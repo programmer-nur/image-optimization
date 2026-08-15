@@ -1,0 +1,155 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      # The generated Prisma client is a build artifact, not committed, so it must
+      # exist before anything typechecks.
+      - name: Generate Prisma client
+        run: pnpm --filter @imgopt/db db:generate
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Format check
+        run: pnpm format:check
+
+      - name: Unit tests
+        run: pnpm test
+
+      # Guards the highest-severity failure mode in the system: if the generated
+      # CloudFront Function and packages/core disagree on normalization, CloudFront
+      # caches one key while the generator writes another. The symptom is a silent
+      # permanent cache miss, not an error. See design.md D4 and task 8.5.
+      # Covered by `pnpm test` above too, but named separately so the failure reads
+      # as what it is instead of as one more red test among hundreds.
+      - name: Edge/core normalization conformance
+        run: pnpm --filter @imgopt/edge test
+
+      # Catches the other half: a ladder or template change nobody regenerated. The
+      # committed artifact is what deploys, so a stale one means the edge keeps
+      # bucketing to the old grammar however current core is.
+      - name: Generated edge function is current
+        run: |
+          pnpm --filter @imgopt/edge generate
+          git diff --exit-code -- infra/cloudfront/normalize.generated.js
+
+      # Synthesizes every stack for every environment. Named separately from the unit
+      # tests because an infrastructure break reads nothing like an application one.
+      #
+      # `cdk synth` is deliberately not used here: resolving a VPC's availability
+      # zones for a concrete account is a context lookup, so the CLI needs credentials
+      # even though it deploys nothing. These assertions go through Template.fromStack
+      # and need no account.
+      - name: Infrastructure synthesis
+        run: pnpm --filter @imgopt/infra test
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        ports:
+          - 5434:5432
+        env:
+          POSTGRES_USER: imgopt
+          POSTGRES_PASSWORD: imgopt
+          POSTGRES_DB: imgopt
+        options: >-
+          --health-cmd "pg_isready -U imgopt -d imgopt"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+      minio:
+        # The published MinIO image has no usable healthcheck for Actions services,
+        # so readiness is polled explicitly below.
+        image: bitnami/minio:latest
+        ports:
+          - 9100:9000
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+          MINIO_DEFAULT_BUCKETS: imgopt-dev
+
+      elasticmq:
+        image: softwaremill/elasticmq-native:latest
+        ports:
+          - 9324:9324
+
+    env:
+      S3_ENDPOINT: http://localhost:9100
+      S3_BUCKET: imgopt-dev
+      SQS_ENDPOINT: http://localhost:9324
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      DATABASE_URL: postgres://imgopt:imgopt@localhost:5434/imgopt
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm --filter @imgopt/db db:generate
+
+      - name: Wait for services
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:9100/minio/health/live > /dev/null; then break; fi
+            sleep 2
+          done
+          for i in $(seq 1 30); do
+            if curl -sf "http://localhost:9324/?Action=ListQueues&Version=2012-11-05" > /dev/null; then break; fi
+            sleep 2
+          done
+
+      # The default ElasticMQ image ships no queues; the redrive topology under test
+      # (maxReceiveCount 3 into a DLQ) has to be created explicitly.
+      - name: Create queues
+        run: |
+          curl -sf "http://localhost:9324/?Action=CreateQueue&QueueName=imgopt-optimize-dlq&Version=2012-11-05" > /dev/null
+          curl -sf --get "http://localhost:9324/" \
+            --data-urlencode "Action=CreateQueue" \
+            --data-urlencode "QueueName=imgopt-optimize" \
+            --data-urlencode "Version=2012-11-05" \
+            --data-urlencode "Attribute.1.Name=RedrivePolicy" \
+            --data-urlencode 'Attribute.1.Value={"maxReceiveCount":"3","deadLetterTargetArn":"arn:aws:sqs:elasticmq:000000000000:imgopt-optimize-dlq"}' \
+            > /dev/null
+
+      - name: Apply database migrations
+        run: pnpm --filter @imgopt/db db:migrate
+
+      - name: Integration tests
+        run: pnpm test:integration

@@ -1,0 +1,147 @@
+// Asset registry.
+//
+// Single-tenant by design: one deployment serves one project, so there is no
+// tenant column anywhere. Cross-project reuse happens by deploying another copy.
+// See design.md D1.
+//
+// Note what is NOT here: nothing on the delivery path reads this database. S3
+// object existence is the sole authority for whether a derivative can be served,
+// which is why images keep flowing when Postgres is down.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated"
+  moduleFormat = "esm"
+}
+
+// Prisma 7 no longer accepts `url` here — the connection string lives in
+// prisma.config.ts for the CLI, and is supplied to PrismaClient via a driver adapter.
+datasource db {
+  provider = "postgresql"
+}
+
+enum AssetStatus {
+  pending_upload
+  stored
+  ready
+  rejected
+  failed
+  deleted
+}
+
+/// How a derivative came to exist, for cost attribution.
+enum DerivativeOrigin {
+  warm
+  ondemand
+}
+
+model Asset {
+  /// ULID: sortable, URL-safe, and independent of storage location or content.
+  id             String      @id
+  currentVersion Int         @default(0) @map("current_version")
+  status         AssetStatus @default(pending_upload)
+
+  altText    String?  @map("alt_text")
+  tags       String[] @default([])
+  /// Normalised focal point, {x, y} in 0..1. Drives crop=focal.
+  focalPoint Json?    @map("focal_point")
+
+  /// Machine-readable reason for a terminal state. Null unless rejected/failed.
+  failureReason String? @map("failure_reason")
+
+  /// Owning API key, for quota accounting.
+  apiKeyId String? @map("api_key_id")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  versions AssetVersion[]
+
+  @@index([status])
+  @@index([createdAt])
+  @@index([apiKeyId])
+  @@map("assets")
+}
+
+model AssetVersion {
+  assetId String @map("asset_id")
+  version Int
+
+  /// Immutable source key. Written exactly once, never read-modify-written.
+  sourceKey String  @map("source_key")
+  /// Bounded intermediate, only for very large sources. Never served to clients.
+  masterKey String? @map("master_key")
+
+  /// SHA-256 of the original bytes, for upload deduplication.
+  contentHash String @map("content_hash")
+
+  /// Displayed dimensions, with EXIF orientation already applied.
+  width  Int?
+  height Int?
+
+  format        String?
+  bytes         BigInt?
+  hasAlpha      Boolean? @map("has_alpha")
+  colorspace    String?
+  orientation   Int?
+  dominantColor String?  @map("dominant_color")
+
+  /// Base64 WebP placeholder, inlined by the client SDK. Stored here rather than
+  /// in S3 because a network round-trip would defeat a few-hundred-byte image.
+  lqip String?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  asset       Asset        @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  derivatives Derivative[]
+
+  @@id([assetId, version])
+  @@index([contentHash])
+  @@map("asset_versions")
+}
+
+model Derivative {
+  /// The canonical key: simultaneously the CDN cache key and the S3 object key.
+  canonicalKey String @id @map("canonical_key")
+
+  assetId String @map("asset_id")
+  version Int
+
+  format String
+  width  Int?
+  height Int?
+  bytes  BigInt
+
+  generatedAt DateTime         @default(now()) @map("generated_at") @db.Timestamptz(3)
+  generatedBy DerivativeOrigin @map("generated_by")
+
+  assetVersion AssetVersion @relation(fields: [assetId, version], references: [assetId, version], onDelete: Cascade)
+
+  @@index([assetId, version])
+  @@index([generatedAt])
+  @@map("derivatives")
+}
+
+model ApiKey {
+  id   String @id
+  name String
+
+  /// Salted hash. The plaintext is shown exactly once, at creation.
+  hash String @unique
+
+  /// Coarse permissions, e.g. ["upload", "delete"].
+  permissions String[] @default([])
+
+  /// Quotas. Null means unlimited.
+  maxBytes  BigInt? @map("max_bytes")
+  maxAssets Int?    @map("max_assets")
+
+  usedBytes  BigInt @default(0) @map("used_bytes")
+  usedAssets Int    @default(0) @map("used_assets")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  revokedAt DateTime? @map("revoked_at") @db.Timestamptz(3)
+
+  @@map("api_keys")
+}

@@ -1,0 +1,13 @@
+{
+  "//": "Editor and ESLint view. Emission happens through tsconfig.build.json.",
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "composite": false,
+    "incremental": false,
+    "declaration": false,
+    "declarationMap": false
+  },
+  "include": ["src/**/*.ts", "vitest.config.ts", "vitest.integration.config.ts", "esbuild.mjs"],
+  "exclude": ["dist", "node_modules"]
+}

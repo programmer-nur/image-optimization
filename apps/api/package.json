@@ -1,0 +1,42 @@
+{
+  "name": "@imgopt/api",
+  "version": "0.0.0",
+  "private": true,
+  "description": "NestJS control plane: uploads, validation, asset metadata, lifecycle.",
+  "type": "module",
+  "main": "./dist/main.js",
+  "scripts": {
+    "build": "tsc --build tsconfig.build.json",
+    "clean": "tsc --build tsconfig.build.json --clean",
+    "start": "node dist/main.js",
+    "dev": "node --watch --experimental-strip-types src/main.ts",
+    "test": "vitest run",
+    "test:integration": "vitest run --config vitest.integration.config.ts"
+  },
+  "dependencies": {
+    "@aws-sdk/client-cloudfront": "^3.1100.0",
+    "@aws-sdk/cloudfront-signer": "^3.700.0",
+    "@fastify/multipart": "^9.0.1",
+    "@imgopt/config": "workspace:*",
+    "@imgopt/core": "workspace:*",
+    "@imgopt/db": "workspace:*",
+    "@imgopt/metrics": "workspace:*",
+    "@imgopt/queue": "workspace:*",
+    "@imgopt/storage": "workspace:*",
+    "@nestjs/common": "^11.0.0",
+    "@nestjs/core": "^11.0.0",
+    "@nestjs/platform-fastify": "^11.0.0",
+    "fastify": "^5.10.0",
+    "file-type": "^19.6.0",
+    "pino": "^9.5.0",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.1"
+  },
+  "devDependencies": {
+    "@nestjs/testing": "^11.0.0",
+    "@swc/core": "^1.15.47",
+    "sharp": "^0.35.3",
+    "unplugin-swc": "^1.5.9",
+    "vitest": "^2.1.8"
+  }
+}

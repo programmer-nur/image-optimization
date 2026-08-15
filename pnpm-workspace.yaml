@@ -1,0 +1,14 @@
+packages:
+  - 'apps/*'
+  - 'packages/*'
+  - 'infra/*'
+  - 'examples/*'
+
+allowBuilds:
+  # Required by vitest; fetches its platform-native binary during install.
+  esbuild: true
+  # Prisma's CLI and schema-engine binaries, needed for migrate/generate.
+  '@prisma/engines': true
+  prisma: true
+  # SWC's native binary; used only by the vitest transform.
+  '@swc/core': true

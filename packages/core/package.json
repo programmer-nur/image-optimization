@@ -1,0 +1,42 @@
+{
+  "name": "@imgopt/core",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Transform grammar, breakpoint bucketing, canonical keys, and the Sharp pipeline. No AWS imports.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./pipeline": {
+      "types": "./dist/pipeline/index.d.ts",
+      "default": "./dist/pipeline/index.js"
+    },
+    "./conformance-vectors": {
+      "types": "./dist/conformance-vectors.d.ts",
+      "default": "./dist/conformance-vectors.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc --build tsconfig.build.json",
+    "clean": "tsc --build tsconfig.build.json --clean",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
+  },
+  "devDependencies": {
+    "@vitest/coverage-v8": "^2.1.8",
+    "fast-check": "^3.23.2",
+    "vitest": "^2.1.8"
+  },
+  "dependencies": {
+    "sharp": "^0.35.3",
+    "zod": "^3.24.1"
+  }
+}

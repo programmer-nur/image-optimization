@@ -1,0 +1,30 @@
+{
+  "name": "@imgopt/optimizer",
+  "version": "0.0.0",
+  "private": true,
+  "description": "SQS-triggered Lambda: intrinsic metadata, LQIP, conditional master, and the eager warm set.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc --build tsconfig.build.json",
+    "clean": "tsc --build tsconfig.build.json --clean",
+    "bundle": "node esbuild.mjs",
+    "test": "vitest run",
+    "test:integration": "vitest run --config vitest.integration.config.ts"
+  },
+  "dependencies": {
+    "@imgopt/config": "workspace:*",
+    "@imgopt/core": "workspace:*",
+    "@imgopt/db": "workspace:*",
+    "@imgopt/metrics": "workspace:*",
+    "@imgopt/queue": "workspace:*",
+    "@imgopt/storage": "workspace:*",
+    "pino": "^9.14.0"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.145",
+    "esbuild": "^0.24.0",
+    "sharp": "^0.35.3",
+    "vitest": "^2.1.8"
+  }
+}

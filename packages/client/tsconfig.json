@@ -1,0 +1,16 @@
+{
+  "//": "Editor and ESLint view. Emission happens through tsconfig.build.json.",
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "//lib": "Browser code: the DOM types are the point, and node is kept for the upload helpers.",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "noEmit": true,
+    "composite": false,
+    "incremental": false,
+    "declaration": false,
+    "declarationMap": false
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "vitest.config.ts"],
+  "exclude": ["dist", "node_modules"]
+}

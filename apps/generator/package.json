@@ -1,0 +1,29 @@
+{
+  "name": "@imgopt/generator",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Function URL Lambda: generates a derivative on cache miss, persists it at its canonical key, and returns the bytes.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc --build tsconfig.build.json",
+    "clean": "tsc --build tsconfig.build.json --clean",
+    "bundle": "node esbuild.mjs",
+    "test": "vitest run",
+    "test:integration": "vitest run --config vitest.integration.config.ts"
+  },
+  "dependencies": {
+    "@imgopt/config": "workspace:*",
+    "@imgopt/core": "workspace:*",
+    "@imgopt/db": "workspace:*",
+    "@imgopt/metrics": "workspace:*",
+    "@imgopt/storage": "workspace:*",
+    "pino": "^9.14.0"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.145",
+    "esbuild": "^0.24.0",
+    "sharp": "^0.35.3",
+    "vitest": "^2.1.8"
+  }
+}

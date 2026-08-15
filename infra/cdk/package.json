@@ -1,0 +1,32 @@
+{
+  "name": "@imgopt/infra",
+  "version": "0.0.0",
+  "private": true,
+  "description": "CDK app: network, storage, data, queue, compute, and CDN stacks, split by lifecycle.",
+  "type": "module",
+  "scripts": {
+    "build": "tsc --build tsconfig.build.json",
+    "clean": "tsc --build tsconfig.build.json --clean",
+    "build:layer": "./scripts/build-sharp-layer.sh",
+    "build:bundles": "pnpm --filter @imgopt/optimizer bundle && pnpm --filter @imgopt/generator bundle && pnpm --filter @imgopt/maintenance bundle",
+    "synth": "cdk synth",
+    "diff": "cdk diff",
+    "deploy": "cdk deploy",
+    "smoke": "tsx scripts/smoke-test.ts",
+    "test": "vitest run",
+    "load-test": "tsx scripts/load-test.ts"
+  },
+  "dependencies": {
+    "@imgopt/core": "workspace:*",
+    "@imgopt/metrics": "workspace:*",
+    "aws-cdk-lib": "^2.263.0",
+    "constructs": "^10.4.2"
+  },
+  "devDependencies": {
+    "@aws-sdk/client-cloudformation": "^3.700.0",
+    "@types/node": "^22.10.2",
+    "aws-cdk": "^2.1135.0",
+    "tsx": "^4.19.2",
+    "vitest": "^2.1.8"
+  }
+}

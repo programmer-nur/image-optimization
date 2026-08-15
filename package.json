@@ -1,0 +1,37 @@
+{
+  "name": "image-optimization",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Self-hosted image optimization service: NestJS control plane, S3 + CloudFront delivery, Sharp in Lambda",
+  "packageManager": "pnpm@11.9.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "pnpm -r --filter './packages/*' --filter './apps/*' build",
+    "typecheck": "tsc --build --verbose",
+    "typecheck:clean": "tsc --build --clean",
+    "test": "pnpm -r test",
+    "test:core": "pnpm --filter @imgopt/core test",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "dev:up": "docker compose up -d",
+    "dev:down": "docker compose down",
+    "dev:reset": "docker compose down -v && docker compose up -d",
+    "dev:logs": "docker compose logs -f",
+    "test:integration": "pnpm -r --workspace-concurrency=1 test:integration"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.17.0",
+    "@types/node": "^22.10.2",
+    "eslint": "^9.17.0",
+    "eslint-config-prettier": "^9.1.0",
+    "globals": "^17.8.0",
+    "prettier": "^3.4.2",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.18.1",
+    "vitest": "^2.1.8"
+  }
+}

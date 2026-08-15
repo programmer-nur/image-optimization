@@ -1,0 +1,30 @@
+{
+  "name": "@imgopt/queue",
+  "version": "0.0.0",
+  "private": true,
+  "description": "QueuePort and its SQS adapter. Kept separate from storage so the generator Lambda does not bundle an SQS client it never uses.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc --build tsconfig.build.json",
+    "clean": "tsc --build tsconfig.build.json --clean",
+    "test": "vitest run",
+    "test:integration": "vitest run --config vitest.integration.config.ts"
+  },
+  "dependencies": {
+    "@aws-sdk/client-sqs": "^3.700.0"
+  },
+  "devDependencies": {
+    "vitest": "^2.1.8"
+  }
+}

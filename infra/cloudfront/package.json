@@ -1,0 +1,17 @@
+{
+  "name": "@imgopt/edge",
+  "version": "0.0.0",
+  "private": true,
+  "description": "CloudFront viewer-request normalizer, generated from @imgopt/core, plus the conformance runner that keeps the two from drifting.",
+  "type": "module",
+  "scripts": {
+    "generate": "node generate.mjs",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@imgopt/core": "workspace:*"
+  },
+  "devDependencies": {
+    "vitest": "^2.1.8"
+  }
+}

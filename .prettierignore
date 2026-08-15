@@ -1,0 +1,9 @@
+node_modules/
+dist/
+coverage/
+cdk.out/
+pnpm-lock.yaml
+infra/cloudfront/normalize.generated.js
+dist-bundle/
+.next/
+next-env.d.ts
