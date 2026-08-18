@@ -1,8 +1,14 @@
 // Asset registry.
 //
-// Single-tenant by design: one deployment serves one project, so there is no
-// tenant column anywhere. Cross-project reuse happens by deploying another copy.
-// See design.md D1.
+// Every asset and every key belongs to a tenant, and a deployment always has at
+// least one — a single-tenant installation is a deployment with one tenant row,
+// not a deployment without the concept. The column is what makes a later collapse
+// of several deployments into one a data migration rather than a route-by-route
+// audit; see openspec/changes/multi-tenancy/design.md T2.
+//
+// Tenancy stops at the control plane. It appears in no URL, no object key, and no
+// edge computation, because the delivery plane never reads this database (D1) and
+// the URL space is free exactly once.
 //
 // Note what is NOT here: nothing on the delivery path reads this database. S3
 // object existence is the sole authority for whether a derivative can be served,
@@ -18,6 +24,32 @@ generator client {
 // prisma.config.ts for the CLI, and is supplied to PrismaClient via a driver adapter.
 datasource db {
   provider = "postgresql"
+}
+
+/// An owning application. One row per deployment today; the column exists so that
+/// several deployments can later share one installation without touching a URL.
+model Tenant {
+  id String @id
+
+  /// Operator-facing name. Renameable at no cost precisely because it never
+  /// appears in a URL or an object key.
+  slug String @unique
+  name String
+
+  /// Quotas live here rather than on a key: an application that is issued a second
+  /// key must not thereby receive a second allowance.
+  maxBytes  BigInt? @map("max_bytes")
+  maxAssets Int?    @map("max_assets")
+
+  usedBytes  BigInt @default(0) @map("used_bytes")
+  usedAssets Int    @default(0) @map("used_assets")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  assets  Asset[]
+  apiKeys ApiKey[]
+
+  @@map("tenants")
 }
 
 enum AssetStatus {
@@ -37,7 +69,11 @@ enum DerivativeOrigin {
 
 model Asset {
   /// ULID: sortable, URL-safe, and independent of storage location or content.
+  /// Globally unique, which is what lets two deployments merge later without a
+  /// single key collision.
   id             String      @id
+  /// Owning tenant. Every read and write is filtered on it.
+  tenantId       String      @map("tenant_id")
   currentVersion Int         @default(0) @map("current_version")
   status         AssetStatus @default(pending_upload)
 
@@ -61,9 +97,13 @@ model Asset {
   deletedAt DateTime? @map("deleted_at") @db.Timestamptz(3)
 
   versions AssetVersion[]
+  tenant   Tenant         @relation(fields: [tenantId], references: [id])
 
-  @@index([status])
-  @@index([createdAt])
+  /// Every index a scoped query uses leads with `tenantId`. One that does not turns
+  /// a tenant-filtered lookup into a scan across every tenant's rows.
+  @@index([tenantId, status])
+  @@index([tenantId, createdAt])
+  @@index([tenantId, id])
   @@index([apiKeyId])
   @@map("assets")
 }
@@ -81,6 +121,10 @@ model AssetVersion {
   masterBytes BigInt? @map("master_bytes")
 
   /// SHA-256 of the original bytes, for upload deduplication.
+  ///
+  /// Deduplication is scoped to the owning tenant, which the query reaches through
+  /// `asset`. Matching across tenants would both hand one tenant a reference to
+  /// another's asset and disclose that the other holds those exact bytes.
   contentHash String @map("content_hash")
 
   /// Displayed dimensions, with EXIF orientation already applied.
@@ -140,6 +184,9 @@ model Derivative {
 
 model ApiKey {
   id   String @id
+  /// The tenant this key acts as. Immutable by policy: moving a key between
+  /// tenants would silently change what it can already reach.
+  tenantId String @map("tenant_id")
   name String
 
   /// SHA-256 of the whole key, unsalted — the secret half is 32 random bytes, so
@@ -150,7 +197,9 @@ model ApiKey {
   /// Coarse permissions, e.g. ["upload", "delete"].
   permissions String[] @default([])
 
-  /// Quotas. Null means unlimited.
+  /// Per-key quotas, retained as a *secondary* ceiling for narrowing one key below
+  /// its tenant's allowance. The tenant's limits are the accounting unit; these
+  /// cannot raise them.
   maxBytes  BigInt? @map("max_bytes")
   maxAssets Int?    @map("max_assets")
 
@@ -160,5 +209,8 @@ model ApiKey {
   createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
   revokedAt DateTime? @map("revoked_at") @db.Timestamptz(3)
 
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
   @@map("api_keys")
 }

@@ -95,7 +95,7 @@ This reverses a recorded Non-Goal, so it proceeds as a **new OpenSpec change** (
 
 ## 6. Workstream A — First deploy
 
-`docs/bootstrap.md` is the complete empty-account→working-deployment runbook (install/verify locally → CDK bootstrap → build artifacts → configure → two-part first deploy → migrate → first API key → verify miss-then-hit, plus DNS and production notes). Needed from the owner: an AWS account, a region, credentials on this machine (SSO per bootstrap prerequisites; no long-lived keys), and optionally a domain for Route53/ACM — the deploy works without a custom domain first.
+`docs/bootstrap.md` is the complete empty-account→working-deployment runbook (install/verify locally → CDK bootstrap → build artifacts → configure → two-part first deploy → migrate → first API key → verify miss-then-hit, plus DNS and production notes). Needed from the owner: an AWS account, a region, credentials on this machine (SSO per bootstrap prerequisites; no long-lived keys), and optionally a domain — DNS is managed in Cloudflare (design.md D18), with certificates issued ahead of the deploy by `infra/cloudflare`; the deploy works without a custom domain first.
 
 Then burn down, in order: **9.15** staging E2E → **12.9** alarm verification → **13.7** load test (validates cache-hit ratio and cost-per-thousand targets from D16) → **14.7** power tuning (record in `docs/tuning.md`). Exit criteria: all four checked off in `tasks.md`, and the §48 audit rerun with observed — not reasoned — answers.
 

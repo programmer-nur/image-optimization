@@ -20,34 +20,89 @@ original.
 
 Everything comes from the environment, so no account id or hostname is committed.
 
-| Variable                      | Required | Meaning                                       |
-| ----------------------------- | -------- | --------------------------------------------- |
-| `CDK_ACCOUNT`                 | yes      | target AWS account id                         |
-| `CDK_REGION`                  | no       | defaults to `us-east-1`                       |
-| `CDN_HOST`                    | yes      | public delivery hostname                      |
-| `API_HOST`                    | no       | public control-plane hostname                 |
-| `HOSTED_ZONE_ID`              | no       | Route 53 zone id, when DNS is in this account |
-| `HOSTED_ZONE_NAME`            | no       | zone name, e.g. `example.com`                 |
-| `CDN_CERTIFICATE_ARN`         | no       | pre-issued **us-east-1** certificate          |
-| `API_IMAGE_TAG`               | no       | control-plane image tag, defaults to `latest` |
-| `MALWARE_SCANNING`            | no       | GuardDuty on `staging/`; on in production     |
-| `PRIVATE_DELIVERY_PUBLIC_KEY` | no       | PEM public key enabling signed-URL delivery   |
+| Variable                      | Required            | Meaning                                                           |
+| ----------------------------- | ------------------- | ----------------------------------------------------------------- |
+| `CDK_ACCOUNT`                 | yes                 | target AWS account id                                             |
+| `CDK_REGION`                  | no                  | defaults to `us-east-1`                                           |
+| `CDN_HOST`                    | yes                 | public delivery hostname                                          |
+| `API_HOST`                    | production          | public control-plane hostname                                     |
+| `CDN_CERTIFICATE_ARN`         | for a custom domain | pre-issued **us-east-1** certificate; see DNS below               |
+| `API_CERTIFICATE_ARN`         | production          | pre-issued certificate in **this region**; synth fails without it |
+| `API_IMAGE_TAG`               | yes                 | control-plane image tag; `latest` is refused                      |
+| `CDN_DISTRIBUTION_ID`         | no                  | pins the bucket read grant to one distribution; set on redeploy   |
+| `MALWARE_SCANNING`            | no                  | GuardDuty on `staging/`; on in production                         |
+| `PRIVATE_DELIVERY_PUBLIC_KEY` | no                  | PEM public key enabling signed-URL delivery                       |
 
-Named environments live in `lib/config.ts`. Each gets its own bucket, database,
-distribution, domain, and queues — nothing is shared, and staging cannot read
-production's data.
+Every variable can be prefixed with the deployment's own name, upper-cased:
+`DEMO_CDN_HOST` wins over `CDN_HOST` when deploying `demo`. The bare name is the
+fallback, so a single-deployment account never needs a prefix — but two deployments
+sharing one account **must** set at least their own `*_CDN_HOST`, since two
+distributions cannot claim one alias.
+
+DNS credentials are not read by the CDK at all — `CLOUDFLARE_API_TOKEN` and
+`CLOUDFLARE_ZONE_ID` belong to [`infra/cloudflare`](../cloudflare/README.md).
+
+### The deployment manifest
+
+`DEPLOYMENTS` in `lib/config.ts` lists every deployment. Each entry names itself and
+picks a _tier_ — `staging` or `production` — which is only a sizing profile: database
+class, task count, CDN price class, whether malware scanning defaults on.
+
+```ts
+export const DEPLOYMENTS: DeploymentEntry[] = [
+  { name: 'staging', tier: 'staging' },
+  { name: 'production', tier: 'production' },
+  { name: 'demo', tier: 'staging' },
+];
+```
+
+Each deployment gets its own bucket, database, distribution, domain, and queues —
+nothing is shared, and no resource name is derivable from another deployment's. That
+isolation is also what makes a deployment the tenant boundary: **a second application
+is a second entry here**, not a second code path. See
+[docs/bootstrap.md](../../docs/bootstrap.md#onboarding-another-application) for the
+out-of-band work each one still needs, and `openspec/changes/multi-tenancy/design.md`
+T2 for why the boundary is the deployment rather than the URL.
+
+`resolveAllDeployments()` builds every entry at once and refuses two that claim the
+same hostname or bucket. Worth running before adding an entry: CloudFront reports a
+duplicate alias as `CNAMEAlreadyExists` partway through the _second_ deployment, once
+the first is already created.
 
 ### DNS
 
-Supply `HOSTED_ZONE_ID` and `HOSTED_ZONE_NAME` and the certificate is issued and
-validated automatically and the alias records are created. Supply neither and the
-deployment still succeeds: the distribution serves on its own `*.cloudfront.net`
-name, and the `ManualDnsRecord` output names the record to create by hand. An
-externally managed zone is a normal arrangement, not a blocker.
+**This app creates no DNS records and issues no certificates.** DNS is in Cloudflare
+(design.md D18), and CloudFormation can only write a hosted zone it owns — point a
+DNS-validated certificate at an external zone and the stack does not fail, it _waits_,
+holding the deploy open until CloudFormation gives up hours later.
 
-The zone is referenced by id rather than looked up, deliberately — a `fromLookup`
-needs credentials at synth time, which would put an AWS account between a
-contributor and `pnpm test`.
+So the two halves are split:
+
+- **Certificates** are requested ahead of the deploy by
+  [`infra/cloudflare`](../cloudflare/README.md), which writes the validation record
+  into the zone, waits for issuance, and prints the ARNs to set here. Two of them:
+  CloudFront accepts a viewer certificate only from `us-east-1`, an ALB only from its
+  own region.
+- **Records** are reconciled after the deploy by the same package, from the
+  `CdnDnsTarget` and `ApiDnsTarget` outputs. Every record is created with the
+  **proxy off** — an orange-clouded record caches one image format for every viewer.
+
+Without a certificate the deployment still succeeds: the distribution serves on its
+own `*.cloudfront.net` name and the load balancer on its own DNS name. Staging may run
+that way; production synthesis fails without an API certificate.
+
+### Region constraint
+
+The observability stack is deployable **only to `us-east-1`** while it owns CloudFront
+alarms: CloudFront publishes `CacheHitRate` and `5xxErrorRate` only there, and
+CloudWatch refuses an alarm on a metric from another region. Everything else deploys
+anywhere — the distribution's certificate is a literal ARN, so a `us-east-1`
+certificate attaches from a stack in any region with no cross-region machinery.
+
+Moving the deployment out of `us-east-1` therefore means splitting the two CloudFront
+alarms into their own `us-east-1` stack with its own SNS topic, which is an operator
+wart (two subscriptions to confirm) rather than a code change. Not done, because
+nothing has been deployed yet and the region has not been chosen.
 
 ## Release order
 
@@ -99,7 +154,28 @@ Could not load the "sharp" module using the linux-arm64 runtime
 
 on its first real invocation — in front of a viewer, after CI was green. Building in
 the runtime's own image makes the artifact independent of whoever ran the release.
-The post-deploy smoke test exists to catch it if this ever regresses.
+
+**Verify it without deploying.** On an x86 host this needs one-time arm64 emulation
+(`docker run --privileged --rm tonistiigi/binfmt --install arm64`, reversible with
+`--uninstall`). Then load each bundle exactly the way Lambda does — the layer mounted
+at `/opt/nodejs`, exposed through `NODE_PATH`:
+
+```bash
+docker run --rm --platform linux/arm64 \
+  -v "$PWD/apps/generator/dist-bundle:/var/task:ro" \
+  -v "$PWD/infra/cdk/layers/sharp/nodejs:/opt/nodejs:ro" \
+  -w /var/task -e NODE_PATH=/opt/nodejs/node_modules \
+  -e AWS_REGION=us-east-1 -e S3_BUCKET=x -e CDN_HOST=x \
+  -e SQS_OPTIMIZE_QUEUE_URL=x -e DATABASE_URL=postgres://u:p@127.0.0.1:5432/d \
+  public.ecr.aws/sam/build-nodejs22.x:latest-arm64 \
+  node -e "import('/var/task/index.mjs').then(m => console.log(typeof m.handler))"
+```
+
+`function` means the whole init path works: the ESM bundle loaded, it reached sharp
+through the layer, and the handler is exported under the name `index.handler` resolves
+to. That is the closest check available to a real invocation, and it catches both
+failure modes the `.mjs` rename and the `createRequire` shim exist for. The
+post-deploy smoke test is the backstop if this ever regresses.
 
 ## Verification without an account
 

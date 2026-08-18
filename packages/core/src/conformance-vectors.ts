@@ -26,6 +26,71 @@ export interface ConformanceVector {
   expected: string;
 }
 
+/**
+ * Path-shape vectors, kept separate from the query vectors above.
+ *
+ * The query vectors pin the *variant filename* and are replayed against both
+ * implementations. They say nothing about the path the filename is attached to —
+ * which prefixes are viewer-facing, where the id and version sit, what is refused —
+ * because `packages/core` builds that path and the edge function builds it again,
+ * independently, at the one line where a rewrite is assembled.
+ *
+ * That left the half of the edge most likely to change structurally as the half with
+ * no shared oracle. These vectors close it: the expected value is the *whole*
+ * rewritten URI, written by hand, so a change to the path grammar has to be made in
+ * both implementations and stated here before it passes.
+ */
+export interface PathVector {
+  /** The viewer's URI, exactly as CloudFront would present it. */
+  uri: string;
+  /** Query string, without the leading `?`. Usually a single width. */
+  query: string;
+  /** The full rewritten URI, or `ERROR:<code>` when the request must be refused. */
+  expected: string;
+}
+
+const PATH_ASSET = '01JABCDEFGHJKMNPQRSTVWXYZ';
+const PATH_VERSION = 'v3-1';
+
+export const PATH_VECTORS: readonly PathVector[] = [
+  // The ordinary shape, and the slug being decoration.
+  {
+    uri: `/i/${PATH_ASSET}/${PATH_VERSION}/red-shoes.jpg`,
+    query: 'w=640&format=avif',
+    expected: `/derived/${PATH_ASSET}/${PATH_VERSION}/w640_q75.avif`,
+  },
+  {
+    uri: `/i/${PATH_ASSET}/${PATH_VERSION}`,
+    query: 'w=640&format=avif',
+    expected: `/derived/${PATH_ASSET}/${PATH_VERSION}/w640_q75.avif`,
+  },
+  // The signature-required prefix normalizes into the same key space, so a private
+  // asset is bucketed exactly like a public one.
+  {
+    uri: `/p/${PATH_ASSET}/${PATH_VERSION}/red-shoes.jpg`,
+    query: 'w=640&format=avif',
+    expected: `/derived/${PATH_ASSET}/${PATH_VERSION}/w640_q75.avif`,
+  },
+  // Raw storage paths are the one way to reach the generator without passing the
+  // quantizers. Refused at the edge.
+  {
+    uri: `/derived/${PATH_ASSET}/${PATH_VERSION}/w641_q75.avif`,
+    query: '',
+    expected: 'ERROR:unsupported_path',
+  },
+  { uri: `/original/${PATH_ASSET}/1/source.jpg`, query: '', expected: 'ERROR:unsupported_path' },
+  { uri: `/master/${PATH_ASSET}/1/master.webp`, query: '', expected: 'ERROR:unsupported_path' },
+  { uri: '/staging/some-upload-id', query: '', expected: 'ERROR:unsupported_path' },
+  // Malformed path segments are refused rather than passed to an origin.
+  { uri: '/i/../v1-1/photo.jpg', query: 'w=640', expected: 'ERROR:invalid_asset_id' },
+  { uri: `/i/${PATH_ASSET}/3-1/photo.jpg`, query: 'w=640', expected: 'ERROR:invalid_version' },
+  { uri: `/i/${PATH_ASSET}/vx/photo.jpg`, query: 'w=640', expected: 'ERROR:invalid_version' },
+  // Anything outside the viewer prefixes is passed through untouched — the
+  // distribution may serve other paths, and rewriting them would be a surprise.
+  { uri: '/healthz', query: '', expected: '/healthz' },
+  { uri: `/i/${PATH_ASSET}`, query: 'w=640', expected: `/i/${PATH_ASSET}` },
+];
+
 const ACCEPT_AVIF = 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8';
 const ACCEPT_WEBP = 'image/webp,image/apng,image/*,*/*;q=0.8';
 const ACCEPT_LEGACY = 'image/*,*/*;q=0.8';

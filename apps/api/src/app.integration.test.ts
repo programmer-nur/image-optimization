@@ -13,7 +13,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import sharp from 'sharp';
 import type { NestFastifyApplication } from '@nestjs/platform-fastify';
 // Type-only: erased at runtime, so it does not trigger the env-sensitive module load.
-import type { PrismaClient } from '@imgopt/db';
+import { DEFAULT_TENANT_ID, type PrismaClient } from '@imgopt/db';
 
 process.env['AWS_REGION'] ??= 'us-east-1';
 process.env['S3_BUCKET'] ??= 'imgopt-dev';
@@ -64,6 +64,7 @@ beforeAll(async () => {
 
   const keys = app.get(ApiKeyService);
   const created = await keys.create({
+    tenantId: DEFAULT_TENANT_ID,
     name: `itest-${Date.now()}`,
     permissions: ['read', 'upload', 'delete'],
   });
@@ -203,7 +204,11 @@ describe('lifecycle', () => {
 
   it('requires the delete permission on a key that lacks it', async () => {
     const keys = app.get(ApiKeyService);
-    const readOnly = await keys.create({ name: 'readonly', permissions: ['read', 'upload'] });
+    const readOnly = await keys.create({
+      tenantId: DEFAULT_TENANT_ID,
+      name: 'readonly',
+      permissions: ['read', 'upload'],
+    });
 
     const res = await fetch(`${baseUrl}/v1/images/${assetId}`, {
       method: 'DELETE',
@@ -261,7 +266,12 @@ describe('presigned upload', () => {
 describe('quota enforcement', () => {
   it('rejects an upload once the asset quota is exhausted', async () => {
     const keys = app.get(ApiKeyService);
-    const limited = await keys.create({ name: 'limited', permissions: ['upload'], maxAssets: 1 });
+    const limited = await keys.create({
+      tenantId: DEFAULT_TENANT_ID,
+      name: 'limited',
+      permissions: ['upload'],
+      maxAssets: 1,
+    });
 
     const form1 = new FormData();
     form1.append('file', new Blob([await jpeg(320, 240)], { type: 'image/jpeg' }), 'a.jpg');
@@ -281,5 +291,69 @@ describe('quota enforcement', () => {
       body: form2,
     });
     expect(second.status).toBe(413);
+  });
+
+  /*
+   * Quota is charged to the caller, not to whoever created the asset.
+   *
+   * `PUT /v1/images/:id/source` used to bill `asset.apiKeyId`, so any key holding
+   * `upload` could replace another key's source and spend that key's allowance while
+   * never touching its own. Asserted by reading both counters rather than by
+   * exhausting a limit, so the test says plainly *who was charged*.
+   */
+  it('charges a source replacement to the replacing key, not the owning one', async () => {
+    const keys = app.get(ApiKeyService);
+    const prisma = app.get<PrismaClient>(PRISMA);
+    const owner = await keys.create({
+      tenantId: DEFAULT_TENANT_ID,
+      name: 'quota-owner',
+      permissions: ['read', 'upload'],
+    });
+    const replacer = await keys.create({
+      tenantId: DEFAULT_TENANT_ID,
+      name: 'quota-replacer',
+      permissions: ['read', 'upload'],
+    });
+
+    // Deliberately unique dimensions. Reusing another test's image deduplicates onto
+    // *that* test's asset, and the replacement would then be exercising a different
+    // key pairing than the one this test names.
+    const form = new FormData();
+    form.append('file', new Blob([await jpeg(337, 211)], { type: 'image/jpeg' }), 'owned.jpg');
+    const created = await fetch(`${baseUrl}/v1/images`, {
+      method: 'POST',
+      headers: { 'x-api-key': owner.plaintext },
+      body: form,
+    });
+    expect(created.status).toBe(201);
+    const createdBody = (await created.json()) as { asset: { id: string }; duplicate: boolean };
+    expect(createdBody.duplicate, 'the owner must actually own this asset').toBe(false);
+    const assetId = createdBody.asset.id;
+    createdAssetIds.push(assetId);
+
+    const before = await prisma.apiKey.findMany({
+      where: { id: { in: [owner.apiKey.id, replacer.apiKey.id] } },
+      select: { id: true, usedBytes: true },
+    });
+
+    const replaced = await fetch(`${baseUrl}/v1/images/${assetId}/source`, {
+      method: 'PUT',
+      headers: { 'x-api-key': replacer.plaintext, 'content-type': 'image/jpeg' },
+      body: await jpeg(200, 200),
+    });
+    expect(replaced.status).toBe(200);
+
+    const after = await prisma.apiKey.findMany({
+      where: { id: { in: [owner.apiKey.id, replacer.apiKey.id] } },
+      select: { id: true, usedBytes: true },
+    });
+
+    const usage = (rows: typeof before, id: string) =>
+      rows.find((row) => row.id === id)?.usedBytes ?? 0n;
+
+    // The replacer paid for the bytes it supplied...
+    expect(usage(after, replacer.apiKey.id)).toBeGreaterThan(usage(before, replacer.apiKey.id));
+    // ...and the owner's allowance was not spent on someone else's upload.
+    expect(usage(after, owner.apiKey.id)).toBe(usage(before, owner.apiKey.id));
   });
 });

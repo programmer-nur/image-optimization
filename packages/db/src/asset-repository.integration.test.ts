@@ -7,24 +7,25 @@
  */
 
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { AssetNotFoundError, AssetRepository } from './asset-repository.js';
+import { AssetNotFoundError, UnscopedAssetRepository } from './asset-repository.js';
 import { createPrismaClient } from './client.js';
 import { AssetStatus, DerivativeOrigin } from './generated/enums.js';
 import { newAssetId } from './ids.js';
+import { DEFAULT_TENANT_ID } from './tenant-scope.js';
 import { IllegalStatusTransition } from './status.js';
 
 const DATABASE_URL =
   process.env['DATABASE_URL'] ?? 'postgres://imgopt:imgopt@localhost:5434/imgopt';
 
 const prisma = createPrismaClient({ connectionString: DATABASE_URL });
-const repo = new AssetRepository(prisma);
+const repo = new UnscopedAssetRepository(prisma);
 
 /** Isolates a run so parallel runs and leftovers cannot interfere. */
 const RUN = Math.random().toString(36).slice(2, 8);
 const createdIds: string[] = [];
 
 async function makeAsset(): Promise<string> {
-  const asset = await repo.create({ tags: [`run-${RUN}`] });
+  const asset = await repo.create({ tenantId: DEFAULT_TENANT_ID, tags: [`run-${RUN}`] });
   createdIds.push(asset.id);
   return asset.id;
 }
@@ -71,7 +72,7 @@ describe('create', () => {
   it('accepts a caller-supplied id', async () => {
     const id = newAssetId();
     createdIds.push(id);
-    const asset = await repo.create({ id });
+    const asset = await repo.create({ tenantId: DEFAULT_TENANT_ID, id });
 
     expect(asset.id).toBe(id);
   });
@@ -79,7 +80,12 @@ describe('create', () => {
   it('stores tags and alt text', async () => {
     const id = newAssetId();
     createdIds.push(id);
-    await repo.create({ id, altText: 'a cat', tags: ['pets', 'hero'] });
+    await repo.create({
+      tenantId: DEFAULT_TENANT_ID,
+      id,
+      altText: 'a cat',
+      tags: ['pets', 'hero'],
+    });
 
     const asset = await repo.findById(id);
     expect(asset?.altText).toBe('a cat');

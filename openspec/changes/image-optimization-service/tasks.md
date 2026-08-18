@@ -129,7 +129,7 @@
 - [x] 9.8 Compute stack: ECS Fargate service, ALB, task definition, autoscaling, and a one-off migration task definition — built from `FargateService` + `ApplicationLoadBalancer` directly rather than the L3 pattern, which wires a security-group rule that creates a cross-stack cycle
 - [x] 9.9 CDN stack: CloudFront distribution, OAC to the derivatives prefix, origin group with the generator as failover on 403 and 404, and origin shield
 - [x] 9.10 CDN stack: attach the generated CloudFront Function on viewer-request, configure the cache policy to include no query strings, headers, or cookies
-- [x] 9.11 CDN stack: ACM certificate, custom domain alias, DNS record, HTTP-to-HTTPS redirect, and error-response TTL configuration — the certificate is a us-east-1 stack of its own, and an externally managed DNS zone falls back to emitting the records rather than failing
+- [x] 9.11 CDN stack: custom domain from a pre-issued us-east-1 ACM certificate, HTTP-to-HTTPS redirect, and error-response TTL configuration. DNS is Cloudflare's (design.md D18): the stack creates no record and issues no certificate, publishing `CdnDnsTarget` for `infra/cloudflare` to reconcile against instead
 - [x] 9.12 IAM: least-privilege roles — generator reads originals/masters and writes only derivatives; distribution reads only derivatives without list permission. `s3:ListBucket` is bucket-level and cannot be scoped by ARN, so every grant of it carries an `s3:prefix` condition, asserted in the tests
 - [x] 9.13 Configure Lambda artifact builds in a container matching the target runtime so native binaries are correct (`scripts/build-sharp-layer.sh`, `--platform linux/arm64`; `lib/artifacts.ts` fails synth when an artifact is missing rather than packaging an empty directory)
 - [x] 9.14 Add a post-deploy smoke test invoking the deployed generator against a known image (`scripts/smoke-test.ts`; reads stack outputs and makes plain HTTPS requests, so it runs from CI or a laptop with only credentials)
@@ -189,6 +189,20 @@
 - [x] 13.8 Give the maintenance worker a per-run deletion cap and a dry-run mode — added during implementation. Every deletion here is irreversible and the objects include originals, so the cap bounds a bug's blast radius to one run and the dry run makes a first execution safe to inspect
 - [x] 13.9 Leave unparseable keys in place rather than deleting them — added during implementation. An unrecognized key almost certainly means this code is out of date, not that the object is junk; the count is reported so it is investigated instead of silently reclaimed
 
+## 9b. DNS and certificates (Cloudflare)
+
+Added when DNS moved off Route 53. See design.md D18 — the split exists because
+CloudFormation can only validate a certificate in a hosted zone it owns, and pointing
+it at an external zone makes a deploy hang rather than fail.
+
+- [x] 9b.1 Remove Route 53 from the CDK entirely: no hosted-zone lookup, no record sets, no certificate construct. A synthesis assertion pins the absence, since a reintroduced record would reference a zone that does not exist
+- [x] 9b.2 Publish `CdnDnsTarget` and `ApiDnsTarget` as stack outputs — the names are assigned at deploy time, so anything written down goes stale the first time a stack is replaced
+- [x] 9b.3 Build `infra/cloudflare`: a scoped-token Cloudflare v4 client, desired-record computation from stack outputs, and a reconciler that plans before it writes
+- [x] 9b.4 Force `proxied: false` on every record, and treat an existing proxied record as a change to undo — Cloudflare's proxy caches by URL and ignores `Vary: Accept`, so one image format would be served to every viewer
+- [x] 9b.5 Never delete, and never convert a record type: a zone holds mail and the apex, and a reconciler that prunes what it does not recognize takes a company offline
+- [x] 9b.6 Implement ACM issuance that writes the validation record into Cloudflare and waits for `ISSUED`, printing the ARNs to configure
+- [ ] 9b.7 Run the certificate and DNS flows against the real zone — **blocked: needs an AWS account and the Cloudflare token.** Confirm renewal eligibility stays `ELIGIBLE` after issuance, which is what proves the validation record was left in place
+
 ## 14. Documentation and Release
 
 - [x] 14.1 Write the architecture overview with the Mermaid diagrams from `design.md` (`docs/architecture.md`)
@@ -198,4 +212,4 @@
 - [x] 14.5 Write the operations runbook: encoder epoch procedure, dead-letter replay, cache-miss investigation, and cost review (`docs/operations.md`) — leads with the regeneration failure, since it is the only one that produces no errors
 - [x] 14.6 Document the tuning knobs — warm set, ladder, quality levels, thresholds — and their cost and latency trade-offs (`docs/tuning.md`), separating redeploy knobs from transform grammar, where a change is an encoder-epoch event
 - [ ] 14.7 Run AWS Lambda Power Tuning against the generator and record the chosen memory setting with its measurements — **blocked: needs an AWS account.** The procedure and an empty results table are in `docs/tuning.md`; the current 3008MB is a starting guess and is labelled as one
-- [ ] 14.8 Publish the client package and tag the first release of the deployable stack — **blocked, and deliberately not attempted.** This is not a git repository, no npm credentials are configured, and every package is `private: true`. Publishing is outward-facing and irreversible, and the `@imgopt` scope may not be the owner's; the decisions and the procedure are written up in `docs/release.md` instead
+- [ ] 14.8 Publish the client package and tag the first release of the deployable stack — **blocked, and deliberately not attempted.** No npm credentials are configured and every package is `private: true`; the repository now has git history, so tagging is possible once the registry question is settled. Publishing is outward-facing and irreversible, and the `@imgopt` scope may not be the owner's; the decisions and the procedure are written up in `docs/release.md` instead

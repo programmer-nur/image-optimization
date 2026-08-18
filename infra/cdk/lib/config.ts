@@ -1,10 +1,24 @@
 /**
- * Per-environment deployment configuration.
+ * The deployment manifest, and the configuration of each deployment in it.
  *
- * Environments are fully isolated — own bucket, database, distribution, domain, and
+ * Deployments are fully isolated — own bucket, database, distribution, domain, and
  * queues — so nothing here is shared between them and no resource name is derivable
- * from another environment's. That isolation is the point: a staging deployment must
+ * from another deployment's. That isolation is the point: a staging deployment must
  * not be able to read production's data even by accident.
+ *
+ * That same isolation is what makes a deployment the tenant boundary. A second
+ * application is a second entry in `DEPLOYMENTS`, not a second code path — see
+ * openspec/changes/multi-tenancy/design.md T2. `staging` and `production` are simply
+ * the first two entries; there is nothing structurally special about either, and
+ * nothing in the stacks branches on their names.
+ *
+ * Each entry picks a *tier*, which is only a sizing profile: how large the database
+ * is, how many tasks run, how far the CDN reaches. Everything that must differ per
+ * deployment — hostnames, certificates, the distribution id — comes from the
+ * environment, read under the deployment's own prefix first (`ACME_CDN_HOST`) and
+ * falling back to the bare name (`CDN_HOST`). The fallback is what keeps the
+ * single-deployment workflow unchanged; the prefix is what lets one CI configuration
+ * hold several.
  *
  * This is *deployment* configuration. Transform grammar — the width ladder, quality
  * levels, encoder defaults — lives in `@imgopt/core` as constants, because those
@@ -28,19 +42,16 @@ export interface EnvironmentConfig {
   apiHost?: string;
 
   /**
-   * Hosted zone for both records, when DNS is in this account.
+   * Pre-issued **us-east-1** certificate for the distribution.
    *
-   * Supplied explicitly rather than looked up: a `fromLookup` needs credentials at
-   * synth time, which would make `cdk synth` — and therefore CI — unable to run
-   * without an AWS account. When absent, the deployment still succeeds and emits the
-   * records to create by hand instead of failing silently.
-   */
-  hostedZoneId?: string;
-  hostedZoneName?: string;
-
-  /**
-   * Pre-issued us-east-1 certificate for the distribution. When absent, one is
-   * issued in a us-east-1 stack, which requires `hostedZoneId` for validation.
+   * Always pre-issued: DNS lives in Cloudflare (design.md D18), so a DNS-validated
+   * certificate cannot be created and validated inside a CloudFormation deployment —
+   * the validation record has to appear in a zone CloudFormation cannot write to, and
+   * the stack would block until it timed out. `infra/cloudflare` requests it, writes
+   * the validation record, waits for issuance, and prints the ARN.
+   *
+   * Absent, the distribution serves on its own `*.cloudfront.net` name, which is what
+   * lets a first deploy happen before DNS is sorted out.
    */
   cdnCertificateArn?: string;
 
@@ -52,8 +63,7 @@ export interface EnvironmentConfig {
    * ALB accepts one only from its own region. Substituting one for the other fails
    * when CloudFormation tries to attach it, not at synth.
    *
-   * When absent, one is issued for `apiHost` provided the hosted zone is in this
-   * account. Production refuses to synthesize with neither — see ComputeStack.
+   * Production refuses to synthesize without one — see ComputeStack.
    */
   apiCertificateArn?: string;
 
@@ -362,18 +372,36 @@ const LAMBDA = {
   optimizerMaxConcurrency: 10,
 };
 
-export const ENVIRONMENTS: Record<string, () => EnvironmentConfig> = {
-  staging: () => ({
-    name: 'staging',
-    account: requireEnv('CDK_ACCOUNT'),
-    region: process.env['CDK_REGION'] ?? 'us-east-1',
-    cdnHost: requireEnv('CDN_HOST'),
-    ...optional('apiHost', process.env['API_HOST']),
-    ...optional('hostedZoneId', process.env['HOSTED_ZONE_ID']),
-    ...optional('hostedZoneName', process.env['HOSTED_ZONE_NAME']),
-    ...optional('cdnCertificateArn', process.env['CDN_CERTIFICATE_ARN']),
-    ...optional('apiCertificateArn', process.env['API_CERTIFICATE_ARN']),
-    ...optional('cdnDistributionId', process.env['CDN_DISTRIBUTION_ID']),
+/**
+ * Settings that must differ between deployments, resolved from the environment.
+ *
+ * Shared by every tier, because "which hostname" and "which certificate" are
+ * properties of the deployment rather than of its size.
+ */
+function perDeployment(name: string, prefix: string) {
+  return {
+    name,
+    account: requireEnv(prefix, 'CDK_ACCOUNT'),
+    region: readEnv(prefix, 'CDK_REGION') ?? 'us-east-1',
+    cdnHost: requireEnv(prefix, 'CDN_HOST'),
+    ...optional('apiHost', readEnv(prefix, 'API_HOST')),
+    ...optional('cdnCertificateArn', readEnv(prefix, 'CDN_CERTIFICATE_ARN')),
+    ...optional('apiCertificateArn', readEnv(prefix, 'API_CERTIFICATE_ARN')),
+    ...optional('cdnDistributionId', readEnv(prefix, 'CDN_DISTRIBUTION_ID')),
+    ...optional('privateDeliveryPublicKey', readEnv(prefix, 'PRIVATE_DELIVERY_PUBLIC_KEY')),
+  };
+}
+
+/**
+ * Sizing profiles.
+ *
+ * A tier says how big a deployment is, never who it is for. Adding an application
+ * picks one of these; it does not add one.
+ */
+const TIERS = {
+  /** Small, single-AZ, cheap. Suitable for a pre-production or low-volume deployment. */
+  staging: (name: string, prefix: string): EnvironmentConfig => ({
+    ...perDeployment(name, prefix),
     ...BASE,
     database: {
       instanceType: ec2.InstanceType.of(ec2.InstanceClass.T4G, ec2.InstanceSize.MICRO),
@@ -387,32 +415,23 @@ export const ENVIRONMENTS: Record<string, () => EnvironmentConfig> = {
       desiredCount: 1,
       minCapacity: 1,
       maxCapacity: 3,
-      imageTag: requireImageTag(),
+      imageTag: requireImageTag(prefix),
     },
-    // A t4g.micro allows roughly half the connections of a small, and staging's API
+    // A t4g.micro allows roughly half the connections of a small, and this tier's API
     // holds fewer — so the consumer's share shrinks with it.
     lambda: { ...LAMBDA, generatorReservedConcurrency: 10, optimizerMaxConcurrency: 5 },
     delivery: { priceClass: cloudfront.PriceClass.PRICE_CLASS_100, encoderEpoch: 1 },
-    // Charged per gigabyte scanned; off in staging unless a change to the upload
-    // path is being exercised.
-    malwareScanning: process.env['MALWARE_SCANNING'] === 'true',
-    ...optional('privateDeliveryPublicKey', process.env['PRIVATE_DELIVERY_PUBLIC_KEY']),
-    // Staging still retains: losing its data mid-investigation is exactly when it
+    // Charged per gigabyte scanned; off by default on this tier unless a change to
+    // the upload path is being exercised.
+    malwareScanning: readEnv(prefix, 'MALWARE_SCANNING') === 'true',
+    // This tier still retains: losing its data mid-investigation is exactly when it
     // matters, and an empty-bucket redeploy is cheap to do deliberately.
     removalPolicy: RemovalPolicy.RETAIN,
   }),
 
-  production: () => ({
-    name: 'production',
-    account: requireEnv('CDK_ACCOUNT'),
-    region: process.env['CDK_REGION'] ?? 'us-east-1',
-    cdnHost: requireEnv('CDN_HOST'),
-    ...optional('apiHost', process.env['API_HOST']),
-    ...optional('hostedZoneId', process.env['HOSTED_ZONE_ID']),
-    ...optional('hostedZoneName', process.env['HOSTED_ZONE_NAME']),
-    ...optional('cdnCertificateArn', process.env['CDN_CERTIFICATE_ARN']),
-    ...optional('apiCertificateArn', process.env['API_CERTIFICATE_ARN']),
-    ...optional('cdnDistributionId', process.env['CDN_DISTRIBUTION_ID']),
+  /** Multi-AZ, global price class, malware scanning on unless explicitly disabled. */
+  production: (name: string, prefix: string): EnvironmentConfig => ({
+    ...perDeployment(name, prefix),
     ...BASE,
     database: {
       instanceType: ec2.InstanceType.of(ec2.InstanceClass.T4G, ec2.InstanceSize.SMALL),
@@ -426,15 +445,68 @@ export const ENVIRONMENTS: Record<string, () => EnvironmentConfig> = {
       desiredCount: 2,
       minCapacity: 2,
       maxCapacity: 10,
-      imageTag: requireImageTag(),
+      imageTag: requireImageTag(prefix),
     },
     lambda: LAMBDA,
     delivery: { priceClass: cloudfront.PriceClass.PRICE_CLASS_ALL, encoderEpoch: 1 },
-    malwareScanning: process.env['MALWARE_SCANNING'] !== 'false',
-    ...optional('privateDeliveryPublicKey', process.env['PRIVATE_DELIVERY_PUBLIC_KEY']),
+    malwareScanning: readEnv(prefix, 'MALWARE_SCANNING') !== 'false',
     removalPolicy: RemovalPolicy.RETAIN,
   }),
-};
+} satisfies Record<string, (name: string, prefix: string) => EnvironmentConfig>;
+
+export type Tier = keyof typeof TIERS;
+
+export interface DeploymentEntry {
+  /**
+   * The deployment's identity.
+   *
+   * Every resource is prefixed with it, the bucket name is derived from it, and it is
+   * the isolation boundary — so it is effectively permanent once anything is stored.
+   * Renaming one is a migration, not an edit.
+   */
+  name: string;
+
+  /** Which sizing profile to build from. */
+  tier: Tier;
+
+  /**
+   * Environment-variable prefix for this deployment's own settings.
+   *
+   * Defaults to the upper-cased name, so `acme` reads `ACME_CDN_HOST` and falls back
+   * to `CDN_HOST`. Set it explicitly only to keep an existing variable name working.
+   */
+  envPrefix?: string;
+}
+
+/**
+ * The manifest. **Adding an application is adding an entry here.**
+ *
+ * Everything downstream — stacks, alarms, the bucket name, the queue names — is
+ * derived from the entry, so onboarding does not touch any other file. What it *does*
+ * require is the out-of-band work a deployment always needs: two certificates, two
+ * Cloudflare records, and the environment variables named above. See
+ * docs/bootstrap.md.
+ *
+ * Every entry resolves the same way — prefixed name first, bare name second — so
+ * `staging` and `production` keep working from the bare `CDN_HOST`/`CDK_ACCOUNT` they
+ * have always used, and this refactor changes no existing deployment procedure. The
+ * bare fallback is per-invocation, though: a deploy resolves one entry, so it is only
+ * `resolveAllDeployments` that sees several entries sharing one value and objects.
+ */
+export const DEPLOYMENTS: DeploymentEntry[] = [
+  { name: 'staging', tier: 'staging' },
+  { name: 'production', tier: 'production' },
+  /*
+   * A second application, sharing the AWS account and nothing else.
+   *
+   * Present rather than commented out so it is *synthesized* by the test suite: a
+   * manifest whose second entry has never been built is a claim, and the resource
+   * collisions this design has to avoid — a duplicate bucket name, a reused export
+   * name, a stack id that already exists — are all synth-time errors that only appear
+   * when two entries exist at once.
+   */
+  { name: 'demo', tier: 'staging' },
+];
 
 /** Omits the key entirely when unset, so `exactOptionalPropertyTypes` holds. */
 function optional<K extends string>(key: K, value: string | undefined): Record<K, string> | object {
@@ -449,8 +521,8 @@ function optional<K extends string>(key: K, value: string | undefined): Record<K
  * nothing if the tag can be repointed. It also lets the service and the migration
  * task, which take the tag from the same place, end up running different bytes.
  */
-function requireImageTag(): string {
-  const tag = requireEnv('API_IMAGE_TAG');
+function requireImageTag(prefix: string): string {
+  const tag = requireEnv(prefix, 'API_IMAGE_TAG');
   if (tag === 'latest') {
     throw new Error(
       'API_IMAGE_TAG must name an immutable tag, not "latest". The tag is the ' +
@@ -462,16 +534,29 @@ function requireImageTag(): string {
 }
 
 /**
+ * Reads a setting for one deployment, preferring its own prefix.
+ *
+ * `ACME_CDN_HOST` wins over `CDN_HOST`. The fallback is what keeps a single-deployment
+ * account working with the plain variable names, and it is also the sharp edge: two
+ * deployments in one process with no prefixed values both read the same host. That is
+ * caught by `resolveAllDeployments`, not by hoping nobody does it.
+ */
+function readEnv(prefix: string, key: string): string | undefined {
+  const value = (prefix === '' ? undefined : process.env[`${prefix}_${key}`]) ?? process.env[key];
+  return value === '' ? undefined : value;
+}
+
+/**
  * Fails at synth rather than at deploy.
  *
  * A missing account or hostname surfaces as a named error before CloudFormation is
  * involved, instead of as a half-created stack that has to be rolled back.
  */
-function requireEnv(key: string): string {
-  const value = process.env[key];
-  if (value === undefined || value === '') {
+function requireEnv(prefix: string, key: string): string {
+  const value = readEnv(prefix, key);
+  if (value === undefined) {
     throw new Error(
-      `Missing required environment variable ${key}. ` +
+      `Missing required environment variable ${prefix === '' ? key : `${prefix}_${key} (or ${key})`}. ` +
         'See infra/cdk/README.md for the full list.',
     );
   }
@@ -493,18 +578,63 @@ export function bucketNameFor(config: EnvironmentConfig): string {
   return `imgopt-${config.name}-${config.account}-${config.region}`;
 }
 
+function deploymentNames(): string {
+  return DEPLOYMENTS.map((d) => d.name).join(', ');
+}
+
+/** The prefix an entry reads its settings under. */
+function prefixFor(entry: DeploymentEntry): string {
+  return entry.envPrefix ?? entry.name.toUpperCase().replace(/[^A-Z0-9]/g, '_');
+}
+
 export function resolveEnvironment(name: string | undefined): EnvironmentConfig {
   if (name === undefined) {
-    throw new Error(
-      `No environment selected. Pass -c env=<name>, one of: ${Object.keys(ENVIRONMENTS).join(', ')}.`,
-    );
+    throw new Error(`No deployment selected. Pass -c env=<name>, one of: ${deploymentNames()}.`);
   }
 
-  const factory = ENVIRONMENTS[name];
-  if (factory === undefined) {
-    throw new Error(
-      `Unknown environment "${name}". Expected one of: ${Object.keys(ENVIRONMENTS).join(', ')}.`,
-    );
+  const entry = DEPLOYMENTS.find((d) => d.name === name);
+  if (entry === undefined) {
+    throw new Error(`Unknown deployment "${name}". Expected one of: ${deploymentNames()}.`);
   }
-  return factory();
+  return TIERS[entry.tier](entry.name, prefixFor(entry));
+}
+
+/**
+ * Every deployment at once, with the collisions that only exist across entries.
+ *
+ * A deploy resolves one entry, so nothing in the normal path can see two deployments
+ * claiming the same hostname — and CloudFront reports that as `CNAMEAlreadyExists`
+ * during the *second* deployment, after the first has already been created. Checking
+ * here turns it into a synth-time error naming both entries.
+ *
+ * Bucket names cannot collide by construction (they are derived from `name`, which is
+ * the manifest's key), and that is asserted rather than assumed: it is the invariant
+ * the whole isolation story rests on.
+ */
+export function resolveAllDeployments(): EnvironmentConfig[] {
+  const configs = DEPLOYMENTS.map((entry) => TIERS[entry.tier](entry.name, prefixFor(entry)));
+
+  const seenHosts = new Map<string, string>();
+  const seenBuckets = new Map<string, string>();
+
+  for (const config of configs) {
+    const host = seenHosts.get(config.cdnHost);
+    if (host !== undefined) {
+      throw new Error(
+        `Deployments "${host}" and "${config.name}" both claim the CDN hostname ` +
+          `${config.cdnHost}. Each deployment needs its own; set ` +
+          `${config.name.toUpperCase()}_CDN_HOST.`,
+      );
+    }
+    seenHosts.set(config.cdnHost, config.name);
+
+    const bucket = bucketNameFor(config);
+    const owner = seenBuckets.get(bucket);
+    if (owner !== undefined) {
+      throw new Error(`Deployments "${owner}" and "${config.name}" derive the same bucket name.`);
+    }
+    seenBuckets.set(bucket, config.name);
+  }
+
+  return configs;
 }

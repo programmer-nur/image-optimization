@@ -12,7 +12,13 @@ import { Inject, Injectable } from '@nestjs/common';
 import type { Logger } from 'pino';
 import type { StoragePort } from '@imgopt/storage';
 import type { QueuePort } from '@imgopt/queue';
-import { AssetRepository, type Asset, type FocalPoint, type ListAssetsOptions } from '@imgopt/db';
+import {
+  TenantScopedRepository,
+  type Asset,
+  type FocalPoint,
+  type ListAssetsOptions,
+  type TenantScope,
+} from '@imgopt/db';
 import { DERIVED_PREFIX, MASTER_PREFIX, ORIGINAL_PREFIX } from '@imgopt/core';
 import { ASSET_REPOSITORY, LOGGER, QUEUE, STORAGE } from '../../tokens.js';
 import { bindAssetId, requestContext } from '../../common/logger.js';
@@ -23,7 +29,7 @@ import { InvalidationService } from './invalidation.service.js';
 @Injectable()
 export class AssetsService {
   constructor(
-    @Inject(ASSET_REPOSITORY) private readonly repo: AssetRepository,
+    @Inject(ASSET_REPOSITORY) private readonly repo: TenantScopedRepository,
     @Inject(STORAGE) private readonly storage: StoragePort,
     @Inject(QUEUE) private readonly queue: QueuePort,
     @Inject(LOGGER) private readonly logger: Logger,
@@ -31,22 +37,21 @@ export class AssetsService {
     private readonly invalidation: InvalidationService,
   ) {}
 
-  async get(assetId: string): Promise<Asset> {
+  async get(scope: TenantScope, assetId: string): Promise<Asset> {
     bindAssetId(assetId);
-    return this.repo.requireById(assetId);
+    return this.repo.requireById(scope, assetId);
   }
 
-  async currentVersion(assetId: string) {
-    return this.repo.currentVersion(assetId);
+  async currentVersion(scope: TenantScope, assetId: string) {
+    return this.repo.currentVersion(scope, assetId);
   }
 
-  async list(options: ListAssetsOptions) {
-    return this.repo.list(options);
+  async list(scope: TenantScope, options: ListAssetsOptions) {
+    return this.repo.list(scope, options);
   }
 
-  async listVariants(assetId: string) {
-    await this.repo.requireById(assetId);
-    return this.repo.listDerivatives(assetId);
+  async listVariants(scope: TenantScope, assetId: string) {
+    return this.repo.listDerivatives(scope, assetId);
   }
 
   /**
@@ -62,29 +67,31 @@ export class AssetsService {
    * `object-position` and the like), and is documented as exactly that.
    */
   async updateMetadata(
+    scope: TenantScope,
     assetId: string,
     input: { altText?: string | null; tags?: string[]; focalPoint?: FocalPoint | null },
   ): Promise<Asset> {
     bindAssetId(assetId);
-    // Existence check first, so an unknown id is a 404 rather than a driver error.
-    await this.repo.requireById(assetId);
+    // The scoped update checks existence-within-tenant itself, so an id belonging to
+    // anyone else is a 404 before any write is attempted.
+    await this.repo.updateMetadata(scope, assetId, input);
 
-    await this.repo.updateMetadata(assetId, input);
-
-    return this.repo.requireById(assetId);
+    return this.repo.requireById(scope, assetId);
   }
 
   async replaceSource(
+    scope: TenantScope,
     assetId: string,
     body: Readable,
     declaredType: string | undefined,
+    apiKeyId: string | undefined,
   ): Promise<UploadResult> {
-    return this.uploads.replaceSourceStream(assetId, body, declaredType);
+    return this.uploads.replaceSourceStream(scope, assetId, body, declaredType, apiKeyId);
   }
 
-  async reprocess(assetId: string): Promise<void> {
+  async reprocess(scope: TenantScope, assetId: string): Promise<void> {
     bindAssetId(assetId);
-    const asset = await this.repo.requireById(assetId);
+    const asset = await this.repo.requireById(scope, assetId);
     if (asset.currentVersion === 0) {
       throw ApiError.conflict('Cannot reprocess an asset with no stored source.');
     }
@@ -98,14 +105,15 @@ export class AssetsService {
     });
   }
 
-  async delete(assetId: string): Promise<void> {
+  async delete(scope: TenantScope, assetId: string): Promise<void> {
     bindAssetId(assetId);
-    await this.repo.requireById(assetId);
 
     // Soft-delete first: the row records the intent, so a partial object cleanup is
     // reconciled later rather than leaving an asset that is half-deleted and still
-    // servable.
-    await this.repo.softDelete(assetId);
+    // servable. Scoped, so it also serves as the ownership check — the prefix
+    // deletions below are by asset id alone and would otherwise reach any tenant's
+    // objects.
+    await this.repo.softDelete(scope, assetId);
 
     const prefixes = [
       `${ORIGINAL_PREFIX}/${assetId}/`,

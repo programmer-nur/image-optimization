@@ -14,7 +14,11 @@ import pino from 'pino';
 import { loadConfig } from '@imgopt/config';
 import { S3Storage } from '@imgopt/storage';
 import { SqsQueue } from '@imgopt/queue';
-import { AssetRepository, createPrismaClient, hydrateDatabaseCredentials } from '@imgopt/db';
+import {
+  UnscopedAssetRepository,
+  createPrismaClient,
+  hydrateDatabaseCredentials,
+} from '@imgopt/db';
 import { Maintenance, type MaintenanceReport } from './maintenance.js';
 
 // Same as the other Lambdas: the password is fetched from the secret store during
@@ -46,7 +50,13 @@ const prisma = createPrismaClient({
   context: 'lambda',
 });
 
-const maintenance = new Maintenance(storage, new AssetRepository(prisma), queue, config, logger);
+const maintenance = new Maintenance(
+  storage,
+  new UnscopedAssetRepository(prisma),
+  queue,
+  config,
+  logger,
+);
 
 export async function handler(_event: ScheduledEvent): Promise<MaintenanceReport> {
   return maintenance.run();

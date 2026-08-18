@@ -18,7 +18,7 @@ import {
 } from '@nestjs/common';
 import { AssetStatus, type FocalPoint } from '@imgopt/db';
 import { ApiError } from '../../common/errors.js';
-import { ApiKeyGuard, type AuthenticatedRequest } from '../auth/api-key.guard.js';
+import { ApiKeyGuard, requestScope, type AuthenticatedRequest } from '../auth/api-key.guard.js';
 import { RequirePermissions } from '../auth/permissions.decorator.js';
 import { DeliveryService } from '../delivery/delivery.service.js';
 import { AssetsService } from './assets.service.js';
@@ -54,14 +54,17 @@ export class AssetsController {
    */
   @Get(':id')
   @RequirePermissions('read')
-  async get(@Param('id') id: string): Promise<AssetResponse> {
-    const asset = await this.assets.get(id);
+  async get(@Req() req: AuthenticatedRequest, @Param('id') id: string): Promise<AssetResponse> {
+    const asset = await this.assets.get(requestScope(req), id);
     return presentAsset(asset, this.delivery);
   }
 
   @Get(':id/variants')
   @RequirePermissions('read')
-  async variants(@Param('id') id: string): Promise<{
+  async variants(
+    @Req() req: AuthenticatedRequest,
+    @Param('id') id: string,
+  ): Promise<{
     variants: Array<{
       canonicalKey: string;
       format: string;
@@ -72,7 +75,7 @@ export class AssetsController {
       generatedAt: string;
     }>;
   }> {
-    const rows = await this.assets.listVariants(id);
+    const rows = await this.assets.listVariants(requestScope(req), id);
     return {
       variants: rows.map((v) => ({
         canonicalKey: v.canonicalKey,
@@ -88,8 +91,12 @@ export class AssetsController {
 
   @Patch(':id')
   @RequirePermissions('upload')
-  async update(@Param('id') id: string, @Body() body: UpdateBody): Promise<AssetResponse> {
-    const asset = await this.assets.updateMetadata(id, {
+  async update(
+    @Req() req: AuthenticatedRequest,
+    @Param('id') id: string,
+    @Body() body: UpdateBody,
+  ): Promise<AssetResponse> {
+    const asset = await this.assets.updateMetadata(requestScope(req), id, {
       ...(body.altText !== undefined ? { altText: body.altText } : {}),
       ...(body.tags !== undefined ? { tags: body.tags } : {}),
       ...(body.focalPoint !== undefined ? { focalPoint: body.focalPoint } : {}),
@@ -107,32 +114,45 @@ export class AssetsController {
     if (body === undefined) throw ApiError.validation('Expected a raw image body.');
 
     const declaredType = this.headerValue(req.headers['content-type']);
-    const result = await this.assets.replaceSource(id, body, declaredType);
+    const result = await this.assets.replaceSource(
+      requestScope(req),
+      id,
+      body,
+      declaredType,
+      req.apiKey?.id,
+    );
     return { asset: presentAsset(result.asset, this.delivery), duplicate: result.duplicate };
   }
 
   @Post(':id/reprocess')
   @RequirePermissions('upload')
-  async reprocess(@Param('id') id: string): Promise<{ status: string }> {
-    await this.assets.reprocess(id);
+  async reprocess(
+    @Req() req: AuthenticatedRequest,
+    @Param('id') id: string,
+  ): Promise<{ status: string }> {
+    await this.assets.reprocess(requestScope(req), id);
     return { status: 'queued' };
   }
 
   @Delete(':id')
   @RequirePermissions('delete')
-  async remove(@Param('id') id: string): Promise<{ status: string }> {
-    await this.assets.delete(id);
+  async remove(
+    @Req() req: AuthenticatedRequest,
+    @Param('id') id: string,
+  ): Promise<{ status: string }> {
+    await this.assets.delete(requestScope(req), id);
     return { status: AssetStatus.deleted };
   }
 
   @Get()
   @RequirePermissions('read')
   async list(
+    @Req() req: AuthenticatedRequest,
     @Query('limit') limit?: string,
     @Query('cursor') cursor?: string,
     @Query('status') status?: string,
   ): Promise<{ assets: AssetResponse[]; nextCursor?: string }> {
-    const result = await this.assets.list({
+    const result = await this.assets.list(requestScope(req), {
       ...(limit !== undefined ? { limit: Number(limit) } : {}),
       ...(cursor !== undefined ? { cursor } : {}),
       ...(this.isStatus(status) ? { status } : {}),

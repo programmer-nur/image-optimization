@@ -1,9 +1,19 @@
 /**
- * The asset registry.
+ * The asset registry, deployment-wide.
  *
  * Everything the control plane knows about an image. Deliberately *not* on the
  * delivery path: S3 object existence is the sole authority for whether a derivative
  * can be served, so images keep flowing when this database is unavailable.
+ *
+ * UNSCOPED, AND NAMED THAT WAY ON PURPOSE. Nothing here filters by tenant, so it can
+ * read and write across every tenant in the deployment. That is correct for the three
+ * consumers it has — reclamation walks the whole bucket by nature, and the optimizer
+ * and generator act on a job or a key they were handed rather than on behalf of a
+ * caller — and it is wrong for anything serving a request. The control plane uses
+ * `TenantScopedRepository`, whose methods cannot be called without a scope.
+ *
+ * A lint rule restricts importing this class to those workers. If you find yourself
+ * reaching for it in a request path, the answer is a scope, not an exception.
  */
 
 import { Prisma, type PrismaClient } from './generated/client.js';
@@ -18,6 +28,14 @@ export interface FocalPoint {
 }
 
 export interface CreateAssetInput {
+  /**
+   * Required, and deliberately not defaulted.
+   *
+   * A default would make "whichever tenant the code forgot to name" a silent, valid
+   * outcome — and an asset attributed to the wrong tenant is invisible to its owner
+   * while still billing storage.
+   */
+  tenantId: string;
   id?: string;
   apiKeyId?: string;
   altText?: string;
@@ -64,14 +82,103 @@ export class AssetNotFoundError extends Error {
   }
 }
 
-export class AssetRepository {
+export interface AddVersionInput {
+  assetId: string;
+  sourceKey: string;
+  contentHash: string;
+  metadata?: VersionMetadata;
+}
+
+/**
+ * Promotes staged bytes into a new immutable version.
+ *
+ * The version number and the status move together in one transaction: a version row
+ * without the matching `current_version` would make an asset that exists in storage
+ * but is invisible to every reader.
+ *
+ * Shared by both repositories rather than duplicated, because the *only* difference
+ * between them is whether the opening lookup is filtered by tenant — and a copy of
+ * this transaction that drifted from the original would corrupt version history in
+ * whichever copy was not being read.
+ */
+export async function addVersionInTransaction(
+  prisma: PrismaClient,
+  input: AddVersionInput,
+  tenantId?: string,
+) {
+  return prisma.$transaction(async (tx) => {
+    // `findFirst` so the tenant filter can be part of the lookup when there is one;
+    // an id owned by another tenant is indistinguishable from one that does not exist.
+    const asset = await tx.asset.findFirst({
+      where: { id: input.assetId, ...(tenantId !== undefined ? { tenantId } : {}) },
+    });
+    if (asset === null) throw new AssetNotFoundError(input.assetId);
+
+    assertTransition(asset.status, AssetStatus.stored);
+
+    const version = asset.currentVersion + 1;
+    const meta = input.metadata ?? {};
+
+    const created = await tx.assetVersion.create({
+      data: {
+        assetId: input.assetId,
+        version,
+        sourceKey: input.sourceKey,
+        contentHash: input.contentHash,
+        ...(meta.masterKey !== undefined ? { masterKey: meta.masterKey } : {}),
+        ...(meta.masterBytes !== undefined ? { masterBytes: BigInt(meta.masterBytes) } : {}),
+        ...(meta.width !== undefined ? { width: meta.width } : {}),
+        ...(meta.height !== undefined ? { height: meta.height } : {}),
+        ...(meta.format !== undefined ? { format: meta.format } : {}),
+        ...(meta.bytes !== undefined ? { bytes: BigInt(meta.bytes) } : {}),
+        ...(meta.hasAlpha !== undefined ? { hasAlpha: meta.hasAlpha } : {}),
+        ...(meta.colorspace !== undefined ? { colorspace: meta.colorspace } : {}),
+        ...(meta.orientation !== undefined ? { orientation: meta.orientation } : {}),
+        ...(meta.dominantColor !== undefined ? { dominantColor: meta.dominantColor } : {}),
+        ...(meta.lqip !== undefined ? { lqip: meta.lqip } : {}),
+      },
+    });
+
+    /*
+     * The predecessor stops being current at exactly this instant.
+     *
+     * Recorded rather than inferred, because the retention window runs from here:
+     * reclamation used to age a superseded version off its own `createdAt`, which
+     * meant a source that had been live longer than the grace period was deletable
+     * the first time maintenance ran after it was replaced — original, master,
+     * derivatives, rows.
+     *
+     * Stamped with the successor's own database timestamp so both rows agree on one
+     * clock; an app-side `new Date()` would differ from `created_at` by the caller's
+     * skew. `updateMany` with a `supersededAt: null` guard, so a predecessor already
+     * removed by an earlier reclamation cannot fail this promotion, and a stamp is
+     * never restarted.
+     */
+    if (asset.currentVersion > 0) {
+      await tx.assetVersion.updateMany({
+        where: { assetId: input.assetId, version: asset.currentVersion, supersededAt: null },
+        data: { supersededAt: created.createdAt },
+      });
+    }
+
+    await tx.asset.update({
+      where: { id: input.assetId },
+      data: { currentVersion: version, status: AssetStatus.stored, failureReason: null },
+    });
+
+    return created;
+  });
+}
+
+export class UnscopedAssetRepository {
   constructor(private readonly prisma: PrismaClient) {}
 
   /** Reserves an id so the client can build URLs before bytes are stored. */
-  async create(input: CreateAssetInput = {}) {
+  async create(input: CreateAssetInput) {
     return this.prisma.asset.create({
       data: {
         id: input.id ?? newAssetId(),
+        tenantId: input.tenantId,
         status: AssetStatus.pending_upload,
         ...(input.apiKeyId !== undefined ? { apiKeyId: input.apiKeyId } : {}),
         ...(input.altText !== undefined ? { altText: input.altText } : {}),
@@ -130,77 +237,9 @@ export class AssetRepository {
     };
   }
 
-  /**
-   * Promotes staged bytes into a new immutable version.
-   *
-   * The version number and the status move together in one transaction: a version
-   * row without the matching `current_version` would make an asset that exists in
-   * storage but is invisible to every reader.
-   */
-  async addVersion(input: {
-    assetId: string;
-    sourceKey: string;
-    contentHash: string;
-    metadata?: VersionMetadata;
-  }) {
-    return this.prisma.$transaction(async (tx) => {
-      const asset = await tx.asset.findUnique({ where: { id: input.assetId } });
-      if (asset === null) throw new AssetNotFoundError(input.assetId);
-
-      assertTransition(asset.status, AssetStatus.stored);
-
-      const version = asset.currentVersion + 1;
-      const meta = input.metadata ?? {};
-
-      const created = await tx.assetVersion.create({
-        data: {
-          assetId: input.assetId,
-          version,
-          sourceKey: input.sourceKey,
-          contentHash: input.contentHash,
-          ...(meta.masterKey !== undefined ? { masterKey: meta.masterKey } : {}),
-          ...(meta.masterBytes !== undefined ? { masterBytes: BigInt(meta.masterBytes) } : {}),
-          ...(meta.width !== undefined ? { width: meta.width } : {}),
-          ...(meta.height !== undefined ? { height: meta.height } : {}),
-          ...(meta.format !== undefined ? { format: meta.format } : {}),
-          ...(meta.bytes !== undefined ? { bytes: BigInt(meta.bytes) } : {}),
-          ...(meta.hasAlpha !== undefined ? { hasAlpha: meta.hasAlpha } : {}),
-          ...(meta.colorspace !== undefined ? { colorspace: meta.colorspace } : {}),
-          ...(meta.orientation !== undefined ? { orientation: meta.orientation } : {}),
-          ...(meta.dominantColor !== undefined ? { dominantColor: meta.dominantColor } : {}),
-          ...(meta.lqip !== undefined ? { lqip: meta.lqip } : {}),
-        },
-      });
-
-      /*
-       * The predecessor stops being current at exactly this instant.
-       *
-       * Recorded rather than inferred, because the retention window runs from here:
-       * reclamation used to age a superseded version off its own `createdAt`, which
-       * meant a source that had been live longer than the grace period was deletable
-       * the first time maintenance ran after it was replaced — original, master,
-       * derivatives, rows.
-       *
-       * Stamped with the successor's own database timestamp so both rows agree on one
-       * clock; an app-side `new Date()` would differ from `created_at` by the caller's
-       * skew. `updateMany` with a `supersededAt: null` guard, so a predecessor already
-       * removed by an earlier reclamation cannot fail this promotion, and a stamp is
-       * never restarted.
-       */
-      if (asset.currentVersion > 0) {
-        await tx.assetVersion.updateMany({
-          where: { assetId: input.assetId, version: asset.currentVersion, supersededAt: null },
-          data: { supersededAt: created.createdAt },
-        });
-      }
-
-      await tx.asset.update({
-        where: { id: input.assetId },
-        data: { currentVersion: version, status: AssetStatus.stored, failureReason: null },
-      });
-
-      return created;
-    });
+  /** See `addVersionInTransaction`. Unscoped: any asset in the deployment. */
+  async addVersion(input: AddVersionInput) {
+    return addVersionInTransaction(this.prisma, input);
   }
 
   /** Fills in properties discovered during processing. */

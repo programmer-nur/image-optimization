@@ -62,6 +62,8 @@ apps/generator     Function URL Lambda: on-miss generation   (task group 8)
 apps/maintenance   scheduled reclamation and storage accounting (task group 13)
 infra/cloudfront   edge normalizer, generated from packages/core, plus its conformance runner
 infra/cdk          CDK stacks, split by lifecycle             (task group 9)
+infra/cloudflare   DNS records and ACM issuance — outside the CDK, because CloudFormation
+                   cannot write a zone it does not own       (task group 9b)
 packages/client    URL builder, srcset, React + Next.js loader, upload helpers
 examples/nextjs    minimal app exercising hero, gallery, and avatar cases
 infra/local        local service configuration
@@ -80,16 +82,17 @@ Requested widths snap to a fixed ladder, so `?w=602` and `?w=640` resolve to one
 
 ## Documentation
 
-| Guide                                  |                                                           |
-| -------------------------------------- | --------------------------------------------------------- |
-| [Architecture](docs/architecture.md)   | How the two planes fit together, and why                  |
-| [API reference](docs/api-reference.md) | Control-plane endpoints and the transform grammar         |
-| [Integration](docs/integration.md)     | React, Next.js, and non-React consumers                   |
-| [Bootstrap](docs/bootstrap.md)         | Empty AWS account to a working deployment                 |
-| [Operations](docs/operations.md)       | Epoch procedure, dead letters, cache misses, cost review  |
-| [Tuning](docs/tuning.md)               | Every knob, what it buys, and what it costs               |
-| [Release](docs/release.md)             | Versioning, what ships, and what is still blocked         |
-| [Infrastructure](infra/cdk/README.md)  | Stack layout, release order, and the parts that will bite |
+| Guide                                  |                                                                       |
+| -------------------------------------- | --------------------------------------------------------------------- |
+| [Architecture](docs/architecture.md)   | How the two planes fit together, and why                              |
+| [API reference](docs/api-reference.md) | Control-plane endpoints and the transform grammar                     |
+| [Integration](docs/integration.md)     | React, Next.js, and non-React consumers                               |
+| [Bootstrap](docs/bootstrap.md)         | Empty AWS account to a working deployment                             |
+| [Operations](docs/operations.md)       | Epoch procedure, dead letters, cache misses, cost review              |
+| [Tuning](docs/tuning.md)               | Every knob, what it buys, and what it costs                           |
+| [Release](docs/release.md)             | Versioning, what ships, and what is still blocked                     |
+| [Infrastructure](infra/cdk/README.md)  | Stack layout, release order, and the parts that will bite             |
+| [DNS](infra/cloudflare/README.md)      | Cloudflare records, certificate issuance, and why the proxy stays off |
 
 Decisions and their alternatives: [`design.md`](openspec/changes/image-optimization-service/design.md).
 Invariants that are easy to break: [`CLAUDE.md`](CLAUDE.md).

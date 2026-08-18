@@ -10,7 +10,12 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import sharp from 'sharp';
 import { loadConfig, type AppConfig } from '@imgopt/config';
 import { S3Storage } from '@imgopt/storage';
-import { AssetRepository, createPrismaClient, newAssetId } from '@imgopt/db';
+import {
+  DEFAULT_TENANT_ID,
+  UnscopedAssetRepository,
+  createPrismaClient,
+  newAssetId,
+} from '@imgopt/db';
 import type { PrismaClient } from '@imgopt/db';
 import { toCanonicalKey, type TransformSpec } from '@imgopt/core';
 import { Optimizer } from './optimizer.js';
@@ -39,7 +44,7 @@ const storage = new S3Storage({
   credentials: { accessKeyId: 'minioadmin', secretAccessKey: 'minioadmin' },
 });
 const prisma: PrismaClient = createPrismaClient({ connectionString: config.database.url });
-const repo = new AssetRepository(prisma);
+const repo = new UnscopedAssetRepository(prisma);
 const noopLogger = { info() {}, warn() {}, error() {} };
 const optimizer = new Optimizer(storage, repo, config, noopLogger);
 
@@ -49,7 +54,7 @@ const createdIds: string[] = [];
 async function storeAsset(bytes: Buffer, ext = 'jpg'): Promise<string> {
   const id = newAssetId();
   createdIds.push(id);
-  await repo.create({ id });
+  await repo.create({ tenantId: DEFAULT_TENANT_ID, id });
   const sourceKey = `original/${id}/1/source.${ext}`;
   await storage.put(sourceKey, bytes, { contentType: 'image/jpeg' });
   await repo.addVersion({
@@ -213,7 +218,7 @@ describe('terminal failure', () => {
   it('marks the asset failed for a corrupt source without asking for a retry', async () => {
     const id = newAssetId();
     createdIds.push(id);
-    await repo.create({ id });
+    await repo.create({ tenantId: DEFAULT_TENANT_ID, id });
     const sourceKey = `original/${id}/1/source.jpg`;
     // Truncated JPEG: a real decode error, classified terminal.
     const truncated = (await photo(800, 600)).subarray(0, 200);

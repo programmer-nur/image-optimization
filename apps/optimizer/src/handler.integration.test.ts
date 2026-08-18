@@ -11,7 +11,12 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import sharp from 'sharp';
 import type { SQSEvent, SQSRecord } from 'aws-lambda';
 import { S3Storage } from '@imgopt/storage';
-import { AssetRepository, createPrismaClient, newAssetId } from '@imgopt/db';
+import {
+  DEFAULT_TENANT_ID,
+  UnscopedAssetRepository,
+  createPrismaClient,
+  newAssetId,
+} from '@imgopt/db';
 import type { PrismaClient } from '@imgopt/db';
 
 process.env['AWS_REGION'] ??= 'us-east-1';
@@ -41,7 +46,7 @@ const storage = new S3Storage({
 const prisma: PrismaClient = createPrismaClient({
   connectionString: process.env['DATABASE_URL'],
 });
-const repo = new AssetRepository(prisma);
+const repo = new UnscopedAssetRepository(prisma);
 const createdIds: string[] = [];
 
 function record(body: unknown, messageId: string): SQSRecord {
@@ -63,7 +68,7 @@ function record(body: unknown, messageId: string): SQSRecord {
 async function storeAsset(bytes: Buffer): Promise<string> {
   const id = newAssetId();
   createdIds.push(id);
-  await repo.create({ id });
+  await repo.create({ tenantId: DEFAULT_TENANT_ID, id });
   const sourceKey = `original/${id}/1/source.jpg`;
   await storage.put(sourceKey, bytes);
   await repo.addVersion({ assetId: id, sourceKey, contentHash: `h-${id}` });
@@ -119,7 +124,7 @@ describe('handler batch response', () => {
     // class of failure the handler asks SQS to retry.
     const id = newAssetId();
     createdIds.push(id);
-    await repo.create({ id });
+    await repo.create({ tenantId: DEFAULT_TENANT_ID, id });
     await repo.addVersion({
       assetId: id,
       sourceKey: `original/${id}/1/missing.jpg`,
@@ -142,7 +147,7 @@ describe('handler batch response', () => {
     );
     const missingSource = newAssetId();
     createdIds.push(missingSource);
-    await repo.create({ id: missingSource });
+    await repo.create({ tenantId: DEFAULT_TENANT_ID, id: missingSource });
     await repo.addVersion({
       assetId: missingSource,
       sourceKey: `original/${missingSource}/1/missing.jpg`,

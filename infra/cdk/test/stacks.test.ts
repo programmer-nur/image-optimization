@@ -18,15 +18,21 @@
  * - prefix-scoped IAM, because a role that can write `original/` can rewrite history
  */
 
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { App } from 'aws-cdk-lib';
 import { Match, Template } from 'aws-cdk-lib/assertions';
 import { beforeAll, describe, expect, it } from 'vitest';
 
 import { METRICS } from '@imgopt/metrics';
-import { ENVIRONMENTS, bucketNameFor, type EnvironmentConfig } from '../lib/config.js';
+import {
+  DEPLOYMENTS,
+  bucketNameFor,
+  resolveAllDeployments,
+  resolveEnvironment,
+  type EnvironmentConfig,
+} from '../lib/config.js';
 import { NetworkStack } from '../lib/network-stack.js';
 import { StorageStack } from '../lib/storage-stack.js';
 import { DataStack } from '../lib/data-stack.js';
@@ -42,37 +48,33 @@ const TEST_PUBLIC_KEY = [
   '-----END PUBLIC KEY-----',
 ].join('\n');
 
-const here = dirname(fileURLToPath(import.meta.url));
-const repoRoot = resolve(here, '..', '..', '..');
-
 /**
- * Stands in for the real build artifacts.
+ * Stands in for the real build artifacts, in a temporary directory.
  *
- * Synthesis only needs the directories to exist and hold an entrypoint; what CDK zips
- * is irrelevant to the template. Creating them here keeps these tests runnable on a
- * fresh clone without a Docker daemon or an esbuild pass.
+ * Temporary, and that is the whole point. The stub has to be named `index.mjs`,
+ * because `artifacts.ts` asserts that name so an ESM bundle written to a bare `.js`
+ * fails at synth rather than at every invocation of the deployed function. But that
+ * is also exactly the filename the real bundler emits — so writing the stub into each
+ * app's `dist-bundle` directory replaced a real build with a 30-byte comment, and
+ * `pnpm test` after `build:bundles` produced a deploy that succeeded and shipped empty
+ * functions.
  *
- * The stub is deliberately named `index.mjs`, matching what the real bundles emit:
- * `artifacts.ts` asserts that name so an ESM bundle written to a bare `.js` fails at
- * synth instead of at every invocation of the deployed function. A stub that ignored
- * the rule would make these tests pass over exactly the mistake the rule exists for.
- * The packaging job in CI builds the real bundles and is what proves they land there.
+ * `IMGOPT_ARTIFACT_ROOT` points the resolver somewhere disposable instead, so the two
+ * can never collide regardless of what order anyone runs things in.
  */
 function stubArtifacts(): void {
-  const bundleDirs = [
-    join(repoRoot, 'apps', 'optimizer', 'dist-bundle'),
-    join(repoRoot, 'apps', 'generator', 'dist-bundle'),
-    join(repoRoot, 'apps', 'maintenance', 'dist-bundle'),
-  ];
+  const root = mkdtempSync(join(tmpdir(), 'imgopt-synth-'));
+  process.env['IMGOPT_ARTIFACT_ROOT'] = root;
 
-  for (const dir of bundleDirs) {
+  for (const app of ['optimizer', 'generator', 'maintenance']) {
+    const dir = join(root, 'apps', app, 'dist-bundle');
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, 'index.mjs'), '// created by infra/cdk tests\n');
+    writeFileSync(join(dir, 'index.mjs'), '// synthesis stub\n');
   }
 
-  const layer = join(here, '..', 'layers', 'sharp');
+  const layer = join(root, 'layers', 'sharp');
   mkdirSync(layer, { recursive: true });
-  writeFileSync(join(layer, '.synth-placeholder'), 'created by infra/cdk tests\n');
+  writeFileSync(join(layer, '.synth-placeholder'), 'synthesis stub\n');
 }
 
 interface Synthesized {
@@ -104,10 +106,17 @@ function synthesize(
     // Required in every environment: the tag is the rollback coordinate, and config
     // refuses both an absent one and `latest`.
     API_IMAGE_TAG: 'v-test',
-    // An ARN rather than an issued certificate, so these tests need no certificate
-    // stack. Production refuses to synthesize without one.
+    // ARNs, because nothing issues certificates any more: DNS is in Cloudflare, so
+    // validation cannot happen inside a deployment. Production refuses to synthesize
+    // without the API one.
     API_CERTIFICATE_ARN:
       'arn:aws:acm:us-east-1:123456789012:certificate/11111111-2222-3333-4444-555555555555',
+    CDN_CERTIFICATE_ARN:
+      'arn:aws:acm:us-east-1:123456789012:certificate/22222222-3333-4444-5555-666666666666',
+    // The third manifest entry's own hostname. Deployments cannot share one, so
+    // `demo` needs a prefixed value; everything else it needs falls back to the
+    // shared defaults above, which is exactly the intended onboarding shape.
+    DEMO_CDN_HOST: 'images.demo.example.com',
   });
 
   for (const [key, value] of Object.entries(overrides)) {
@@ -115,7 +124,7 @@ function synthesize(
     else process.env[key] = value;
   }
 
-  const config = ENVIRONMENTS[environment]!();
+  const config = resolveEnvironment(environment);
   // Exercise the optional security features rather than synthesizing them away.
   config.malwareScanning = true;
   config.privateDeliveryPublicKey = TEST_PUBLIC_KEY;
@@ -247,10 +256,93 @@ describe('the app synthesizes', () => {
     }
   });
 
-  it('synthesizes every configured environment', () => {
-    for (const name of Object.keys(ENVIRONMENTS)) {
-      expect(() => synthesize(name), `${name} failed to synthesize`).not.toThrow();
+  it('synthesizes every deployment in the manifest', () => {
+    for (const entry of DEPLOYMENTS) {
+      expect(() => synthesize(entry.name), `${entry.name} failed to synthesize`).not.toThrow();
     }
+  });
+});
+
+/*
+ * The manifest, as a deployment boundary (tasks 2.1 / 2.2).
+ *
+ * The claim being tested is that adding an application is adding an entry — so the
+ * things that would make that false are what is asserted: a third entry that reads
+ * another deployment's settings, two deployments sharing a bucket, or a deployment
+ * whose resources are named after a tier rather than after itself.
+ */
+describe('deployment manifest', () => {
+  it('carries more than the staging/production pair', () => {
+    // Guards the refactor itself. With only two entries the manifest is
+    // indistinguishable from what it replaced, and nothing here would be exercised.
+    expect(DEPLOYMENTS.length).toBeGreaterThan(2);
+  });
+
+  /**
+   * Runs `fn` with a distinct hostname configured for every entry.
+   *
+   * This is the configuration a multi-deployment account actually has, and it is
+   * *not* the suite's default — the rest of these tests deploy one deployment at a
+   * time from the bare variables, which is the single-deployment shape.
+   */
+  function withPerDeploymentHosts<T>(fn: () => T): T {
+    const saved = DEPLOYMENTS.map((d) => {
+      const key = `${d.name.toUpperCase()}_CDN_HOST`;
+      const before = process.env[key];
+      process.env[key] = `images.${d.name}.example.com`;
+      return [key, before] as const;
+    });
+
+    try {
+      return fn();
+    } finally {
+      for (const [key, before] of saved) {
+        if (before === undefined) delete process.env[key];
+        else process.env[key] = before;
+      }
+    }
+  }
+
+  it('gives every deployment its own bucket and hostname', () => {
+    const configs = withPerDeploymentHosts(resolveAllDeployments);
+
+    expect(configs.length).toBe(DEPLOYMENTS.length);
+    expect(new Set(configs.map(bucketNameFor)).size).toBe(configs.length);
+    expect(new Set(configs.map((c) => c.cdnHost)).size).toBe(configs.length);
+  });
+
+  it('prefers the deployment’s own prefix over the bare variable', () => {
+    expect(resolveEnvironment('demo').cdnHost).toBe(process.env['DEMO_CDN_HOST']);
+    // No STAGING_CDN_HOST is set here, so staging falls back — which is what keeps a
+    // single-deployment account working from the plain names it always used.
+    expect(resolveEnvironment('staging').cdnHost).toBe(process.env['CDN_HOST']);
+  });
+
+  it('refuses two deployments claiming one hostname', () => {
+    // The default suite environment is exactly the broken multi-deployment case:
+    // staging and production both fall back to the shared CDN_HOST. CloudFront
+    // reports that as CNAMEAlreadyExists partway through the *second* deployment,
+    // after the first is already created. Named here instead, at synth, with both
+    // entries in the message.
+    expect(() => resolveAllDeployments()).toThrow(/both claim the CDN hostname/);
+    expect(() => resolveAllDeployments()).toThrow(/staging.*production|production.*staging/);
+  });
+
+  it('names resources after the deployment, not its tier', () => {
+    // `demo` and `staging` share a tier. If anything were keyed off the tier they
+    // would collide in the same account — the failure this whole split exists to
+    // prevent.
+    const demo = resolveEnvironment('demo');
+    const staging = resolveEnvironment('staging');
+
+    expect(demo.database.instanceType).toEqual(staging.database.instanceType);
+    expect(bucketNameFor(demo)).not.toBe(bucketNameFor(staging));
+    expect(bucketNameFor(demo)).toContain('demo');
+  });
+
+  it('rejects an unknown deployment by name, listing the real ones', () => {
+    expect(() => resolveEnvironment('nope')).toThrow(/Unknown deployment "nope"/);
+    expect(() => resolveEnvironment('nope')).toThrow(/demo/);
   });
 });
 
@@ -283,6 +375,109 @@ describe('delivery plane', () => {
         },
       },
     });
+  });
+
+  /*
+   * DNS is Cloudflare's, and certificates are pre-issued.
+   *
+   * Asserted as an absence because the failure is a slow one: a `Route53::RecordSet`
+   * here would need a hosted zone that does not exist, and an `ACM::Certificate` with
+   * DNS validation would make CloudFormation sit and wait for a record only a human
+   * with a Cloudflare token can create — a deploy that hangs rather than fails. See
+   * design.md D18.
+   */
+  it('creates no DNS records and issues no certificates', () => {
+    for (const [name, template] of [
+      ['cdn', app.cdn],
+      ['compute', app.compute],
+    ] as const) {
+      expect(Object.keys(template.findResources('AWS::Route53::RecordSet')), name).toHaveLength(0);
+      expect(Object.keys(template.findResources('AWS::Route53::HostedZone')), name).toHaveLength(0);
+      expect(
+        Object.keys(template.findResources('AWS::CertificateManager::Certificate')),
+        name,
+      ).toHaveLength(0);
+    }
+  });
+
+  /*
+   * A deployment outside us-east-1 still gets a CloudFront certificate.
+   *
+   * The certificate used to come from a us-east-1 stack, which is why the CDN stack
+   * carried `crossRegionReferences: true` — CDK provisions SSM-backed custom resources
+   * to move an export across regions. Now the ARN is a literal from configuration, so
+   * there is no export to move and that machinery is gone. Asserted rather than
+   * assumed: if it were still needed, every non-us-east-1 deployment would break, and
+   * the default region hides it.
+   *
+   * Built by hand rather than through `synthesize()` because the observability stack
+   * cannot synthesize outside us-east-1 at all: CloudFront publishes its metrics only
+   * there, and CloudWatch refuses an alarm on a metric from another region. That is a
+   * real constraint on where the observability stack may be deployed, recorded here
+   * because this is the test that would otherwise trip over it.
+   */
+  it('attaches a us-east-1 certificate from a stack in another region', () => {
+    Object.assign(process.env, {
+      CDK_ACCOUNT: '123456789012',
+      CDK_REGION: 'eu-west-1',
+      CDN_HOST: 'images.example.com',
+      API_HOST: 'api.example.com',
+      API_IMAGE_TAG: 'v-test',
+      CDN_CERTIFICATE_ARN: 'arn:aws:acm:us-east-1:123456789012:certificate/aaaa-bbbb',
+      API_CERTIFICATE_ARN: 'arn:aws:acm:eu-west-1:123456789012:certificate/cccc-dddd',
+    });
+
+    const config = resolveEnvironment('production');
+    const scoped = new App();
+    const env = { account: config.account, region: config.region };
+
+    const network = new NetworkStack(scoped, 'N', { env, config });
+    const storage = new StorageStack(scoped, 'S', { env, config });
+    const queue = new QueueStack(scoped, 'Q', { env, config });
+    const data = new DataStack(scoped, 'D', {
+      env,
+      config,
+      vpc: network.vpc,
+      databaseSecurityGroup: network.databaseSecurityGroup,
+    });
+    const compute = new ComputeStack(scoped, 'C', {
+      env,
+      config,
+      vpc: network.vpc,
+      appSecurityGroup: network.appSecurityGroup,
+      albSecurityGroup: network.albSecurityGroup,
+      bucket: storage.bucket,
+      optimizeQueue: queue.optimizeQueue,
+      database: data.instance,
+      databaseSecret: data.secret,
+      databaseName: data.databaseName,
+    });
+    const cdn = Template.fromStack(
+      new CdnStack(scoped, 'CDN', {
+        env,
+        config,
+        generatorFunctionUrl: compute.generatorFunctionUrl,
+      }),
+    );
+
+    expect(JSON.stringify(cdn.toJSON())).toContain(
+      'arn:aws:acm:us-east-1:123456789012:certificate/aaaa-bbbb',
+    );
+    // What `crossRegionReferences` would have provisioned, and no longer needs to.
+    expect(Object.keys(cdn.findResources('Custom::CrossRegionExportReader'))).toHaveLength(0);
+
+    process.env['CDK_REGION'] = 'us-east-1';
+  });
+
+  it('publishes the DNS targets an external provider needs', () => {
+    // The reconciler in infra/cloudflare reads these; a renamed output silently
+    // leaves the zone pointing at the previous deployment.
+    for (const [template, output] of [
+      [app.cdn, 'CdnDnsTarget'],
+      [app.compute, 'ApiDnsTarget'],
+    ] as const) {
+      expect(Object.keys(template.findOutputs(output))).toHaveLength(1);
+    }
   });
 
   it('subscribes to the metrics its own alarms watch', () => {
@@ -1020,8 +1215,8 @@ describe('lifecycle and cost controls', () => {
     ).PriceClass;
 
     expect(priceClass).toBe('PriceClass_All');
-    expect(ENVIRONMENTS['staging']!().delivery.priceClass).not.toBe(
-      ENVIRONMENTS['production']!().delivery.priceClass,
+    expect(resolveEnvironment('staging').delivery.priceClass).not.toBe(
+      resolveEnvironment('production').delivery.priceClass,
     );
   });
 });

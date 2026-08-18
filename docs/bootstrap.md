@@ -10,8 +10,9 @@
 - An AWS account and credentials with permission to create IAM, VPC, S3, RDS, ECS,
   Lambda, and CloudFront resources.
 - Node 22, pnpm 11, Docker (able to run `linux/arm64` containers).
-- A domain you control, ideally with its hosted zone in the same account. If DNS lives
-  elsewhere the deployment still works — see [DNS](#dns).
+- A domain you control, with its zone in **Cloudflare**, and a scoped API token
+  (`Zone:DNS:Edit` on that zone). Route 53 is not used — see [DNS and certificates](#dns-and-certificates).
+  A first deploy works without any domain at all, on the `*.cloudfront.net` name.
 
 ## 1. Install and verify locally first
 
@@ -65,13 +66,26 @@ after CI was green.
 
 ```bash
 export CDN_HOST=images.example.com
-export API_HOST=api.example.com            # optional
-export HOSTED_ZONE_ID=Z123...              # optional; see DNS below
-export HOSTED_ZONE_NAME=example.com
+export API_HOST=api.example.com            # optional in staging, required in production
 export MALWARE_SCANNING=true               # optional; charged per GB scanned
+
+# Cloudflare, for DNS and certificate validation. A scoped token, never a global key.
+export CLOUDFLARE_API_TOKEN=...
+export CLOUDFLARE_ZONE_ID=...
 ```
 
 The full list is in [`infra/cdk/README.md`](../infra/cdk/README.md).
+
+Then issue the certificates, before deploying anything — the CDK takes them as ARNs
+and issues nothing itself:
+
+```bash
+pnpm --filter @imgopt/cloudflare certs
+```
+
+Export the two lines it prints. Skip this only if you are deploying without a custom
+domain; production will refuse to synthesize without the API certificate. Details and
+the reasoning are in [DNS and certificates](#dns-and-certificates).
 
 ## 5. First deploy, in two parts
 
@@ -137,15 +151,35 @@ node -e "
 const { generateApiKey } = require('./apps/api/dist/modules/auth/api-key.js');
 const k = generateApiKey();
 console.log('PLAINTEXT (store now):', k.plaintext);
-console.log('INSERT INTO api_keys (id, name, hash, permissions, created_at) VALUES (\'' +
-  k.keyId + \"', 'bootstrap', '\" + k.hash + \"', ARRAY['read','upload','delete','admin'], now());\");
+console.log(\"INSERT INTO api_keys (id, tenant_id, name, hash, permissions, created_at) VALUES ('\" +
+  k.keyId + \"', 'tenant_default', 'bootstrap', '\" + k.hash + \"', ARRAY['read','upload','delete','admin'], now());\");
 "
 ```
 
-Run the emitted `INSERT` against the database, then use the plaintext to create
-properly scoped keys through `POST /v1/keys`. Revoke the bootstrap key afterwards.
+`tenant_default` is created by the migration in step 6, so it already exists — the
+insert fails on a foreign key if you run it before migrating, which is the intended
+order. Every asset this key uploads is attributed to that tenant, and its quota is
+accounted there rather than on the key: issuing a second key does not grant a second
+allowance.
 
-## 8. Verify
+Run the emitted `INSERT` against the database, then use the plaintext to create
+properly scoped keys through `POST /v1/keys`. Those are issued into the issuer's own
+tenant — the endpoint takes no tenant id, because `admin` on any key would otherwise be
+a way to mint credentials for someone else's data. Revoke the bootstrap key afterwards.
+
+## 8. Point Cloudflare at it
+
+The distribution and load balancer hostnames only exist once the stacks do, so DNS is
+the phase after the deploy rather than part of it:
+
+```bash
+pnpm --filter @imgopt/cloudflare dns
+```
+
+Read the plan, then re-run with `--apply`. Every record is created **proxy off**; see
+[DNS and certificates](#dns-and-certificates) for why that is not a preference.
+
+## 9. Verify
 
 ```bash
 pnpm --filter @imgopt/infra smoke -- --env staging
@@ -172,15 +206,50 @@ pnpm --filter @imgopt/infra smoke -- --env staging --asset <assetId>
 Miss then hit is the whole architecture working. If the second request also misses,
 stop and read [the runbook](operations.md#every-request-is-regenerating).
 
-## DNS
+## DNS and certificates
 
-With `HOSTED_ZONE_ID` and `HOSTED_ZONE_NAME` set, the certificate is issued and
-validated automatically and the alias records are created.
+DNS is in Cloudflare and the CDK creates no records and issues no certificates — it
+cannot, because CloudFormation can only write a zone it owns. Point the certificate
+construct at an external zone and the stack does not fail, it _waits_, holding the
+deploy open until CloudFormation gives up hours later. So issuance happens before the
+deploy and DNS after it. See design.md D18.
 
-Without them the deployment still succeeds — the distribution serves on its own
-`*.cloudfront.net` name, and the `ManualDnsRecord` output names the record to create by
-hand. An externally managed zone is a normal arrangement, not a blocker. Once the
-record exists, set `CDN_HOST` on the API to match so generated URLs use it.
+**Before the first deploy — certificates.** Run this once per environment; it requests
+both certificates, writes each validation record into Cloudflare, waits for ACM to
+issue, and prints the ARNs:
+
+```bash
+pnpm --filter @imgopt/cloudflare certs
+```
+
+Export the two lines it prints (`CDN_CERTIFICATE_ARN`, `API_CERTIFICATE_ARN`) before
+deploying. Two certificates, not one: CloudFront accepts a viewer certificate only
+from `us-east-1`, an ALB only from its own region.
+
+**Leave the validation records alone afterwards.** ACM re-checks them to renew, roughly
+every eleven months; deleting them turns renewal into a silent failure that surfaces as
+an expired certificate on a date nobody has in a calendar.
+
+**After each deploy — DNS.** The distribution and load balancer hostnames are assigned
+by AWS, so they are read from stack outputs rather than written down:
+
+```bash
+pnpm --filter @imgopt/cloudflare dns
+```
+
+That prints a plan and writes nothing. Add `--apply` when it looks right. Re-run it
+after any deploy that could replace the distribution or the load balancer.
+
+**The proxy must stay off** — grey cloud, not orange. Cloudflare's proxy caches by URL
+and honours `Vary` only for `Accept-Encoding`, while this service returns AVIF, WebP or
+JPEG from one URL depending on the viewer's `Accept`. Proxied, Cloudflare caches
+whichever format the first visitor received and serves it to everyone — AVIF to
+browsers that cannot decode it, with nothing in any log to explain the broken images.
+The reconciler turns the proxy off rather than reporting it.
+
+**Without a domain** the deployment still succeeds: the distribution serves on its own
+`*.cloudfront.net` name and the ALB on its own DNS name, with staging permitted to run
+plain HTTP. Production refuses to synthesize without an API certificate.
 
 ## Production
 
@@ -191,12 +260,76 @@ default.
 Deploy staging first and leave it running. It is the only place to find out whether a
 change to the transform grammar did what you expected before it reaches cached URLs.
 
+## Onboarding another application
+
+A second application is a second deployment. There is no tenant id in a URL, no shared
+bucket, and no route that branches on who is calling — the isolation the stacks already
+have between staging and production is the same isolation between two customers. See
+`openspec/changes/multi-tenancy/design.md` T2 for why the boundary is drawn here.
+
+Add the entry to `DEPLOYMENTS` in `infra/cdk/lib/config.ts`:
+
+```ts
+{ name: 'acme', tier: 'production' },
+```
+
+`tier` is a sizing profile only — database class, task count, price class, whether
+malware scanning defaults on. It says nothing about who the deployment is for, and two
+deployments on the same tier collide nowhere: every resource name derives from `name`.
+
+Then repeat this guide with `-c env=acme`, using `ACME_`-prefixed variables so the new
+deployment does not read another's settings:
+
+```bash
+export ACME_CDN_HOST=images.acme.example.com
+export ACME_API_HOST=api.acme.example.com
+export ACME_CDN_CERTIFICATE_ARN=...   # us-east-1, from `pnpm --filter @imgopt/cloudflare certs`
+export ACME_API_CERTIFICATE_ARN=...   # this region
+export ACME_CDN_DISTRIBUTION_ID=...   # after the first deploy; see step 5
+```
+
+Any variable without a prefix falls back to the bare name, which is what keeps a
+single-deployment account working — and is also the trap: leave `ACME_CDN_HOST` unset
+and the new deployment claims the existing one's hostname. CloudFront reports that as
+`CNAMEAlreadyExists`, partway through the second deploy, after resources have already
+been created. `resolveAllDeployments()` refuses it at synth instead; the manifest test
+in `infra/cdk/test/stacks.test.ts` runs that check.
+
+### What is per-deployment, and what is shared
+
+**Per-deployment — all of it:**
+
+| Thing                               | Why it cannot be shared                                                    |
+| ----------------------------------- | -------------------------------------------------------------------------- |
+| S3 bucket                           | the read grant is pinned to one distribution; sharing defeats it           |
+| PostgreSQL instance                 | the registry is the deployment's, and quotas are accounted in it           |
+| CloudFront distribution + function  | one origin, one edge normalizer, one cache                                 |
+| SQS optimize + dead-letter queues   | a shared queue would hand one deployment's job to another's worker         |
+| Both Lambdas, the Fargate service   | each carries its own bucket and queue in its environment                   |
+| Hostnames (CDN and API)             | an alias belongs to exactly one distribution                               |
+| Two ACM certificates                | us-east-1 for CloudFront, this region for the ALB                          |
+| Two Cloudflare CNAMEs, grey-clouded | see [DNS and certificates](#dns-and-certificates)                          |
+| VPC, NAT gateway, RDS instance      | the fixed cost floor; see [tuning.md](tuning.md#cost-floor-per-deployment) |
+
+**Shared: nothing.** Deployments may sit in one AWS account, and that is the only thing
+they have in common. It is also the only place they can run out of room — CloudFront's
+per-account quotas on cache policies, response-headers policies, functions, and key
+groups are counted per account, not per deployment. The wall arrives around the
+eleventh deployment for key groups and the twenty-first for policies, as a
+`LimitExceeded` naming a resource nobody associates with deployment count.
+
+The registry carries a `tenant_id` on every asset and key regardless, with one tenant
+row per deployment. It costs nothing at one tenant and it is what makes collapsing
+several deployments into one later a data migration rather than a route-by-route audit.
+
 ## Known rough edges
 
 - **`cdk synth` needs credentials** even though it deploys nothing: resolving a VPC's
   availability zones for a concrete account is a context lookup. Use
   `pnpm --filter @imgopt/infra test` for a credential-free check.
 - **First deploy is two-phase** because of the ECR chicken-and-egg above.
+- **DNS is a third phase**, after the deploy, because the hostnames to point at do not
+  exist until the stacks do.
 - **The API image builds and runs**, verified locally: `/healthz` 200, `/readyz` 503
   with dependencies down, 401 unauthenticated, non-root, healthcheck green. It is
   ~720MB, which is unremarkable for Node plus sharp plus Prisma plus the AWS SDK but

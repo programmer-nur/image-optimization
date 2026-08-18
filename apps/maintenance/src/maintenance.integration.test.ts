@@ -13,7 +13,13 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { loadConfig, type AppConfig } from '@imgopt/config';
 import { S3Storage } from '@imgopt/storage';
 import type { QueuePort } from '@imgopt/queue';
-import { AssetRepository, createPrismaClient, newAssetId, type PrismaClient } from '@imgopt/db';
+import {
+  DEFAULT_TENANT_ID,
+  UnscopedAssetRepository,
+  createPrismaClient,
+  newAssetId,
+  type PrismaClient,
+} from '@imgopt/db';
 import { Maintenance, ownerOf } from './maintenance.js';
 
 process.env['AWS_REGION'] ??= 'us-east-1';
@@ -38,7 +44,7 @@ const storage = new S3Storage({
 });
 
 const prisma: PrismaClient = createPrismaClient({ connectionString: config.database.url });
-const repo = new AssetRepository(prisma);
+const repo = new UnscopedAssetRepository(prisma);
 const noopLogger = { info() {}, warn() {}, error() {} };
 
 const createdIds: string[] = [];
@@ -76,7 +82,7 @@ async function storedAsset(options: { version?: number } = {}): Promise<string> 
   createdIds.push(id);
 
   const version = options.version ?? 1;
-  await repo.create({ id });
+  await repo.create({ tenantId: DEFAULT_TENANT_ID, id });
 
   const sourceKey = `original/${id}/${version}/source.jpg`;
   await storage.put(sourceKey, Buffer.from('source-bytes'), { contentType: 'image/jpeg' });
@@ -336,7 +342,7 @@ describe('pending upload reaping', () => {
   it('reaps an upload that was presigned and never completed', async () => {
     const id = newAssetId();
     createdIds.push(id);
-    await repo.create({ id });
+    await repo.create({ tenantId: DEFAULT_TENANT_ID, id });
     await storage.put(`staging/${id}`, Buffer.from('abandoned'), { contentType: 'image/jpeg' });
 
     await maintenance({ pendingUploadTtlHours: 1 }).run(new Date(Date.now() + 2 * HOUR));
@@ -349,7 +355,7 @@ describe('pending upload reaping', () => {
     // Still inside its window: the client may be mid-upload right now.
     const id = newAssetId();
     createdIds.push(id);
-    await repo.create({ id });
+    await repo.create({ tenantId: DEFAULT_TENANT_ID, id });
 
     await maintenance({ pendingUploadTtlHours: 24 }).run();
 

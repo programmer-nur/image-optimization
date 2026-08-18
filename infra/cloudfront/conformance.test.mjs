@@ -17,7 +17,11 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
-import { CONFORMANCE_VECTORS, EQUIVALENCE_GROUPS } from '@imgopt/core/conformance-vectors';
+import {
+  CONFORMANCE_VECTORS,
+  EQUIVALENCE_GROUPS,
+  PATH_VECTORS,
+} from '@imgopt/core/conformance-vectors';
 import { parseTransformFromQuery, parseVariantName, toVariantName } from '@imgopt/core';
 
 import { OUTPUT_PATH, generate } from './generate.mjs';
@@ -107,6 +111,28 @@ describe('edge/core conformance', () => {
         true,
       );
     }
+  });
+});
+
+/*
+ * The path half of the grammar, which the query vectors do not reach.
+ *
+ * They pin the variant filename; this pins the whole rewritten URI — which prefixes
+ * are viewer-facing, where the id and version sit, and what is refused outright. That
+ * is the part of the edge most likely to change structurally, and until these vectors
+ * existed it was covered only by assertions written here, with no shared oracle for
+ * `packages/core` to be held to.
+ */
+describe('edge path shape', () => {
+  it.each(PATH_VECTORS.map((v) => [v.uri, v]))('%s', (_label, vector) => {
+    const result = handler(eventFor(vector.query, undefined, { uri: vector.uri }));
+
+    const actual =
+      result.statusCode === undefined
+        ? result.uri
+        : `ERROR:${result.headers['x-imgopt-error'].value}`;
+
+    expect(actual).toBe(vector.expected);
   });
 });
 

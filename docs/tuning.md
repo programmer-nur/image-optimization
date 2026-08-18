@@ -149,6 +149,63 @@ Directly billed, and one of the few settings with an immediate, predictable effe
 `PriceClass_100` (US/EU/Israel) is materially cheaper; the wider classes add latency
 improvements for viewers elsewhere. If your audience is regional, this is free money.
 
+## Cost floor per deployment
+
+Every deployment is fully isolated (see
+[bootstrap.md](bootstrap.md#onboarding-another-application)), so this is what a
+deployment costs **with zero traffic and zero stored bytes** — before a single image is
+served. It matters because it is the number that scales with deployment _count_ rather
+than with usage, and it is the whole argument for the fourth or fifth application
+eventually sharing one deployment instead.
+
+Figures are us-east-1 on-demand list prices at 730 hours, computed from the values in
+`infra/cdk/lib/config.ts`. **They are arithmetic, not observed** — nothing here has been
+deployed, so treat them as the shape of the bill rather than the bill.
+
+| Resource                           | `staging` tier                | `production` tier            |
+| ---------------------------------- | ----------------------------- | ---------------------------- |
+| NAT gateway (`natGateways: 1`)     | $32.85                        | $32.85                       |
+| Interface VPC endpoints (3 × 2 AZ) | $43.80                        | $43.80                       |
+| RDS instance                       | $11.68 (t4g.micro, single-AZ) | $46.72 (t4g.small, Multi-AZ) |
+| RDS storage (gp3)                  | $2.30 (20 GB)                 | $23.00 (100 GB, mirrored)    |
+| Fargate tasks                      | $18.02 (1 × 0.5 vCPU/1 GB)    | $72.08 (2 × 1 vCPU/2 GB)     |
+| Application Load Balancer          | $16.43                        | $16.43                       |
+| Secrets Manager (1 secret)         | $0.40                         | $0.40                        |
+| CloudWatch alarms (14)             | $1.40                         | $1.40                        |
+| **Floor**                          | **≈ $127/month**              | **≈ $237/month**             |
+
+CloudFront, S3, SQS, and both Lambdas add nothing at zero traffic — they are the parts
+that scale with usage, which is the intended shape.
+
+Two entries stand out because they are larger than they look:
+
+**The interface endpoints cost more than the NAT gateway they exist to avoid.** Three
+services (SQS, Secrets Manager, CloudWatch Logs) × two availability zones × $0.01/hour.
+They are not there to save money — they are there so the hot paths do not depend on a
+NAT in one AZ. Dropping to `maxAzs: 1` halves them and gives up the redundancy; dropping
+the endpoints and keeping the NAT saves about $30 and puts queue traffic through it.
+
+**`natGateways: 1` is not a saving to be found, it is a risk already taken.** One NAT
+lives in one AZ, and everything not endpoint-backed — ECR image pulls for task launches,
+X-Ray, STS — goes through it. A second is one line and roughly one more $32.85; see the
+comment on `network.natGateways` for why the default is one anyway.
+
+The floor is also why `demo` sits on the `staging` tier in the manifest: an internal or
+low-volume deployment costs $127 rather than $237 for the same code, and the difference
+is entirely Multi-AZ and task count.
+
+### When to stop adding deployments
+
+At three deployments the fixed cost is roughly $400–700/month before traffic. That is
+cheap next to the isolation it buys — no shared bucket, no shared database, no route
+that can read the wrong tenant — and it stays cheap while bandwidth dominates the bill
+(D16: roughly 75% of the running cost at any real volume).
+
+Revisit when the fixed floor is a visible fraction of the total, or at the CloudFront
+account quotas, whichever comes first: cache policies and response-headers policies cap
+around twenty deployments, key groups around ten. Both are per-account, both surface as
+a `LimitExceeded` naming a resource nobody associates with deployment count.
+
 ## Lifecycle windows
 
 `ORPHAN_SAFETY_WINDOW_HOURS` (24), `SUPERSEDED_RETENTION_DAYS` (30),

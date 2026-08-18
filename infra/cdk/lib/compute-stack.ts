@@ -27,8 +27,6 @@ import { ApplicationProtocol } from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as logs from 'aws-cdk-lib/aws-logs';
-import * as route53 from 'aws-cdk-lib/aws-route53';
-import * as targets from 'aws-cdk-lib/aws-route53-targets';
 import * as wafv2 from 'aws-cdk-lib/aws-wafv2';
 import type * as rds from 'aws-cdk-lib/aws-rds';
 import * as s3 from 'aws-cdk-lib/aws-s3';
@@ -52,8 +50,6 @@ export interface ComputeStackProps extends StackProps {
   database: rds.IDatabaseInstance;
   databaseSecret: secretsmanager.ISecret;
   databaseName: string;
-  /** Regional certificate for the ALB. Absent means plain HTTP on the ALB DNS name. */
-  apiCertificate?: acm.ICertificate;
 }
 
 export class ComputeStack extends Stack {
@@ -81,7 +77,6 @@ export class ComputeStack extends Stack {
       database,
       databaseSecret,
       databaseName,
-      apiCertificate,
     } = props;
 
     // Connection parts, not a URL. The host, port, user, and database name are not
@@ -435,13 +430,14 @@ export class ComputeStack extends Stack {
      * construct. Staging is deliberately still allowed to run without a certificate,
      * so a first deploy is possible before DNS exists.
      */
-    const certificate = this.resolveApiCertificate(config, apiCertificate);
+    const certificate = this.resolveApiCertificate(config);
 
     if (certificate === undefined && config.name === 'production') {
       throw new Error(
-        'Production must terminate TLS at the load balancer. Set API_CERTIFICATE_ARN, ' +
-          'or set API_HOST together with HOSTED_ZONE_ID and HOSTED_ZONE_NAME so a ' +
-          'certificate can be issued and validated automatically.',
+        'Production must terminate TLS at the load balancer. Issue a regional ' +
+          'certificate for API_HOST and pass its ARN as API_CERTIFICATE_ARN — ' +
+          '`pnpm --filter @imgopt/cloudflare certs` requests it and writes the ' +
+          'validation record into Cloudflare for you.',
       );
     }
 
@@ -569,7 +565,7 @@ export class ComputeStack extends Stack {
     });
     databaseSecret.grantRead(migrationTask.taskRole);
 
-    this.createApiDnsRecord(config, certificate !== undefined);
+    this.publishApiDnsTarget(config, certificate !== undefined);
 
     new CfnOutput(this, 'MaintenanceFunctionName', { value: maintenance.functionName });
     new CfnOutput(this, 'GeneratorFunctionUrl', { value: this.generatorFunctionUrl.url });
@@ -610,61 +606,37 @@ export class ComputeStack extends Stack {
   }
 
   /**
-   * The regional certificate for the load balancer.
+   * The regional certificate for the load balancer, always supplied as an ARN.
    *
-   * Mirrors `CdnStack.resolveCertificate`, and is a different certificate from that
-   * one: CloudFront requires us-east-1, an ALB requires its own region. An explicit
-   * ARN wins, so an externally managed zone — or a certificate shared across
-   * environments — can be brought in without this stack issuing anything.
+   * A different certificate from the distribution's, and necessarily so: CloudFront
+   * accepts a viewer certificate only from us-east-1, an ALB only from its own
+   * region. Substituting one for the other fails when CloudFormation attaches it.
+   *
+   * This stack issues nothing — DNS lives in Cloudflare, so validation cannot happen
+   * inside a deployment. See design.md D18 and `infra/cloudflare`.
    */
-  private resolveApiCertificate(
-    config: EnvironmentConfig,
-    issued: acm.ICertificate | undefined,
-  ): acm.ICertificate | undefined {
-    if (config.apiCertificateArn !== undefined) {
-      return acm.Certificate.fromCertificateArn(this, 'ApiCertificate', config.apiCertificateArn);
-    }
-    return issued;
+  private resolveApiCertificate(config: EnvironmentConfig): acm.ICertificate | undefined {
+    if (config.apiCertificateArn === undefined) return undefined;
+    return acm.Certificate.fromCertificateArn(this, 'ApiCertificate', config.apiCertificateArn);
   }
 
   /**
-   * Points `apiHost` at the load balancer, when the zone is in this account.
+   * Publishes what the load balancer answers to, for the Cloudflare reconciler.
    *
-   * Fail-soft in the same shape as the CDN stack's: with an externally managed zone
-   * the deploy still succeeds and emits the record to create by hand, because a
-   * DNS-validated certificate for a name nobody can resolve is not an improvement.
+   * No DNS record is created here: DNS lives in Cloudflare (design.md D18), and no
+   * zone in this account holds the name. `infra/cloudflare` reads this output and
+   * makes `apiHost` a **DNS-only** CNAME onto it — a subdomain CNAME rather than an
+   * alias, because ALIAS is a Route 53 concept and does not exist elsewhere.
    */
-  private createApiDnsRecord(config: EnvironmentConfig, secure: boolean): void {
+  private publishApiDnsTarget(config: EnvironmentConfig, secure: boolean): void {
     if (config.apiHost === undefined) return;
 
-    if (config.hostedZoneId === undefined || config.hostedZoneName === undefined) {
-      new CfnOutput(this, 'ManualApiDnsRecord', {
-        value: `${config.apiHost} ALIAS ${this.loadBalancer.loadBalancerDnsName}`,
-        description: secure
-          ? 'No hosted zone configured. Create this record, then the certificate validates.'
-          : 'No hosted zone configured. Create this record by hand.',
-      });
-      return;
-    }
-
-    const zone = route53.HostedZone.fromHostedZoneAttributes(this, 'ApiZone', {
-      hostedZoneId: config.hostedZoneId,
-      zoneName: config.hostedZoneName,
-    });
-
-    const target = route53.RecordTarget.fromAlias(
-      new targets.LoadBalancerTarget(this.loadBalancer),
-    );
-
-    new route53.ARecord(this, 'ApiAliasRecord', {
-      zone,
-      recordName: config.apiHost,
-      target,
-    });
-    new route53.AaaaRecord(this, 'ApiAliasRecordV6', {
-      zone,
-      recordName: config.apiHost,
-      target,
+    new CfnOutput(this, 'ApiDnsTarget', {
+      value: this.loadBalancer.loadBalancerDnsName,
+      description: secure
+        ? `Cloudflare: CNAME ${config.apiHost} -> this value, proxy DISABLED`
+        : `Cloudflare: CNAME ${config.apiHost} -> this value, proxy DISABLED. ` +
+          'NOTE: no certificate is configured, so this listener is plain HTTP.',
     });
   }
 }

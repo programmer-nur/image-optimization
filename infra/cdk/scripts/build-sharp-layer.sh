@@ -27,8 +27,13 @@ NODEJS_DIR="${LAYER_DIR}/nodejs"
 SHARP_VERSION="0.35.3"
 BUILD_IMAGE="public.ecr.aws/sam/build-nodejs22.x:latest-arm64"
 
-DOCKER="${DOCKER:-docker}"
-if ! "${DOCKER}" info >/dev/null 2>&1; then
+# An *array*, so a multi-word override works. `DOCKER="docker --context default"`
+# expanded inside quotes is one filename with spaces in it, which fails with the same
+# "cannot reach the Docker daemon" message it is meant to cure — the escape hatch this
+# script documents did not work until it was one.
+read -r -a DOCKER_CMD <<< "${DOCKER:-docker}"
+
+if ! "${DOCKER_CMD[@]}" info >/dev/null 2>&1; then
   echo "error: cannot reach the Docker daemon." >&2
   echo "  If a stale context is selected, try: DOCKER='docker --context default' $0" >&2
   exit 1
@@ -41,7 +46,7 @@ echo "Building sharp ${SHARP_VERSION} for linux/arm64 in ${BUILD_IMAGE}..."
 
 # --platform matters even with an arm64-tagged image: on an x86 host without it,
 # Docker will happily run the amd64 variant and produce the wrong binaries.
-"${DOCKER}" run --rm --platform linux/arm64 \
+"${DOCKER_CMD[@]}" run --rm --platform linux/arm64 \
   -v "${NODEJS_DIR}:/out" \
   -w /build \
   "${BUILD_IMAGE}" \

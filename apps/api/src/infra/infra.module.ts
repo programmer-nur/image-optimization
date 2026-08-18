@@ -15,7 +15,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { loadConfig, type AppConfig } from '@imgopt/config';
 import { S3Storage, type StoragePort } from '@imgopt/storage';
 import { SqsQueue, type QueuePort } from '@imgopt/queue';
-import { AssetRepository, createPrismaClient, type PrismaClient } from '@imgopt/db';
+import { TenantScopedRepository, createPrismaClient, type PrismaClient } from '@imgopt/db';
 import { createLogger } from '../common/logger.js';
 import { APP_CONFIG, ASSET_REPOSITORY, LOGGER, PRISMA, QUEUE, STORAGE } from '../tokens.js';
 
@@ -77,7 +77,10 @@ class ResourceCleanup implements OnApplicationShutdown {
     },
     {
       provide: ASSET_REPOSITORY,
-      useFactory: (prisma: PrismaClient) => new AssetRepository(prisma),
+      // The control plane gets the *scoped* repository and nothing else. There is no
+      // provider for the unscoped one here, so a service that wanted to skip a tenant
+      // filter would have to construct it — visibly — rather than inject it.
+      useFactory: (prisma: PrismaClient) => new TenantScopedRepository(prisma),
       inject: [PRISMA],
     },
     ResourceCleanup,

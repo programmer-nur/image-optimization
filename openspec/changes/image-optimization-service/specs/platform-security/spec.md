@@ -35,8 +35,13 @@ The control-plane load balancer SHALL terminate TLS with a certificate for its c
 
 #### Scenario: Production is deployed without a certificate
 
-- **WHEN** synthesis runs for production and neither an explicit certificate ARN nor a hostname with a usable hosted zone is configured
+- **WHEN** synthesis runs for production and no certificate ARN is configured
 - **THEN** synthesis fails naming the missing setting, because the alternative — an optional setting nobody supplies — is how a control plane comes to serve credentials in cleartext without anyone noticing
+
+#### Scenario: A certificate is needed for a hostname whose DNS is not in this account
+
+- **WHEN** a deployment needs a certificate for a name managed by an external DNS provider
+- **THEN** the certificate is issued and validated before the deployment rather than by it, and supplied as an ARN — infrastructure-as-code MUST NOT attempt DNS validation against a zone it cannot write, because that does not fail, it blocks the deployment until it times out
 
 ### Requirement: API keys are stored hashed
 

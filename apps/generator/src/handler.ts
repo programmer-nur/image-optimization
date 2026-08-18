@@ -16,7 +16,7 @@ import pino from 'pino';
 import { loadConfig } from '@imgopt/config';
 import { S3Storage } from '@imgopt/storage';
 import {
-  AssetRepository,
+  UnscopedAssetRepository,
   DerivativeOrigin,
   createPrismaClient,
   hydrateDatabaseCredentials,
@@ -44,10 +44,10 @@ const storage = new S3Storage({
 // Bookkeeping only — for cost attribution, orphan GC, and answering "what did we
 // actually generate". Never read by the delivery path, and constructed lazily so a
 // database that is slow or down costs nothing until the first miss.
-let repo: AssetRepository | undefined;
+let repo: UnscopedAssetRepository | undefined;
 
 const recordDerivative: RecordDerivative = async (record) => {
-  repo ??= new AssetRepository(
+  repo ??= new UnscopedAssetRepository(
     createPrismaClient({ connectionString: config.database.url, context: 'lambda' }),
   );
 

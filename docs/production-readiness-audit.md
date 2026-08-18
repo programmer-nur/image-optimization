@@ -199,7 +199,7 @@ Checked items were completed and verified in the remediation pass (§L); uncheck
 - [ ] 9.15 — staging E2E: upload → first request generates → second is a storage hit
 - [ ] 13.7 — load test; confirm generations ≤ distinct variants (bounded-space assertion) and cost/1k images
 - [ ] 14.7 — power tuning; record in tuning.md
-- [ ] M5/M5b — confirm all three Lambdas init on nodejs22.x with the sharp layer attached (the bundles now reach it through `createRequire`; CI proves the mechanism, not the real binary)
+- [x] M5/M5b — **verified.** All three bundles were loaded inside `public.ecr.aws/sam/build-nodejs22.x:latest-arm64` with the real arm64 layer mounted at `/opt/nodejs` and exposed through `NODE_PATH`; each initialized and exported `handler`. Not a deployed invocation, but the same runtime image, the same binary, and the same resolution mechanism
 - [x] M10 — restore/DR runbook and the sanctioned DB access path are written (`docs/operations.md`). **Rehearsing them on staging is still outstanding.**
 - [x] M3 — `maxConcurrency` set from a written-down connection budget (10 prod / 5 staging). **Resize against observed headroom after 13.7.**
 
@@ -287,6 +287,8 @@ All addressed. The ones with consequences worth naming: **M12** oversize rejecti
 3. **`background` was an unbounded key axis.** Full 8-bit hex is 2²⁴ keys per box — 2³² with alpha — each a Sharp invocation and a permanent object, reachable from an ordinary URL. Exactly C1's hole, spelled in hex. Channels now snap to the 4-bit grid, which leaves three-digit shorthand untouched.
 
 Also fixed in passing: the X-Ray sidecar was pinned to `:latest`, found by a test written for M7.
+
+4. **The synthesis tests destroyed real Lambda bundles.** Introduced by the M5 fix and caught while verifying it: `artifacts.ts` began asserting the entrypoint is named `index.mjs`, so the tests' stub was renamed to match — which is the same filename the bundler emits. `pnpm test` after `build:bundles` therefore replaced 6MB of Lambda code with a 30-byte comment, and a deploy in that order would have shipped three empty functions with nothing failing along the way. Artifact resolution now honours `IMGOPT_ARTIFACT_ROOT` and the tests stub into a temporary directory, so the two paths cannot collide in any order. `build:bundles` → `test` → check sizes is now part of the verification below.
 
 ### Still open
 

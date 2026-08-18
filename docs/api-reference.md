@@ -22,8 +22,21 @@ The separator is `_` throughout — `imgk_{keyId}_{secret}`, where the id itself
 contain the separator, which is what lets the id be read off a presented key without
 trusting the rest of it.
 
-Keys carry coarse permissions and optional storage and asset-count quotas. Only a hash
-is stored, so the plaintext is shown exactly once at creation and cannot be recovered.
+Keys carry coarse permissions. Only a hash is stored, so the plaintext is shown exactly
+once at creation and cannot be recovered.
+
+Every key belongs to a **tenant**, and a deployment has one — a single-tenant install is
+a deployment with one tenant row, not one without the concept. A key acts only within
+its own tenant: it cannot read, modify, or delete another tenant's assets, and an id
+belonging to another tenant answers `404`, never `403`, because a `403` would confirm
+the id exists. `POST /v1/keys` issues into the _issuer's_ tenant and takes no tenant id;
+otherwise `admin` on any key would be a way to mint credentials for someone else's data.
+
+**Storage and asset-count quotas belong to the tenant**, not to the key. Issuing a
+second key does not grant a second allowance. Per-key `maxBytes`/`maxAssets` still exist
+as a secondary ceiling for narrowing one key below its tenant's allowance — a build key
+capped well under the whole — and they can only narrow, never raise. Both counters are
+incremented, so per-key attribution stays readable in `GET /v1/keys`.
 
 | Permission | Grants                                                                |
 | ---------- | --------------------------------------------------------------------- |
@@ -42,20 +55,20 @@ Errors share one envelope, so a client branches on `code` rather than parsing pr
 { "error": { "code": "content_type_mismatch", "message": "...", "correlationId": "..." } }
 ```
 
-| Code                    | Status | Meaning                                           |
-| ----------------------- | ------ | ------------------------------------------------- |
-| `unauthorized`          | 401    | Missing, invalid, or revoked key                  |
-| `forbidden`             | 403    | Key lacks the required permission                 |
-| `not_found`             | 404    | No such asset                                     |
-| `validation_failed`     | 400    | Malformed request                                 |
-| `content_type_mismatch` | 422    | Declared type disagrees with the actual bytes     |
-| `unsupported_format`    | 422    | Detected type is not an accepted image format     |
-| `pixel_limit_exceeded`  | 422    | Decoded dimensions exceed the configured ceiling  |
-| `empty_file`            | 400    | Zero bytes                                        |
-| `malware_detected`      | 422    | Rejected by malware scanning                      |
-| `payload_too_large`     | 413    | Over the proxy threshold — use the presigned flow |
-| `quota_exceeded`        | 413    | Key is at its storage or asset limit              |
-| `conflict`              | 409    | Upload already completed                          |
+| Code                    | Status | Meaning                                                        |
+| ----------------------- | ------ | -------------------------------------------------------------- |
+| `unauthorized`          | 401    | Missing, invalid, or revoked key                               |
+| `forbidden`             | 403    | Key lacks the required permission                              |
+| `not_found`             | 404    | No such asset                                                  |
+| `validation_failed`     | 400    | Malformed request                                              |
+| `content_type_mismatch` | 422    | Declared type disagrees with the actual bytes                  |
+| `unsupported_format`    | 422    | Detected type is not an accepted image format                  |
+| `pixel_limit_exceeded`  | 422    | Decoded dimensions exceed the configured ceiling               |
+| `empty_file`            | 400    | Zero bytes                                                     |
+| `malware_detected`      | 422    | Rejected by malware scanning                                   |
+| `payload_too_large`     | 413    | Over the proxy threshold — use the presigned flow              |
+| `quota_exceeded`        | 413    | Tenant (or the calling key's narrower ceiling) is at its limit |
+| `conflict`              | 409    | Upload already completed                                       |
 
 ## Uploads
 

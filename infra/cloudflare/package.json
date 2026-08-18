@@ -1,0 +1,25 @@
+{
+  "name": "@imgopt/cloudflare",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Cloudflare DNS reconciliation and ACM certificate issuance. Deliberately outside the CDK app: CloudFormation cannot write to a zone it does not own.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc --build tsconfig.build.json",
+    "clean": "tsc --build tsconfig.build.json --clean",
+    "test": "vitest run",
+    "dns": "tsx src/cli.ts dns",
+    "certs": "tsx src/cli.ts certs"
+  },
+  "dependencies": {
+    "@aws-sdk/client-acm": "^3.700.0",
+    "@aws-sdk/client-cloudformation": "^3.700.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "vitest": "^2.1.8"
+  }
+}

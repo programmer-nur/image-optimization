@@ -219,8 +219,12 @@ curl -X DELETE https://api/v1/keys/<oldKeyId> -H "x-api-key: $ADMIN"
 ```
 
 Revocation takes effect on the next request. It is a soft delete: the row carries the
-quota accounting and is referenced by the assets that key uploaded, and destroying that
-history during an incident is the last thing anyone wants.
+per-key usage counters and is referenced by the assets that key uploaded, and
+destroying that history during an incident is the last thing anyone wants.
+
+Revoking a key does **not** return its storage to the tenant's allowance, and should
+not: the bytes are still stored. The tenant's `used_bytes`/`used_assets` are the
+accounting unit, and they fall when assets are deleted, not when keys are.
 
 ## Running SQL, or anything else, against the database
 
@@ -269,6 +273,34 @@ aws s3api delete-object --bucket "$BUCKET" --key "$KEY" --version-id "$VERSION_I
 re-encoded pipeline output, so a polyglot or an embedded payload does not survive into
 a derivative — that is a structural property, not a detection result. What is at stake
 is the object at rest and anything that later reads originals directly.
+
+## The certificate is about to expire, or DNS looks wrong
+
+Both live outside the CDK; nothing in a redeploy touches them.
+
+**Certificates.** ACM renews automatically _provided its validation CNAME is still in
+Cloudflare_. That record is permanent by design, and deleting it after issuance is the
+one failure mode here: renewal fails quietly and the certificate expires roughly eleven
+months later, on a date nobody is watching.
+
+```bash
+aws acm describe-certificate --certificate-arn "$CDN_CERTIFICATE_ARN"   --region us-east-1 --query 'Certificate.[Status,NotAfter,RenewalSummary]'
+```
+
+`RenewalEligibility: INELIGIBLE` or a `PENDING_VALIDATION` renewal means the record is
+gone — recreate it from `DomainValidationOptions.ResourceRecord` in the same output.
+
+**Records.** The distribution and load balancer hostnames change if a stack is ever
+replaced, so DNS is reconciled from stack outputs rather than remembered:
+
+```bash
+pnpm --filter @imgopt/cloudflare dns
+```
+
+Prints a plan; `--apply` writes it. If images are broken for _some_ viewers and fine
+for others, check the proxy status first — an orange-clouded record caches one image
+format and serves it to everyone, and that is invisible in CloudFront's metrics
+because those requests never reach CloudFront.
 
 ## Restore and disaster recovery
 

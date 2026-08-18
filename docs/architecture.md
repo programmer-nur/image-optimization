@@ -17,7 +17,8 @@ flowchart LR
         B --> D[SQS optimize queue]
     end
     subgraph Delivery["Delivery plane — massive, stateless"]
-        E[Browser] -->|"GET cdn.example.com/i/..."| F[CloudFront + edge function]
+        E[Browser] -->|"GET cdn.example.com/i/..."| CF[Cloudflare DNS - resolve only, proxy off]
+        CF --> F[CloudFront + edge function]
         F -->|hit| E
         F -->|miss| G[(S3)]
         G -->|"403/404 = not generated yet"| H[Generator Lambda]
@@ -169,8 +170,27 @@ Worked numbers are in design.md D16.
 | `apps/generator`   | Lambda (Fn URL) | On-miss generation                                         |
 | `apps/maintenance` | Lambda (daily)  | Orphan reconciliation, expiry, reaping, storage accounting |
 | `infra/cloudfront` | CloudFront      | Edge normalizer, **generated** from `packages/core`        |
+| `infra/cloudflare` | your laptop, CI | DNS records and ACM issuance — outside the CDK, see D18    |
 | `packages/core`    | everywhere      | Transform grammar, ladder, canonical key. Zero AWS imports |
 | `packages/client`  | consumer apps   | URL builder, srcset, React components, Next.js loader      |
+
+## DNS sits in front, and only resolves
+
+Names are managed in Cloudflare; AWS holds no hosted zone. Both hostnames are plain
+`CNAME` records onto the CloudFront distribution and the load balancer, with
+Cloudflare's **proxy switched off**.
+
+That last part is load-bearing rather than a preference. Format negotiation happens at
+the CloudFront edge: one URL returns AVIF, WebP or JPEG depending on the viewer's
+`Accept` header, which is why every response carries `Vary: Accept`. Cloudflare's proxy
+caches by URL and honours `Vary` only for `Accept-Encoding` — so a proxied record would
+cache whichever format the first visitor received and hand it to everyone, including
+AVIF to browsers that cannot decode it. The symptom is broken images for a subset of
+users and nothing at all in the error metrics.
+
+Certificates stay in ACM and are issued ahead of a deploy rather than by it, because
+CloudFormation can only validate a certificate in a zone it owns. `infra/cloudflare`
+does both jobs; see design.md D18.
 
 ## The failure mode to know about
 

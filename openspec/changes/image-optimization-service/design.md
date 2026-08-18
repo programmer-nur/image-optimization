@@ -595,6 +595,74 @@ Additional controls: lifecycle rules move originals to Standard-IA at 30 days an
 
 **Dashboard:** a single CloudWatch dashboard with delivery health (hit rate, 4xx/5xx, latency), pipeline health (queue depth, DLQ, failures), cost proxies (bytes served, GB-seconds, object count), and business volume (uploads, assets, storage growth).
 
+### D18 — DNS in Cloudflare; certificates pre-issued, never created by CloudFormation
+
+**Decision:** DNS and domain management live in **Cloudflare**. Route 53 is not used
+anywhere. CloudFront remains the CDN and ACM remains the certificate authority, but
+certificates are requested _before_ a deploy by `infra/cloudflare` and passed into the
+CDK as ARNs. The CDK creates no DNS records and issues no certificates; it publishes
+the hostnames its resources answer to (`CdnDnsTarget`, `ApiDnsTarget`) as stack
+outputs instead.
+
+```text
+Cloudflare DNS
+      ↓  (CNAME, proxy off)
+AWS CloudFront   ← ACM certificate, us-east-1
+      ↓
+S3 (derived/ only, via OAC)
+```
+
+**Why certificates cannot be created in the stack.** DNS-validated issuance requires a
+validation record to appear in the zone. CloudFormation can write that record only for
+a Route 53 zone it owns. Point the same construct at an external zone and the stack
+does not fail — it _waits_, holding the deployment open until CloudFormation gives up
+hours later. A deploy that hangs is worse than one that fails, so issuance moves ahead
+of the deploy and the ARN becomes an input. It also means the certificate outlives any
+`cdk destroy`, which is the right lifetime for something with a renewal schedule.
+
+**Why the proxy must stay off.** Cloudflare's proxy is a second CDN in front of
+CloudFront, and it caches by URL while honouring `Vary` only for `Accept-Encoding`.
+Format negotiation here happens at the CloudFront edge (D9): one URL returns AVIF,
+WebP or JPEG depending on `Accept`, and every response carries `Vary: Accept`. An
+orange-clouded record would cache whichever format the first visitor received and
+serve it to everyone — AVIF to browsers that cannot decode it, presenting as a broken
+image for a subset of users with nothing in any log to explain it. It would also
+detach CloudFront's cache-hit metrics from what viewers actually experience, which is
+one of only two detectors for normalization drift (D4). The reconciler in
+`infra/cloudflare` treats a proxied record as a change to undo, not a preference.
+
+**Why the tooling is a separate package.** Keeping it inside the CDK app would mean
+either a Cloudflare custom resource — a Lambda holding a zone-editing token, invoked
+by CloudFormation, in the deploy path — or a hand-copied hostname that goes stale the
+first time a stack is replaced. A small reconciler that reads stack outputs and diffs
+against the zone is less machinery and fails in the open: it prints a plan and writes
+nothing without `--apply`.
+
+**Alternatives considered.**
+
+- **Route 53 (the original design).** Fully automatic: certificate issuance,
+  validation, and alias records in one deploy. Rejected because the domain is managed
+  in Cloudflare; delegating the zone to Route 53 to regain the automation would move
+  the whole domain, which is a larger decision than this system deserves to force.
+- **Cloudflare proxy in front of CloudFront.** Would add WAF and analytics at the
+  edge, but breaks format negotiation as above, and doubles the CDN bill for a
+  workload whose entire cost model is bandwidth (D16).
+- **A Cloudflare Terraform provider.** Correct in a shop that already runs Terraform;
+  here it would introduce a second IaC toolchain and a second state file for three
+  DNS records.
+- **Cloudflare R2 instead of S3.** Out of scope: it would replace the storage layer,
+  the OAC trust model, and the failover-to-Lambda mechanism that D5 rests on.
+
+**Consequences.**
+
+- Two certificate ARNs are deployment inputs; production synthesis fails without the
+  API one (see the TLS requirement in `specs/platform-security`).
+- DNS is reconciled _after_ a deploy, not during it — a two-phase bootstrap.
+- ACM validation records are permanent. Deleting one after issuance breaks renewal
+  silently, roughly eleven months later.
+- Nothing in the delivery path depends on Cloudflare beyond name resolution, so the
+  DNS provider can change again without touching the architecture.
+
 ## Risks / Trade-offs
 
 - **Edge/core normalization drift** → the highest-severity failure mode. A mismatch means CloudFront caches key A while Lambda writes object B: permanent 100% miss, every request invoking Lambda, no error anywhere. _Mitigation:_ generate the edge function from `packages/core` (D4), run shared conformance vectors against both in CI, and alarm on `OnDemandGenerations` staying non-zero — the symptom is invisible in error rates but obvious in that one metric.
@@ -603,6 +671,14 @@ Additional controls: lifecycle rules move originals to Standard-IA at 30 days an
 
 - **`immutable` + a bad encoder setting = a year of bad cached images** → _Mitigation:_ `encoderEpoch` (D8) mints a fresh URL space instantly, deployment-wide, without per-asset writes or invalidations. Requires consuming apps to re-render URLs via the SDK rather than hardcoding them — which the SDK exists to enforce.
 
+- **A proxied Cloudflare record silently breaks format negotiation** → one cached
+  format served to every viewer, including AVIF to browsers that cannot decode it,
+  with nothing in any error metric. _Mitigation:_ the reconciler in `infra/cloudflare`
+  turns the proxy off rather than reporting it, a unit test pins the rule, and D18
+  records why.
+- **A deleted ACM validation record breaks renewal ~11 months later** → an expired
+  certificate on a date nobody is watching. _Mitigation:_ the record carries a comment
+  saying it is permanent, and the certificate runbook says so twice.
 - **Origin failover returns 403 not 404 under OAC** → misconfiguring the failover status codes shows users a 403 instead of generating their image. _Mitigation:_ include both 403 and 404 in the failover criteria; an integration test asserts that an ungenerated variant returns 200 with correct bytes.
 
 - **Thundering herd on newly-published popular content** → hundreds of concurrent misses for the same key. _Mitigation:_ origin shield collapses them; `IfNoneMatch: *` conditional writes make concurrent generation harmless; reserved concurrency caps spend (D11).

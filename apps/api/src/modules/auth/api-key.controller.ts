@@ -10,10 +10,10 @@
  * the whole point of hashing it, and it is why the response says so explicitly.
  */
 
-import { Body, Controller, Delete, Get, Param, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Post, Req, UseGuards } from '@nestjs/common';
 import type { ApiKey } from '@imgopt/db';
 import { ApiError } from '../../common/errors.js';
-import { ApiKeyGuard } from './api-key.guard.js';
+import { ApiKeyGuard, requestScope, type AuthenticatedRequest } from './api-key.guard.js';
 import { ApiKeyService, type CreateKeyInput } from './api-key.service.js';
 import { RequirePermissions } from './permissions.decorator.js';
 
@@ -65,13 +65,21 @@ export class ApiKeyController {
   @Post()
   @RequirePermissions('admin')
   async create(
+    @Req() req: AuthenticatedRequest,
     @Body() body: CreateKeyBody,
   ): Promise<{ key: ApiKeyResponse; plaintext: string; warning: string }> {
     if (body?.name === undefined || body.name.trim() === '') {
       throw ApiError.validation('A key name is required.');
     }
 
-    const input: CreateKeyInput = { name: body.name.trim() };
+    /*
+     * A key is always issued into the issuer's own tenant, never a named one.
+     *
+     * Taking a tenant id from the body would make `admin` on any key a way to mint
+     * credentials for someone else's data — the one privilege escalation this whole
+     * change exists to prevent.
+     */
+    const input: CreateKeyInput = { tenantId: requestScope(req), name: body.name.trim() };
     if (body.permissions !== undefined) input.permissions = body.permissions;
     if (body.maxBytes !== undefined) input.maxBytes = body.maxBytes;
     if (body.maxAssets !== undefined) input.maxAssets = body.maxAssets;
@@ -87,8 +95,8 @@ export class ApiKeyController {
 
   @Get()
   @RequirePermissions('admin')
-  async list(): Promise<{ keys: ApiKeyResponse[] }> {
-    return { keys: (await this.keys.list()).map(present) };
+  async list(@Req() req: AuthenticatedRequest): Promise<{ keys: ApiKeyResponse[] }> {
+    return { keys: (await this.keys.list(requestScope(req))).map(present) };
   }
 
   /**
@@ -100,7 +108,10 @@ export class ApiKeyController {
    */
   @Delete(':id')
   @RequirePermissions('admin')
-  async revoke(@Param('id') id: string): Promise<{ key: ApiKeyResponse }> {
-    return { key: present(await this.keys.revoke(id)) };
+  async revoke(
+    @Req() req: AuthenticatedRequest,
+    @Param('id') id: string,
+  ): Promise<{ key: ApiKeyResponse }> {
+    return { key: present(await this.keys.revoke(requestScope(req), id)) };
   }
 }

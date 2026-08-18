@@ -16,7 +16,11 @@ import type { SQSBatchResponse, SQSEvent, SQSRecord } from 'aws-lambda';
 import pino from 'pino';
 import { loadConfig } from '@imgopt/config';
 import { S3Storage } from '@imgopt/storage';
-import { AssetRepository, createPrismaClient, hydrateDatabaseCredentials } from '@imgopt/db';
+import {
+  UnscopedAssetRepository,
+  createPrismaClient,
+  hydrateDatabaseCredentials,
+} from '@imgopt/db';
 import type { OptimizeJob } from '@imgopt/queue';
 import { CORRELATION_ATTRIBUTE } from '@imgopt/queue';
 import { Optimizer } from './optimizer.js';
@@ -43,7 +47,7 @@ const prisma = createPrismaClient({
   connectionString: config.database.url,
   context: 'lambda',
 });
-const repo = new AssetRepository(prisma);
+const repo = new UnscopedAssetRepository(prisma);
 
 function parseJob(record: SQSRecord): OptimizeJob {
   const job = JSON.parse(record.body) as OptimizeJob;

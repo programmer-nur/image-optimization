@@ -58,17 +58,27 @@ Database credentials and API signing material SHALL be delivered through a manag
 
 ### Requirement: Custom domain provisioning
 
-Deployment SHALL provision the CDN custom domain with a managed certificate and the required DNS record.
+Deployment SHALL serve the CDN custom domain with a managed certificate and a DNS record pointing at the distribution. DNS is managed outside the infrastructure-as-code app, so provisioning is three phases — issue the certificate, deploy, then reconcile DNS — and the app itself SHALL create no DNS record and issue no certificate.
 
-#### Scenario: Domain is configured
+#### Scenario: Certificate is issued before deployment
 
-- **WHEN** the deployment is configured with a CDN hostname in a hosted zone under the account's control
-- **THEN** the certificate is issued and validated automatically and the DNS record is created
+- **WHEN** a certificate is needed for a hostname whose zone the deployment account does not hold
+- **THEN** it is requested ahead of the deployment, its validation record is written into the external zone, and its ARN is supplied to the deployment as configuration
 
-#### Scenario: DNS is managed externally
+#### Scenario: Deployment publishes what DNS must point at
 
-- **WHEN** the hosted zone is outside the account
-- **THEN** deployment emits the required validation and alias records for manual creation and does not fail silently
+- **WHEN** the distribution and load balancer are deployed
+- **THEN** each stack emits the hostname it answers to as an output, because those names are assigned at deploy time and a recorded copy goes stale the moment a stack is replaced
+
+#### Scenario: DNS is reconciled after deployment
+
+- **WHEN** DNS is reconciled against a deployed environment
+- **THEN** the reconciler reads those outputs, reports the changes it would make before making any, leaves records it does not own untouched, and creates every record with CDN proxying disabled
+
+#### Scenario: No custom domain is configured
+
+- **WHEN** a deployment is made without a certificate
+- **THEN** it succeeds and serves on the provider-assigned hostnames, so a first deployment does not require DNS to be settled first
 
 ### Requirement: Edge normalizer is generated during the build
 

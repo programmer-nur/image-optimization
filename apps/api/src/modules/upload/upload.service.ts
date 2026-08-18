@@ -17,7 +17,12 @@ import type { Logger } from 'pino';
 import type { AppConfig } from '@imgopt/config';
 import type { StoragePort, PresignedUploadTarget } from '@imgopt/storage';
 import type { QueuePort } from '@imgopt/queue';
-import { AssetRepository, type Asset, type RejectionReason } from '@imgopt/db';
+import {
+  TenantScopedRepository,
+  type Asset,
+  type RejectionReason,
+  type TenantScope,
+} from '@imgopt/db';
 import { toOriginalKey, toStagingKey, FORMAT_EXTENSIONS } from '@imgopt/core';
 import { APP_CONFIG, ASSET_REPOSITORY, LOGGER, QUEUE, STORAGE } from '../../tokens.js';
 import { requestContext, bindAssetId } from '../../common/logger.js';
@@ -88,7 +93,7 @@ export class UploadService {
     @Inject(APP_CONFIG) private readonly config: AppConfig,
     @Inject(STORAGE) private readonly storage: StoragePort,
     @Inject(QUEUE) private readonly queue: QueuePort,
-    @Inject(ASSET_REPOSITORY) private readonly repo: AssetRepository,
+    @Inject(ASSET_REPOSITORY) private readonly repo: TenantScopedRepository,
     @Inject(LOGGER) private readonly logger: Logger,
     private readonly validation: ValidationService,
     private readonly keys: ApiKeyService,
@@ -97,12 +102,13 @@ export class UploadService {
 
   /** Proxied path: stream the request body straight into staging, then validate. */
   async ingestStream(
+    scope: TenantScope,
     body: Readable,
     declaredType: string | undefined,
     apiKeyId: string | undefined,
     options: { altText?: string; tags?: string[] } = {},
   ): Promise<UploadResult> {
-    const asset = await this.repo.create({
+    const asset = await this.repo.create(scope, {
       ...(apiKeyId !== undefined ? { apiKeyId } : {}),
       ...(options.altText !== undefined ? { altText: options.altText } : {}),
       ...(options.tags !== undefined ? { tags: options.tags } : {}),
@@ -114,7 +120,9 @@ export class UploadService {
       ...(declaredType !== undefined ? { contentType: declaredType } : {}),
     });
 
-    return this.validateAndPromote(asset, stagingKey, declaredType, apiKeyId, { dedup: true });
+    return this.validateAndPromote(scope, asset, stagingKey, declaredType, apiKeyId, {
+      dedup: true,
+    });
   }
 
   /**
@@ -124,30 +132,39 @@ export class UploadService {
    * asset, not to be redirected to whichever other asset happens to share the bytes.
    */
   async replaceSourceStream(
+    scope: TenantScope,
     assetId: string,
     body: Readable,
     declaredType: string | undefined,
+    apiKeyId: string | undefined,
   ): Promise<UploadResult> {
     bindAssetId(assetId);
-    const asset = await this.repo.requireById(assetId);
+    const asset = await this.repo.requireById(scope, assetId);
 
     const stagingKey = toStagingKey(`${assetId}-${Date.now()}`);
     await this.storage.put(stagingKey, body, {
       ...(declaredType !== undefined ? { contentType: declaredType } : {}),
     });
 
-    return this.validateAndPromote(asset, stagingKey, declaredType, asset.apiKeyId ?? undefined, {
+    /*
+     * The *caller's* key pays for these bytes, not the key that first created the
+     * asset. Charging `asset.apiKeyId` meant any key holding `upload` could replace
+     * another key's source and have the bytes billed to that other key's quota —
+     * spending an allowance it does not hold and never touching its own.
+     */
+    return this.validateAndPromote(scope, asset, stagingKey, declaredType, apiKeyId, {
       dedup: false,
     });
   }
 
   /** Presigned path: hand back an upload target; the client writes to S3 directly. */
   async createUploadTarget(
+    scope: TenantScope,
     declaredType: string,
     apiKeyId: string | undefined,
     options: { altText?: string; tags?: string[] } = {},
   ): Promise<{ asset: Asset; target: PresignedUploadTarget }> {
-    const asset = await this.repo.create({
+    const asset = await this.repo.create(scope, {
       ...(apiKeyId !== undefined ? { apiKeyId } : {}),
       ...(options.altText !== undefined ? { altText: options.altText } : {}),
       ...(options.tags !== undefined ? { tags: options.tags } : {}),
@@ -165,9 +182,14 @@ export class UploadService {
   }
 
   /** Presigned path, second step: validate what the client uploaded, then promote. */
-  async completeUpload(assetId: string, declaredType: string | undefined): Promise<UploadResult> {
+  async completeUpload(
+    scope: TenantScope,
+    assetId: string,
+    declaredType: string | undefined,
+    apiKeyId: string | undefined,
+  ): Promise<UploadResult> {
     bindAssetId(assetId);
-    const asset = await this.repo.findById(assetId, { includeDeleted: true });
+    const asset = await this.repo.findById(scope, assetId, { includeDeleted: true });
     if (asset === null) throw ApiError.notFound(`No upload with id "${assetId}".`);
     if (asset.currentVersion > 0) {
       throw ApiError.conflict('This upload has already been completed.');
@@ -179,12 +201,15 @@ export class UploadService {
       throw ApiError.notFound('No uploaded bytes found for this id. Did the upload finish?');
     }
 
-    return this.validateAndPromote(asset, stagingKey, declaredType, asset.apiKeyId ?? undefined, {
+    // Same rule as above: quota is the completing caller's, since completion is what
+    // makes the bytes durable and is the step that must have headroom.
+    return this.validateAndPromote(scope, asset, stagingKey, declaredType, apiKeyId, {
       dedup: true,
     });
   }
 
   private async validateAndPromote(
+    scope: TenantScope,
     asset: Asset,
     stagingKey: string,
     declaredType: string | undefined,
@@ -205,7 +230,7 @@ export class UploadService {
       );
       result = await this.validation.validate(header, head.bytes, declaredType);
     } catch (error) {
-      await this.reject(asset.id, stagingKey, error);
+      await this.reject(scope, asset.id, stagingKey, error);
       throw error;
     }
 
@@ -229,7 +254,7 @@ export class UploadService {
       );
       recordUploadRejection('malware_detected', { assetId: asset.id });
       await this.storage.delete(stagingKey).catch(() => undefined);
-      await this.repo.markRejected(asset.id, 'malware_detected').catch(() => undefined);
+      await this.repo.markRejected(scope, asset.id, 'malware_detected').catch(() => undefined);
       throw ApiError.malwareDetected();
     }
 
@@ -252,15 +277,18 @@ export class UploadService {
     try {
       const hash = await this.hashStaged(stagingKey);
 
-      const existing = options.dedup ? await this.repo.findByContentHash(hash) : null;
+      // Scoped: a match is only a duplicate if *this* tenant already holds those
+      // bytes. Matching deployment-wide would hand one tenant a reference to another's
+      // asset and disclose that the other holds exactly these bytes.
+      const existing = options.dedup ? await this.repo.findByContentHash(scope, hash) : null;
       if (existing !== null && existing.assetId !== asset.id) {
         // Identical bytes already stored: discard this upload and hand back the
         // original. A re-upload is common — a CMS retry, a double-click.
         await this.storage.delete(stagingKey);
         if (reserved && apiKeyId !== undefined)
           await this.keys.releaseQuota(apiKeyId, result.bytes);
-        await this.repo.softDelete(asset.id);
-        const original = await this.repo.requireById(existing.assetId);
+        await this.repo.softDelete(scope, asset.id);
+        const original = await this.repo.requireById(scope, existing.assetId);
         return { asset: original, duplicate: true };
       }
 
@@ -271,7 +299,7 @@ export class UploadService {
       );
       await this.storage.copy(stagingKey, originalKey);
 
-      const stored = await this.repo.addVersion({
+      const stored = await this.repo.addVersion(scope, {
         assetId: asset.id,
         sourceKey: originalKey,
         contentHash: hash,
@@ -286,7 +314,7 @@ export class UploadService {
       await this.enqueueOptimize(asset.id, stored.version);
       await this.storage.delete(stagingKey);
 
-      const promoted = await this.repo.requireById(asset.id);
+      const promoted = await this.repo.requireById(scope, asset.id);
       recordUpload(result.bytes, result.format);
       this.logger.info({ assetId: asset.id, format: result.format }, 'upload stored');
       return { asset: promoted, duplicate: false };
@@ -312,14 +340,19 @@ export class UploadService {
     }
   }
 
-  private async reject(assetId: string, stagingKey: string, error: unknown): Promise<void> {
+  private async reject(
+    scope: TenantScope,
+    assetId: string,
+    stagingKey: string,
+    error: unknown,
+  ): Promise<void> {
     await this.storage.delete(stagingKey).catch(() => undefined);
     const reason = rejectionReasonFor(error);
 
     // The reason dimension is what separates "a consuming application shipped a bug"
     // from "someone is probing the uploader" — same total, opposite responses.
     recordUploadRejection(reason, { assetId });
-    await this.repo.markRejected(assetId, reason).catch(() => undefined);
+    await this.repo.markRejected(scope, assetId, reason).catch(() => undefined);
   }
 
   private async hashStaged(stagingKey: string): Promise<string> {

@@ -13,7 +13,7 @@ import type { FastifyReply } from 'fastify';
 import type { AppConfig } from '@imgopt/config';
 import { APP_CONFIG } from '../../tokens.js';
 import { ApiError } from '../../common/errors.js';
-import { ApiKeyGuard, type AuthenticatedRequest } from '../auth/api-key.guard.js';
+import { ApiKeyGuard, requestScope, type AuthenticatedRequest } from '../auth/api-key.guard.js';
 import { RequirePermissions } from '../auth/permissions.decorator.js';
 import { DeliveryService } from '../delivery/delivery.service.js';
 import { presentAsset, type AssetResponse } from '../assets/asset.presenter.js';
@@ -84,7 +84,12 @@ export class UploadController {
     }
     if (part === undefined) throw ApiError.validation('No file part in the request.');
 
-    const result = await this.uploads.ingestStream(part.file, part.mimetype, req.apiKey?.id);
+    const result = await this.uploads.ingestStream(
+      requestScope(req),
+      part.file,
+      part.mimetype,
+      req.apiKey?.id,
+    );
 
     // 201 for a promoted upload, 202 when it is held awaiting a malware verdict —
     // the asset exists and is addressable, but nothing has been promoted, and a
@@ -112,6 +117,7 @@ export class UploadController {
     }
 
     const { asset, target } = await this.uploads.createUploadTarget(
+      requestScope(req),
       body.contentType,
       req.apiKey?.id,
       {
@@ -136,9 +142,15 @@ export class UploadController {
   async completeUpload(
     @Param('id') id: string,
     @Body() body: { contentType?: string },
+    @Req() req: AuthenticatedRequest,
     @Res({ passthrough: true }) reply: FastifyReply,
   ): Promise<UploadResponse> {
-    const result = await this.uploads.completeUpload(id, body?.contentType);
+    const result = await this.uploads.completeUpload(
+      requestScope(req),
+      id,
+      body?.contentType,
+      req.apiKey?.id,
+    );
     if (result.held !== undefined) reply.status(202);
 
     return {

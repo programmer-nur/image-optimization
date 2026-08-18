@@ -9,7 +9,7 @@
 
 import { Injectable, type CanActivate, type ExecutionContext } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
-import type { ApiKey } from '@imgopt/db';
+import { scopeOf, type ApiKey, type TenantScope } from '@imgopt/db';
 import { ApiError } from '../../common/errors.js';
 import { ApiKeyService } from './api-key.service.js';
 import { PERMISSIONS_KEY, PUBLIC_KEY } from './permissions.decorator.js';
@@ -17,6 +17,19 @@ import { PERMISSIONS_KEY, PUBLIC_KEY } from './permissions.decorator.js';
 export interface AuthenticatedRequest {
   headers: Record<string, string | string[] | undefined>;
   apiKey?: ApiKey;
+}
+
+/**
+ * The tenant scope for an authenticated request.
+ *
+ * The single doorway between HTTP and the registry: `scopeOf` is the only way to make
+ * a `TenantScope`, and this is the only place a request reaches it. `apiKey` is typed
+ * optional because `@Public()` routes share the request shape, so this throws rather
+ * than asserting — a route that loses its guard gets a 401, not an unscoped query.
+ */
+export function requestScope(req: AuthenticatedRequest): TenantScope {
+  if (req.apiKey === undefined) throw ApiError.unauthorized();
+  return scopeOf(req.apiKey);
 }
 
 @Injectable()

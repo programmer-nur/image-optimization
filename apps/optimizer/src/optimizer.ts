@@ -12,7 +12,7 @@
 
 import type { StoragePort } from '@imgopt/storage';
 import type { OptimizeJob } from '@imgopt/queue';
-import type { AssetRepository } from '@imgopt/db';
+import type { UnscopedAssetRepository } from '@imgopt/db';
 import { DerivativeOrigin } from '@imgopt/db';
 import type { AppConfig } from '@imgopt/config';
 import {
@@ -54,7 +54,7 @@ export type ProcessOutcome =
 export class Optimizer {
   constructor(
     private readonly storage: StoragePort,
-    private readonly repo: AssetRepository,
+    private readonly repo: UnscopedAssetRepository,
     private readonly config: AppConfig,
     private readonly logger: Logger,
   ) {}

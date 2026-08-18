@@ -53,6 +53,47 @@ export default tseslint.config(
       ],
     },
   },
+  /*
+   * The unscoped registry is opt-in, per directory.
+   *
+   * `UnscopedAssetRepository` reads and writes across every tenant in the deployment.
+   * That is correct for reclamation, which walks the whole bucket by nature, and for
+   * the two workers, which act on a job or a key they were handed rather than on
+   * behalf of a caller. It is wrong anywhere a request is being served, and the
+   * difference is one import that reviews cleanly on its own.
+   *
+   * Denied everywhere by default and re-enabled below for the three apps that need
+   * it, so adding a fourth is a visible edit to this file rather than an import
+   * nobody looked twice at. The control plane never appears in that list: it injects
+   * `TenantScopedRepository`, whose methods do not compile without a scope.
+   */
+  {
+    files: ['**/*.ts'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          paths: [
+            {
+              name: '@imgopt/db',
+              importNames: ['UnscopedAssetRepository', 'addVersionInTransaction'],
+              message:
+                'Reads and writes across every tenant. Request paths use TenantScopedRepository, whose methods require a TenantScope. If this really is deployment-wide work, add the directory to the allowlist in eslint.config.mjs.',
+            },
+          ],
+        },
+      ],
+    },
+  },
+  {
+    files: [
+      'apps/maintenance/**/*.ts',
+      'apps/optimizer/**/*.ts',
+      'apps/generator/**/*.ts',
+      'packages/db/**/*.ts',
+    ],
+    rules: { 'no-restricted-imports': 'off' },
+  },
   {
     files: ['**/*.test.ts', '**/*.spec.ts'],
     rules: {

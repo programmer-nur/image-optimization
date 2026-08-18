@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository state
 
-Feature-complete against the build plan, and never deployed. Task groups 1–14 of `openspec/changes/image-optimization-service/tasks.md` are done except the four that need an AWS account (9.15, 12.9, 13.7, 14.7) and 14.8, which needs a registry decision: the pnpm workspace and tooling, `packages/core` (transform grammar, breakpoint bucketing, canonical keys, Sharp pipeline), `packages/config`, `packages/storage`, `packages/queue`, `packages/db` (Prisma schema, migrations, asset registry), `apps/api` (NestJS + Fastify control plane), `apps/optimizer` (SQS Lambda — warm set, metadata, LQIP, conditional master), `infra/cloudfront` (the generated edge normalizer and its conformance runner), `apps/generator` (Function URL Lambda — on-miss generation), `infra/cdk` (six stacks split by lifecycle), `packages/client` (browser SDK), group 11's security hardening, `packages/metrics` with the observability stack, and `apps/maintenance` for scheduled reclamation. 867 unit tests, 153 integration.
+Feature-complete against the build plan, and never deployed. Task groups 1–14 of `openspec/changes/image-optimization-service/tasks.md` are done except the four that need an AWS account (9.15, 12.9, 13.7, 14.7) and 14.8, which needs a registry decision. The `multi-tenancy` change is implemented through group 3; its group 4 is explicitly deferred until a third deployment exists.
+
+What exists: the pnpm workspace and tooling, `packages/core` (transform grammar, breakpoint bucketing, canonical keys, Sharp pipeline), `packages/config`, `packages/storage`, `packages/queue`, `packages/db` (Prisma schema, migrations, scoped and unscoped registries), `apps/api` (NestJS + Fastify control plane), `apps/optimizer` (SQS Lambda — warm set, metadata, LQIP, conditional master), `infra/cloudfront` (the generated edge normalizer and its conformance runner), `apps/generator` (Function URL Lambda — on-miss generation), `infra/cdk` (six stacks split by lifecycle), `infra/cloudflare` (DNS reconciliation and ACM issuance), `packages/client` (browser SDK), group 11's security hardening, `packages/metrics` with the observability stack, and `apps/maintenance` for scheduled reclamation. 990 unit tests, 175 integration.
 
 Both planes run end to end locally: a URL normalizes at the edge to a canonical key, the generator renders and persists exactly that key, and the next request is a storage hit.
 
@@ -94,7 +96,10 @@ packages/queue    EXISTS. QueuePort + SQS adapter; separate from storage for Lam
 packages/metrics  EXISTS. CloudWatch EMF emission. The alarms import METRICS/DIMENSIONS
                   from here rather than re-declaring them — a misspelled metric name
                   leaves an alarm in INSUFFICIENT_DATA, which reads as healthy
-packages/db       EXISTS. Prisma schema + migrations + AssetRepository; generated client in src/generated (gitignored)
+packages/db       EXISTS. Prisma schema + migrations; generated client in src/generated (gitignored).
+                  Two faces on the registry: TenantScopedRepository, whose every method takes a
+                  branded TenantScope, and UnscopedAssetRepository, which spans the deployment
+                  and is lint-restricted to the three workers
 apps/api          EXISTS. NestJS control plane → Docker → Fargate
 apps/optimizer    EXISTS. SQS-triggered Lambda: warm set, metadata, conditional master
 apps/maintenance  EXISTS. Daily EventBridge Lambda: orphan reconciliation, superseded-version
@@ -109,9 +114,15 @@ infra/cloudfront  EXISTS. @imgopt/edge — normalize.template.js is hand-written
                   normalize.generated.js is emitted by generate.mjs and never hand-edited,
                   conformance.test.mjs replays the shared vectors against both
 infra/cdk         EXISTS. @imgopt/infra — Network / Storage / Data / Queue / Compute / Cdn.
+                  DEPLOYMENTS in lib/config.ts is the manifest; a tier is only a sizing profile.
                   All security groups live in the network stack, and the CDN stack imports
                   the bucket by name; both avoid cross-stack cycles that CloudFormation
-                  reports as walls of unrelated resources. See infra/cdk/README.md
+                  reports as walls of unrelated resources. Creates NO DNS records and
+                  issues NO certificates. See infra/cdk/README.md
+infra/cloudflare  EXISTS. @imgopt/cloudflare — DNS reconciliation and ACM issuance, kept
+                  outside the CDK because CloudFormation cannot write a zone it does not
+                  own. Reads CdnDnsTarget/ApiDnsTarget from stack outputs, diffs against
+                  the zone, prints a plan, writes only with --apply. See D18
 packages/client   EXISTS. Three entry points — `.` framework-agnostic, `./react`, `./next`.
                   `sizes` selects the candidate set, not just the attribute: viewport-scaled
                   images get device rungs, fixed-size ones the 1x/2x rungs
@@ -175,7 +186,39 @@ These are not discoverable by reading code, and violating any of them is expensi
 
 **Reclamation fails toward keeping objects.** The registry is not the authority on what exists: the generator writes a derivative _before_ its best-effort bookkeeping row, so a recently written object with no row is normal, not an orphan. `apps/maintenance` therefore never touches anything inside the safety window, leaves unparseable keys alone, and caps deletions per run. Shortening a window makes the job race the system it is cleaning up after, and the objects at stake include originals.
 
+**DNS is Cloudflare's, and the proxy must stay off.** Every record is a plain CNAME with the grey cloud. Cloudflare's proxy caches by URL and honours `Vary` only for `Accept-Encoding`, while one delivery URL legitimately returns AVIF, WebP or JPEG depending on `Accept` — so an orange-clouded record caches one format and serves it to every viewer, including AVIF to browsers that cannot decode it. Broken images for a subset of users, nothing in any error metric. The reconciler in `infra/cloudflare` turns it off rather than reporting it.
+
+**Certificates are pre-issued and passed in as ARNs.** CloudFormation can only validate a DNS-validated certificate in a hosted zone it owns; pointed at an external zone it does not fail, it _waits_ — a deploy that hangs until CloudFormation gives up. `pnpm --filter @imgopt/cloudflare certs` issues both (us-east-1 for CloudFront, deployment region for the ALB) and plants their validation records. **Those records are permanent** — ACM re-checks them to renew, so deleting one breaks renewal silently about eleven months later.
+
 **URLs are immutable; do not invalidate CloudFront for content changes.** The version segment is `{assetVersion}-{encoderEpoch}`. Replacing bytes bumps `assetVersion`; changing encoder policy globally bumps `encoderEpoch`, minting a fresh URL space with no per-asset writes. Invalidation is for deletions and takedowns only.
+
+**Tenancy is the deployment, and it stops at the control plane.** It appears in no URL, no
+object key, and no edge computation — the delivery plane never reads the database, and the URL
+space is free exactly once. A second application is a second entry in `DEPLOYMENTS`. The
+`tenantId` column exists anyway at one tenant per deployment, because it is what makes a later
+collapse into one installation a data migration rather than a route-by-route audit.
+
+**The control plane can only reach the registry through a `TenantScope`.** `scopeOf(req.apiKey)`
+is the only way to make one, so an endpoint that forgets to scope fails to compile rather than
+reading across tenants. `UnscopedAssetRepository` is the deployment-wide face, named that way and
+restricted by a `no-restricted-imports` rule to `apps/maintenance`, `apps/optimizer`, and
+`apps/generator` — reclamation walks the whole bucket by nature, and the two workers act on a job
+they were handed. Adding a fourth consumer is a visible edit to `eslint.config.mjs`.
+`packages/db/src/tenant-scoped-repository.test.ts` enumerates the scoped methods off the
+prototype, so a method added without a scoping expectation fails there.
+
+**Another tenant's id answers 404, never 403.** A 403 confirms the id is real, which is the one
+bit an enumeration attempt is trying to learn. `findById` uses `findFirst` with the tenant in the
+`where` for the same reason: "fetch then compare" is the shape that gets refactored into a leak.
+
+**Deduplication is scoped.** Matching a content hash across tenants would hand one tenant a
+reference to another's asset _and_ disclose that the other holds exactly those bytes. Two
+customers uploading the same stock photo is two assets and two copies, and that is correct.
+
+**Quota is the tenant's, not the key's.** Per-key limits survive only as a ceiling that can
+narrow — otherwise the way to raise an allowance was to ask for a second key. Both counters move
+inside one transaction, because charging the tenant and then failing on the key would leak
+allowance on every rejected upload.
 
 **`packages/core` imports no AWS SDK.** That is what lets the transform algorithm be unit-tested in milliseconds and run unchanged in a container, in Lambda, and in a browser SDK.
 

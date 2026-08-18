@@ -27,7 +27,7 @@
 import type { StoragePort } from '@imgopt/storage';
 import type { QueuePort } from '@imgopt/queue';
 import type { AppConfig } from '@imgopt/config';
-import type { AssetRepository } from '@imgopt/db';
+import type { UnscopedAssetRepository } from '@imgopt/db';
 import {
   DERIVED_PREFIX,
   MASTER_PREFIX,
@@ -116,7 +116,7 @@ export class Maintenance {
 
   constructor(
     private readonly storage: StoragePort,
-    private readonly repo: AssetRepository,
+    private readonly repo: UnscopedAssetRepository,
     private readonly queue: QueuePort,
     private readonly config: AppConfig,
     private readonly logger: Logger,

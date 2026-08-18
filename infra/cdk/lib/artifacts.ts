@@ -12,7 +12,24 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const repoRoot = resolve(here, '..', '..', '..');
+
+/**
+ * Where build artifacts are read from.
+ *
+ * Overridable for one reason: the synthesis tests need directories that look like
+ * built artifacts, and writing those into the real paths silently destroys a real
+ * build. `index.mjs` is the file the bundler emits *and* the file the tests would
+ * stub, so `pnpm test` after `build:bundles` left three 30-byte comments where the
+ * Lambda code had been — a deploy that succeeds and ships empty functions.
+ *
+ * Pointing the tests at a temporary directory removes the collision entirely rather
+ * than relying on ordering or on remembering to rebuild.
+ */
+const artifactRoot = process.env['IMGOPT_ARTIFACT_ROOT'];
+const repoRoot = artifactRoot ?? resolve(here, '..', '..', '..');
+
+/** Layers live under the CDK package, so they follow the override too. */
+const layerRoot = artifactRoot ?? resolve(here, '..');
 
 function requireArtifact(path: string, produce: string): string {
   if (!existsSync(path) || readdirSync(path).length === 0) {
@@ -75,7 +92,7 @@ export function generatorBundle(): string {
  */
 export function sharpLayer(): string {
   return requireArtifact(
-    join(here, '..', 'layers', 'sharp'),
+    join(layerRoot, 'layers', 'sharp'),
     'pnpm --filter @imgopt/infra build:layer',
   );
 }
@@ -90,7 +107,14 @@ export function maintenanceBundle(): string {
 
 /** The generated CloudFront Function. Never hand-edited; see infra/cloudfront. */
 export function edgeFunctionPath(): string {
-  const path = join(repoRoot, 'infra', 'cloudfront', 'normalize.generated.js');
+  // Always the committed artifact, never a stub: it is checked into the repository
+  // and the conformance suite gates it, so there is nothing for a test to stand in for.
+  const path = join(
+    resolve(here, '..', '..', '..'),
+    'infra',
+    'cloudfront',
+    'normalize.generated.js',
+  );
   if (!existsSync(path)) {
     throw new Error(`Missing ${path}.\nRun: pnpm --filter @imgopt/edge generate`);
   }

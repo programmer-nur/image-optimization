@@ -24,7 +24,6 @@ import { DataStack } from '../lib/data-stack.js';
 import { QueueStack } from '../lib/queue-stack.js';
 import { ComputeStack } from '../lib/compute-stack.js';
 import { CdnStack } from '../lib/cdn-stack.js';
-import { CertificateStack } from '../lib/certificate-stack.js';
 import { ObservabilityStack } from '../lib/observability-stack.js';
 
 const app = new App();
@@ -48,42 +47,17 @@ const data = new DataStack(app, `${prefix}-Data`, {
 });
 
 /*
- * Two certificates, in two regions, for two different names.
+ * Certificates arrive as ARNs; nothing here issues one.
  *
- * The distribution's must be in us-east-1 whatever region everything else is in —
- * a CloudFront constraint — while the load balancer's must be in the deployment's own
- * region. Each is issued here only when the hosted zone is in this account, since DNS
- * validation cannot complete otherwise; with an external zone the operator supplies
- * an ARN and the corresponding stack is skipped entirely.
+ * DNS is in Cloudflare (design.md D18), so a DNS-validated certificate cannot be
+ * created and validated inside a CloudFormation deployment — the validation record
+ * has to appear in a zone CloudFormation cannot write to, and the stack would block
+ * until it timed out. `infra/cloudflare` requests both certificates, writes their
+ * validation records, waits for issuance, and prints the ARNs to set here.
  *
- * The API certificate is created before the compute stack because compute consumes
- * it. Missing that wiring is how the control plane came to serve plain HTTP: the prop
- * existed, and nothing ever passed it.
+ * Two certificates, not one: CloudFront accepts a viewer certificate only from
+ * us-east-1, and an ALB accepts one only from its own region.
  */
-const zoneIsOurs = config.hostedZoneId !== undefined && config.hostedZoneName !== undefined;
-
-const certificate =
-  config.cdnCertificateArn === undefined && zoneIsOurs
-    ? new CertificateStack(app, `${prefix}-Certificate`, {
-        env: { account: config.account, region: 'us-east-1' },
-        domainName: config.cdnHost,
-        hostedZoneId: config.hostedZoneId!,
-        hostedZoneName: config.hostedZoneName!,
-        crossRegionReferences: true,
-      })
-    : undefined;
-
-const apiCertificate =
-  config.apiCertificateArn === undefined && config.apiHost !== undefined && zoneIsOurs
-    ? new CertificateStack(app, `${prefix}-ApiCertificate`, {
-        // Same region as the ALB: an ALB cannot attach a certificate from another.
-        env,
-        domainName: config.apiHost,
-        hostedZoneId: config.hostedZoneId!,
-        hostedZoneName: config.hostedZoneName!,
-      })
-    : undefined;
-
 const compute = new ComputeStack(app, `${prefix}-Compute`, {
   env,
   config,
@@ -95,16 +69,12 @@ const compute = new ComputeStack(app, `${prefix}-Compute`, {
   database: data.instance,
   databaseSecret: data.secret,
   databaseName: data.databaseName,
-  ...(apiCertificate !== undefined ? { apiCertificate: apiCertificate.certificate } : {}),
 });
 
 const cdn = new CdnStack(app, `${prefix}-Cdn`, {
   env,
   config,
   generatorFunctionUrl: compute.generatorFunctionUrl,
-  // Lets the distribution reference a certificate in another region.
-  crossRegionReferences: true,
-  ...(certificate !== undefined ? { issuedCertificate: certificate.certificate } : {}),
 });
 
 /*
@@ -138,8 +108,6 @@ const observability = new ObservabilityStack(app, `${prefix}-Observability`, {
  * stating them keeps the deploy order readable and stops a future refactor that
  * removes one reference from silently reordering the deployment.
  */
-if (certificate !== undefined) cdn.addStackDependency(certificate);
-if (apiCertificate !== undefined) compute.addStackDependency(apiCertificate);
 cdn.addStackDependency(compute);
 cdn.addStackDependency(storage);
 compute.addStackDependency(data);
@@ -149,23 +117,7 @@ data.addStackDependency(network);
 observability.addStackDependency(cdn);
 observability.addStackDependency(compute);
 
-// Every stack, including the certificate stacks — which were previously omitted, so
-// the two resources most likely to be found by someone auditing a bill carried no
-// Application or Environment tag.
-const tagged = [
-  network,
-  storage,
-  queue,
-  data,
-  compute,
-  cdn,
-  observability,
-  certificate,
-  apiCertificate,
-];
-
-for (const stack of tagged) {
-  if (stack === undefined) continue;
+for (const stack of [network, storage, queue, data, compute, cdn, observability]) {
   Tags.of(stack).add('Application', 'imgopt');
   Tags.of(stack).add('Environment', config.name);
 }

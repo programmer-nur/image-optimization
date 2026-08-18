@@ -19,8 +19,6 @@ import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
 import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
 import type * as lambda from 'aws-cdk-lib/aws-lambda';
-import * as route53 from 'aws-cdk-lib/aws-route53';
-import * as targets from 'aws-cdk-lib/aws-route53-targets';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import type { Construct } from 'constructs';
 import { bucketNameFor, type EnvironmentConfig } from './config.js';
@@ -30,8 +28,6 @@ import { createPrivateDelivery } from './private-delivery.js';
 export interface CdnStackProps extends StackProps {
   config: EnvironmentConfig;
   generatorFunctionUrl: lambda.IFunctionUrl;
-  /** Issued in the us-east-1 certificate stack when the hosted zone is ours. */
-  issuedCertificate?: acm.ICertificate;
 }
 
 export class CdnStack extends Stack {
@@ -147,7 +143,7 @@ export class CdnStack extends Stack {
           });
 
     const headersPolicy = this.responseHeaders(config);
-    const certificate = this.resolveCertificate(config, props.issuedCertificate);
+    const certificate = this.resolveCertificate(config);
     const domainNames = certificate === undefined ? undefined : [config.cdnHost];
 
     this.distribution = new cloudfront.Distribution(this, 'Distribution', {
@@ -217,7 +213,7 @@ export class CdnStack extends Stack {
       ],
     });
 
-    this.createDnsRecord(config);
+    this.publishDnsTarget(config);
 
     /*
      * Additional CloudFront metrics.
@@ -314,56 +310,40 @@ export class CdnStack extends Stack {
   }
 
   /**
-   * The distribution certificate must live in us-east-1 regardless of where the rest
-   * of the deployment runs — a CloudFront constraint, not a choice.
+   * The distribution's viewer certificate, always supplied as an ARN.
+   *
+   * This stack issues nothing. DNS lives in Cloudflare (design.md D18), so a
+   * DNS-validated certificate cannot be created and validated inside a
+   * CloudFormation deployment — the validation record has to appear in a zone
+   * CloudFormation cannot write to, and the stack would simply block until it timed
+   * out. `infra/cloudflare` requests the certificate, writes the validation record,
+   * and waits for issuance; the resulting ARN comes in here.
+   *
+   * The ARN must name a certificate in **us-east-1** whatever region the rest of the
+   * deployment runs in. That is a CloudFront constraint, not a choice, and it is not
+   * checked here: `fromCertificateArn` accepts any ARN and the mismatch surfaces when
+   * CloudFormation tries to attach it.
+   *
+   * Absent, the distribution serves on its own `*.cloudfront.net` name and the
+   * deployment still works end to end — which is what keeps a first deploy from
+   * requiring DNS to be sorted out first.
    */
-  private resolveCertificate(
-    config: EnvironmentConfig,
-    issued: acm.ICertificate | undefined,
-  ): acm.ICertificate | undefined {
-    // An explicit ARN wins: it is how an externally managed zone, or a certificate
-    // shared across environments, is brought in.
-    if (config.cdnCertificateArn !== undefined) {
-      return acm.Certificate.fromCertificateArn(this, 'CdnCertificate', config.cdnCertificateArn);
-    }
-    // Without either, the distribution serves on its own *.cloudfront.net name. The
-    // deployment still works end to end, which keeps a first deploy from requiring
-    // DNS to be sorted out first.
-    return issued;
+  private resolveCertificate(config: EnvironmentConfig): acm.ICertificate | undefined {
+    if (config.cdnCertificateArn === undefined) return undefined;
+    return acm.Certificate.fromCertificateArn(this, 'CdnCertificate', config.cdnCertificateArn);
   }
 
   /**
-   * Creates the alias record when the hosted zone is in this account.
+   * Publishes what the distribution answers to, for the Cloudflare reconciler.
    *
-   * When it is not, the deployment still succeeds and the outputs carry the record
-   * to create by hand. Failing here instead would make an externally managed zone —
-   * a completely normal arrangement — into a blocker.
+   * No DNS record is created here, because no zone in this account holds the name.
+   * `infra/cloudflare` reads this output and makes `cdnHost` a **DNS-only** CNAME
+   * onto it — see that package for why proxying it would break format negotiation.
    */
-  private createDnsRecord(config: EnvironmentConfig): void {
-    if (config.hostedZoneId === undefined || config.hostedZoneName === undefined) {
-      new CfnOutput(this, 'ManualDnsRecord', {
-        value: `${config.cdnHost} CNAME ${this.distribution.distributionDomainName}`,
-        description:
-          'No hosted zone configured. Create this record manually, then re-run the smoke test.',
-      });
-      return;
-    }
-
-    const zone = route53.HostedZone.fromHostedZoneAttributes(this, 'Zone', {
-      hostedZoneId: config.hostedZoneId,
-      zoneName: config.hostedZoneName,
-    });
-
-    new route53.ARecord(this, 'CdnAliasRecord', {
-      zone,
-      recordName: config.cdnHost,
-      target: route53.RecordTarget.fromAlias(new targets.CloudFrontTarget(this.distribution)),
-    });
-
-    new route53.AaaaRecord(this, 'CdnAliasRecordV6', {
-      zone,
-      recordName: config.cdnHost,
-      target: route53.RecordTarget.fromAlias(new targets.CloudFrontTarget(this.distribution)),
+  private publishDnsTarget(config: EnvironmentConfig): void {
+    new CfnOutput(this, 'CdnDnsTarget', {
+      value: this.distribution.distributionDomainName,
+      description: `Cloudflare: CNAME ${config.cdnHost} -> this value, proxy DISABLED`,
     });
   }
 }

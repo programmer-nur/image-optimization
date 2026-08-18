@@ -13,7 +13,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import sharp from 'sharp';
 import type { NestFastifyApplication } from '@nestjs/platform-fastify';
-import type { PrismaClient } from '@imgopt/db';
+import { DEFAULT_TENANT_ID, type PrismaClient } from '@imgopt/db';
 import type { StoragePort } from '@imgopt/storage';
 
 process.env['AWS_REGION'] ??= 'us-east-1';
@@ -65,10 +65,20 @@ beforeAll(async () => {
   baseUrl = `http://127.0.0.1:${(app.getHttpServer().address() as { port: number }).port}`;
 
   const keys = app.get(ApiKeyService);
-  uploadKey = (await keys.create({ name: `sec-upload-${Date.now()}`, permissions: ['upload'] }))
-    .plaintext;
-  adminKey = (await keys.create({ name: `sec-admin-${Date.now()}`, permissions: ['admin'] }))
-    .plaintext;
+  uploadKey = (
+    await keys.create({
+      tenantId: DEFAULT_TENANT_ID,
+      name: `sec-upload-${Date.now()}`,
+      permissions: ['upload'],
+    })
+  ).plaintext;
+  adminKey = (
+    await keys.create({
+      tenantId: DEFAULT_TENANT_ID,
+      name: `sec-admin-${Date.now()}`,
+      permissions: ['admin'],
+    })
+  ).plaintext;
 }, 60_000);
 
 afterAll(async () => {
