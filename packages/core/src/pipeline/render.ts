@@ -10,7 +10,7 @@
 import sharp from 'sharp';
 import type { FitEnum, Sharp } from 'sharp';
 import type { TransformSpec } from '../transform-spec.js';
-import { backgroundToRgba, type CropGravity, type FitMode } from '../effects.js';
+import { backgroundToRgba, type CanonicalFit, type CropGravity } from '../effects.js';
 import { supportsAlpha } from '../formats.js';
 import { encoderOptionsFor } from './encoder-options.js';
 import { ProcessingError, classifyError } from './errors.js';
@@ -55,20 +55,16 @@ function positionFor(gravity: CropGravity | undefined): string | number {
       return sharp.strategy.entropy;
     case 'attention':
       return sharp.strategy.attention;
-    // `focal` resolves to a stored focal point upstream; absent that it behaves as
-    // centre, which is also the default.
-    case 'focal':
     case 'center':
     default:
       return 'centre';
   }
 }
 
-/** Sharp's `fit` vocabulary. `pad` is our name for a contain that always fills. */
-function fitFor(fit: FitMode | undefined): keyof FitEnum {
+/** Sharp's `fit` vocabulary. The spec's fits are already canonical. */
+function fitFor(fit: CanonicalFit | undefined): keyof FitEnum {
   switch (fit) {
     case 'contain':
-    case 'pad':
       return 'contain';
     case 'inside':
       return 'inside';

@@ -92,6 +92,12 @@ export const REJECTION_REASONS = [
   'scan_unavailable',
   'quota_exceeded',
   'empty_file',
+  /**
+   * A rejection the API surface produced a code for that this vocabulary does not
+   * name. Present so an unmapped code cannot quietly borrow a reason that means
+   * something else — a spike here is a bug in the mapping, and reads as one.
+   */
+  'unknown',
 ] as const;
 export type RejectionReason = (typeof REJECTION_REASONS)[number];
 

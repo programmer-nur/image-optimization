@@ -24,9 +24,34 @@ function requireArtifact(path: string, produce: string): string {
   return path;
 }
 
+/**
+ * The file the Node runtime loads for the handler string `index.handler`.
+ *
+ * Checked, because the failure it prevents is invisible until the function runs. The
+ * bundles are ESM; a deployed function has no package.json above it, so an `index.js`
+ * is read as CommonJS and throws `Cannot use import statement outside a module`
+ * during init — a deploy that succeeds, an alarm that fires on every invocation, and
+ * nothing wrong with the infrastructure. `.mjs` is unambiguous, and asserting it here
+ * turns a runtime failure into a synth-time one.
+ */
+const HANDLER_FILE = 'index.mjs';
+
+function requireBundle(path: string, produce: string): string {
+  requireArtifact(path, produce);
+
+  if (!existsSync(join(path, HANDLER_FILE))) {
+    throw new Error(
+      `Bundle at ${path} has no ${HANDLER_FILE}.\nRun: ${produce}\n` +
+        'The bundles are ESM and must carry the .mjs extension, or the function ' +
+        'fails at init with "Cannot use import statement outside a module".',
+    );
+  }
+  return path;
+}
+
 /** esbuild output for the SQS worker. Plain JS — `sharp` is external. */
 export function optimizerBundle(): string {
-  return requireArtifact(
+  return requireBundle(
     join(repoRoot, 'apps', 'optimizer', 'dist-bundle'),
     'pnpm --filter @imgopt/infra build:bundles',
   );
@@ -34,7 +59,7 @@ export function optimizerBundle(): string {
 
 /** esbuild output for the on-miss generator. Plain JS — `sharp` is external. */
 export function generatorBundle(): string {
-  return requireArtifact(
+  return requireBundle(
     join(repoRoot, 'apps', 'generator', 'dist-bundle'),
     'pnpm --filter @imgopt/infra build:bundles',
   );
@@ -57,7 +82,7 @@ export function sharpLayer(): string {
 
 /** esbuild output for the scheduled maintenance worker. No native code at all. */
 export function maintenanceBundle(): string {
-  return requireArtifact(
+  return requireBundle(
     join(repoRoot, 'apps', 'maintenance', 'dist-bundle'),
     'pnpm --filter @imgopt/infra build:bundles',
   );

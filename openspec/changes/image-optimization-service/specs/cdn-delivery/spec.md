@@ -45,7 +45,12 @@ When the requested format is `auto`, the edge function SHALL select the output f
 #### Scenario: Browser advertises neither
 
 - **WHEN** a request has `format=auto` and an `Accept` header with neither modern format
-- **THEN** the rewritten path targets JPEG, or PNG when the source has transparency
+- **THEN** the rewritten path targets JPEG, and any transparency in the source is flattened onto the configured background colour — the edge holds no asset metadata and cannot know whether a source carries alpha, and the key must be derivable from the URL alone, identically at the edge and in the generator
+
+#### Scenario: Transparency must be preserved for a client that supports neither modern format
+
+- **WHEN** a caller needs alpha preserved for such a client
+- **THEN** the caller requests `format=png` explicitly, because `auto` resolves from the `Accept` header alone and both modern formats already carry alpha
 
 #### Scenario: Cache is not fragmented by Accept header variation
 

@@ -13,13 +13,28 @@ Every control-plane endpoint except `/healthz` and `/readyz` requires an API key
 either header:
 
 ```
-x-api-key: imgk_key_01J.../<secret>
-authorization: Bearer imgk_key_01J.../<secret>
+x-api-key: imgk_key_01J..._<secret>
+authorization: Bearer imgk_key_01J..._<secret>
 ```
 
-Keys carry coarse permissions — `upload`, `delete`, `admin` — and optional storage and
-asset-count quotas. Only a hash is stored, so the plaintext is shown exactly once at
-creation and cannot be recovered.
+The separator is `_` throughout — `imgk_{keyId}_{secret}`, where the id itself is
+`key_<ulid>`. The secret half is hex rather than base64url precisely so it can never
+contain the separator, which is what lets the id be read off a presented key without
+trusting the rest of it.
+
+Keys carry coarse permissions and optional storage and asset-count quotas. Only a hash
+is stored, so the plaintext is shown exactly once at creation and cannot be recovered.
+
+| Permission | Grants                                                                |
+| ---------- | --------------------------------------------------------------------- |
+| `read`     | `GET /v1/images`, `GET /v1/images/:id`, `GET /v1/images/:id/variants` |
+| `upload`   | Creating assets, replacing source bytes, metadata edits, reprocessing |
+| `delete`   | `DELETE /v1/images/:id`                                               |
+| `admin`    | Issuing, listing, and revoking keys                                   |
+
+A key with no permissions can call nothing but the health routes. Reads are not
+implied by authentication: a key issued for uploading cannot enumerate the catalog
+unless it is also given `read`.
 
 Errors share one envelope, so a client branches on `code` rather than parsing prose:
 
@@ -109,15 +124,15 @@ is returned and nothing was stored.
 
 ## Assets
 
-| Endpoint                        | Permission | Notes                                              |
-| ------------------------------- | ---------- | -------------------------------------------------- |
-| `GET /v1/images/:id`            | any        | Metadata, LQIP, intrinsic dimensions, URLs, srcset |
-| `GET /v1/images`                | any        | List, filterable by status and tags                |
-| `GET /v1/images/:id/variants`   | any        | Materialized derivatives                           |
-| `PATCH /v1/images/:id`          | `upload`   | Alt text and tags; focal point triggers reprocess  |
-| `PUT /v1/images/:id/source`     | `upload`   | Replace bytes — mints a new version                |
-| `POST /v1/images/:id/reprocess` | `upload`   | Re-enqueue the warm set                            |
-| `DELETE /v1/images/:id`         | `delete`   | Soft delete, object removal, CDN invalidation      |
+| Endpoint                        | Permission | Notes                                                                                                        |
+| ------------------------------- | ---------- | ------------------------------------------------------------------------------------------------------------ |
+| `GET /v1/images/:id`            | `read`     | Metadata, LQIP, intrinsic dimensions, URLs, srcset                                                           |
+| `GET /v1/images`                | `read`     | List, filterable by `status`; paginated via `limit` (default 50, max 200) and `cursor`, returns `nextCursor` |
+| `GET /v1/images/:id/variants`   | `read`     | Materialized derivatives                                                                                     |
+| `PATCH /v1/images/:id`          | `upload`   | Alt text and tags; focal point is stored but does not yet affect rendering                                   |
+| `PUT /v1/images/:id/source`     | `upload`   | Replace bytes — mints a new version                                                                          |
+| `POST /v1/images/:id/reprocess` | `upload`   | Re-enqueue the warm set                                                                                      |
+| `DELETE /v1/images/:id`         | `delete`   | Soft delete, object removal, CDN invalidation                                                                |
 
 The asset envelope:
 
@@ -191,18 +206,28 @@ during normalization, and it never affects which bytes are returned.
 
 ### Parameters
 
-| Parameter    | Values                                                               | Normalization                       |
-| ------------ | -------------------------------------------------------------------- | ----------------------------------- |
-| `w`          | 1–3840                                                               | Snapped **up** to the ladder        |
-| `h`          | 1–3840                                                               | Ratio quantized, not snapped        |
-| `q`          | 1–100                                                                | Nearest of 50, 65, 75, 85, 95       |
-| `fit`        | `cover` `contain` `inside` `outside` `fill` `pad`                    | Enum                                |
-| `format`     | `auto` `avif` `webp` `jpeg` `png`                                    | `auto` resolves from `Accept`       |
-| `crop`       | `center` `top` `bottom` `left` `right` `entropy` `attention` `focal` | Named gravity only                  |
-| `background` | hex, 3/4/6/8 digits                                                  | Lowercase 6 or 8 digits             |
-| `blur`       | 0–100                                                                | Nearest of 0, 2, 5, 10, 20, 40      |
-| `sharpen`    | 0–2                                                                  | Nearest of 0, 1, 2                  |
-| `dpr`        | 1–3                                                                  | Folded into width; never in the key |
+| Parameter    | Values                                                       | Normalization                        |
+| ------------ | ------------------------------------------------------------ | ------------------------------------ |
+| `w`          | 1–3840                                                       | Snapped **up** to the ladder         |
+| `h`          | 1–3840                                                       | Ratio quantized, not snapped         |
+| `q`          | 1–100                                                        | Nearest of 50, 65, 75, 85, 95        |
+| `fit`        | `cover` `contain` `inside` `outside` `fill` `pad`            | Enum; `pad` is an alias of `contain` |
+| `format`     | `auto` `avif` `webp` `jpeg` `png`                            | `auto` resolves from `Accept`        |
+| `crop`       | `center` `top` `bottom` `left` `right` `entropy` `attention` | Named gravity only                   |
+| `background` | hex, 3/4/6/8 digits                                          | Lowercase 6 or 8 digits              |
+| `blur`       | 0–100                                                        | Nearest of 0, 2, 5, 10, 20, 40       |
+| `sharpen`    | 0–2                                                          | Nearest of 0, 1, 2                   |
+| `dpr`        | 1–3                                                          | Folded into width; never in the key  |
+
+`pad` and `contain` reach the encoder as the same operation, so they resolve to one
+key: `?fit=pad` is accepted and normalizes to `contain`. Both dimensions below 1 clamp
+to 1 before the ratio is taken, so `?w=0&h=0` is the smallest rung rather than an
+error.
+
+There is no `crop=focal`. A stored focal point is asset metadata, and the delivery
+plane never reads the registry — so it could not reach the render, and the key it
+minted held bytes identical to the plain centre-cropped one. The focal point is still
+recorded on the asset for clients that position images themselves.
 
 The width ladder:
 
@@ -224,8 +249,9 @@ parameters cost nothing.
 the cache exactly as badly as an unquantized one:
 
 - `fit` survives only when **both** dimensions are constrained
-- `background` only on padding fits (`pad`, `contain`)
-- `crop` gravity only when a crop actually occurs
+- `background` only on `contain` (which `pad` resolves to), the one fit that pads
+- `crop` gravity only on `cover`, the one fit that discards pixels — `outside`
+  resizes past the box and returns the whole result, so gravity changes nothing there
 - `blur` and `sharpen` only above level 0
 - `dpr` never — it is folded into the width
 

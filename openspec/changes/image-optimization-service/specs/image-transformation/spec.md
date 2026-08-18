@@ -34,7 +34,7 @@ The pipeline SHALL convert output to the sRGB colorspace rather than passing thr
 
 ### Requirement: Resize fit modes
 
-The pipeline SHALL support the fit modes `cover`, `contain`, `inside`, `outside`, `fill`, and `pad`, with gravity/position applied for modes that crop.
+The pipeline SHALL support the fit modes `cover`, `contain`, `inside`, `outside`, and `fill`, with gravity applied only for `cover` — the one mode that discards source pixels. `pad` is an accepted request spelling that normalizes to `contain` before the key is built, because both reach the encoder as the same call and two keys would mean two objects holding one image.
 
 #### Scenario: Cover fit with both dimensions
 
@@ -109,12 +109,17 @@ The pipeline SHALL enforce a maximum decoded pixel count and MUST fail closed on
 
 ### Requirement: Large sources are read efficiently
 
-The pipeline SHALL stream source bytes from storage rather than materializing whole files in memory, and MUST prefer a master rendition over the original when one exists.
+The pipeline SHALL prefer a master rendition over the original whenever one exists, and SHALL bound peak memory by capping source size rather than by streaming: a worker reads the whole source object into memory, which is safe at the configured 100MB maximum against the workers' configured allocations. Raising that maximum without re-sizing the workers MUST be treated as a memory change rather than a limits change.
 
 #### Scenario: Derivative generated from a very large original
 
 - **WHEN** a derivative is requested for an asset whose original exceeds the master threshold and whose master exists
 - **THEN** the pipeline decodes the master rather than the original, substantially reducing decode time and peak memory
+
+#### Scenario: Source at the configured maximum size is rendered
+
+- **WHEN** a derivative is generated from a source at the configured maximum upload size
+- **THEN** the whole object is read into the worker's memory and rendered within its allocation, because the upload cap — not a streaming read — is what bounds this
 
 ### Requirement: Deterministic output
 

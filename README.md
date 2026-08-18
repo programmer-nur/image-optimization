@@ -11,10 +11,10 @@ https://cdn.example.com/i/{assetId}/{version}/hero?w=640&q=80&format=auto
 ## Status
 
 Feature-complete against the build plan, and **never deployed**. Every task in
-`openspec/changes/image-optimization-service/tasks.md` is done except four that need an
-AWS account: staging deployment (9.15), alarm verification (12.9), the load test
-(13.7), and Lambda power tuning (14.7). Treat any claim about runtime AWS behaviour as
-reasoned rather than observed.
+`openspec/changes/image-optimization-service/tasks.md` is done except five: four that
+need an AWS account — staging deployment (9.15), alarm verification (12.9), the load
+test (13.7), Lambda power tuning (14.7) — and the release/publish decision (14.8).
+Treat any claim about runtime AWS behaviour as reasoned rather than observed.
 
 ## Local development
 
@@ -23,7 +23,7 @@ pnpm install
 cp .env.example .env
 pnpm dev:up                              # postgres + minio + elasticmq
 pnpm --filter @imgopt/db db:generate     # generated Prisma client is not committed
-pnpm --filter @imgopt/db db:migrate      # apply migrations
+DATABASE_URL='postgres://imgopt:imgopt@localhost:5434/imgopt' pnpm --filter @imgopt/db db:migrate   # the Prisma CLI reads only the process env, not .env
 pnpm test                                # unit; no Docker needed
 pnpm test:integration                    # needs the stack above
 ```

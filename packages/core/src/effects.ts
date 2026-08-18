@@ -6,23 +6,48 @@
  * unbucketed width would.
  */
 
-/** Resize behaviour. Mirrors Sharp's fit modes plus an explicit `pad`. */
+/**
+ * Resize behaviour a caller may ask for. Mirrors Sharp's fit modes plus `pad`.
+ *
+ * `pad` is an alias, not a mode: it and `contain` reach sharp as the same `contain`
+ * call with the same background, so they produce byte-identical output. Accepting
+ * both spellings is a convenience for callers coming from other image CDNs; letting
+ * both reach the *key* would mean two objects, two generations, and two cache entries
+ * holding the same bytes. `normalizeFit` collapses it at parse time, which is why
+ * `CANONICAL_FIT_MODES` — not this list — is what a spec and a key may contain.
+ */
 export const FIT_MODES = ['cover', 'contain', 'inside', 'outside', 'fill', 'pad'] as const;
 export type FitMode = (typeof FIT_MODES)[number];
 
+/** The fits that survive normalization and may appear in a canonical key. */
+export const CANONICAL_FIT_MODES = ['cover', 'contain', 'inside', 'outside', 'fill'] as const;
+export type CanonicalFit = (typeof CANONICAL_FIT_MODES)[number];
+
 export const DEFAULT_FIT: FitMode = 'cover';
 
-/** Fits that can leave empty area, and so can meaningfully take a background. */
-const PADDING_FITS = new Set<FitMode>(['contain', 'pad']);
+/** Collapses accepted spellings onto the canonical set. */
+export function normalizeFit(fit: FitMode): CanonicalFit {
+  return fit === 'pad' ? 'contain' : fit;
+}
 
-export function fitUsesBackground(fit: FitMode): boolean {
+/** Fits that can leave empty area, and so can meaningfully take a background. */
+const PADDING_FITS = new Set<CanonicalFit>(['contain']);
+
+export function fitUsesBackground(fit: CanonicalFit): boolean {
   return PADDING_FITS.has(fit);
 }
 
-/** Fits that discard source pixels, and so can meaningfully take a gravity. */
-const CROPPING_FITS = new Set<FitMode>(['cover', 'outside']);
+/**
+ * Fits that discard source pixels, and so can meaningfully take a gravity.
+ *
+ * `cover` alone. `outside` resizes so the result *covers* the requested box and then
+ * returns it whole — sharp never crops it, so every gravity yields identical pixels.
+ * Carrying gravity in an `outside` key would multiply that variant by the size of the
+ * gravity enum, each object holding the same bytes.
+ */
+const CROPPING_FITS = new Set<CanonicalFit>(['cover']);
 
-export function fitCrops(fit: FitMode): boolean {
+export function fitCrops(fit: CanonicalFit): boolean {
   return CROPPING_FITS.has(fit);
 }
 
@@ -33,6 +58,13 @@ export function fitCrops(fit: FitMode): boolean {
  * unbounded key space and would single-handedly undo bucketing. Arbitrary rectangles
  * go through the authenticated API, which mints a new asset — which is also the
  * honest model of their cost. See design.md D3.
+ *
+ * `focal` is deliberately absent too, and for a different reason. A stored focal
+ * point lives in the registry, and the delivery plane never reads the registry — so
+ * the generator, handed only a key, has no way to honour it. It rendered as centre,
+ * which meant `crop=focal` minted a second key holding bytes identical to the elided
+ * centre key: fragmentation dressed as a feature. It stays out of the URL grammar
+ * until a design decision says how a focal point can reach the delivery path.
  */
 export const CROP_GRAVITIES = [
   'center',
@@ -42,7 +74,6 @@ export const CROP_GRAVITIES = [
   'right',
   'entropy',
   'attention',
-  'focal',
 ] as const;
 export type CropGravity = (typeof CROP_GRAVITIES)[number];
 
@@ -78,10 +109,42 @@ export function quantizeSharpen(requested: number): SharpenLevel {
 }
 
 /**
+ * Channel values a background may take: the sixteen 4-bit levels, `00` to `ff`.
+ *
+ * Every other axis of the key is quantized, and this one was not. Full 8-bit hex is
+ * 2^24 distinct backgrounds per box — 2^32 with alpha — each of them a Sharp
+ * invocation, a permanent object, and a permanent cache entry, all reachable from an
+ * ordinary delivery URL by anyone who can read an asset id out of a page. That is the
+ * same unbounded-key-space hole the width ladder exists to close, spelled in hex.
+ *
+ * Four bits per channel is chosen rather than fewer because the parameter only
+ * applies to padding bars, which are flat colour: banding cannot appear in a solid
+ * fill, and 4096 colours (times 16 alpha steps) is far more than a letterbox needs.
+ * The step is 17, so the levels are exactly `00, 11, 22, … ff` — which means the
+ * three-digit shorthand everyone writes (`fa0` → `ffaa00`) is already on the grid and
+ * survives untouched.
+ */
+export const BACKGROUND_CHANNEL_STEP = 17;
+
+function quantizeChannel(byte: number): string {
+  const level = Math.round(byte / BACKGROUND_CHANNEL_STEP) * BACKGROUND_CHANNEL_STEP;
+  return level < 16 ? `0${level.toString(16)}` : level.toString(16);
+}
+
+/** Whether a normalized hex string is on the channel grid. */
+export function isQuantizedBackground(hex: string): boolean {
+  for (let i = 0; i < hex.length; i += 2) {
+    if (parseInt(hex.slice(i, i + 2), 16) % BACKGROUND_CHANNEL_STEP !== 0) return false;
+  }
+  return true;
+}
+
+/**
  * Normalizes a background colour to canonical lowercase hex without `#`.
  *
  * Accepts 3, 4, 6, and 8 digit forms and expands shorthand, so `#FA0`, `ffaa00`, and
- * `#FFAA00` all collapse to one cache key. Returns undefined for anything
+ * `#FFAA00` all collapse to one cache key. Channels are then snapped to the 4-bit
+ * grid, which is what keeps this axis finite. Returns undefined for anything
  * unparseable, letting the caller decide between rejecting and ignoring.
  */
 export function normalizeBackground(raw: string): string | undefined {
@@ -89,12 +152,15 @@ export function normalizeBackground(raw: string): string | undefined {
 
   if (!/^[0-9a-f]+$/.test(hex)) return undefined;
 
-  if (hex.length === 3 || hex.length === 4) {
-    return [...hex].map((c) => c + c).join('');
-  }
-  if (hex.length === 6 || hex.length === 8) return hex;
+  const expanded = hex.length === 3 || hex.length === 4 ? [...hex].map((c) => c + c).join('') : hex;
 
-  return undefined;
+  if (expanded.length !== 6 && expanded.length !== 8) return undefined;
+
+  let quantized = '';
+  for (let i = 0; i < expanded.length; i += 2) {
+    quantized += quantizeChannel(parseInt(expanded.slice(i, i + 2), 16));
+  }
+  return quantized;
 }
 
 /** Splits a normalized hex string into Sharp's background object. */

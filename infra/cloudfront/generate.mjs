@@ -17,6 +17,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
   BLUR_LEVELS,
+  CANONICAL_FIT_MODES,
   CROP_GRAVITIES,
   DEFAULT_FIT,
   DEFAULT_GRAVITY,
@@ -34,8 +35,11 @@ import {
   RATIO_TOLERANCE,
   REQUESTED_FORMATS,
   SHARPEN_LEVELS,
+  STORAGE_PREFIXES,
+  VIEWER_PATH_PREFIXES,
   fitCrops,
   fitUsesBackground,
+  normalizeFit,
   toVariantName,
 } from '@imgopt/core';
 
@@ -67,9 +71,14 @@ const tables = {
   BLUR_LEVELS: [...BLUR_LEVELS],
   SHARPEN_LEVELS: [...SHARPEN_LEVELS],
   FIT_MODES: [...FIT_MODES],
+  // Only the aliases, so the edge does one lookup and the table stays empty when
+  // there are none. Derived by asking core, never transcribed.
+  FIT_ALIASES: Object.fromEntries(
+    FIT_MODES.filter((fit) => normalizeFit(fit) !== fit).map((fit) => [fit, normalizeFit(fit)]),
+  ),
   DEFAULT_FIT,
-  PADDING_FITS: FIT_MODES.filter(fitUsesBackground),
-  CROPPING_FITS: FIT_MODES.filter(fitCrops),
+  PADDING_FITS: CANONICAL_FIT_MODES.filter(fitUsesBackground),
+  CROPPING_FITS: CANONICAL_FIT_MODES.filter(fitCrops),
   CROP_GRAVITIES: [...CROP_GRAVITIES],
   DEFAULT_GRAVITY,
   REQUESTED_FORMATS: [...REQUESTED_FORMATS],
@@ -78,6 +87,8 @@ const tables = {
   MAX_DPR: Math.max(...DPR_VALUES),
   DERIVED_PREFIX,
   FULL_WIDTH_TOKEN: fullWidthToken,
+  VIEWER_PATH_PREFIXES: [...VIEWER_PATH_PREFIXES],
+  STORAGE_PREFIXES: [...STORAGE_PREFIXES],
 };
 
 /**

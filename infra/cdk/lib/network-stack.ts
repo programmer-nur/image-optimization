@@ -90,7 +90,15 @@ export class NetworkStack extends Stack {
 
     this.albSecurityGroup.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(443), 'HTTPS');
     this.albSecurityGroup.addIngressRule(ec2.Peer.anyIpv6(), ec2.Port.tcp(443), 'HTTPS');
-    // Answered only to redirect to HTTPS; no request is ever served over it.
+    /*
+     * Port 80 has two lives, and the comment used to describe only the first.
+     *
+     * With a certificate configured — always, in production, where synthesis fails
+     * without one — the listener on 80 exists solely to redirect to 443 and no
+     * request is served over it. Without one, which staging is allowed to be before
+     * DNS exists, 80 *is* the listener and requests really are served in clear. Both
+     * rules stay either way; what changes is which of those two things is true.
+     */
     this.albSecurityGroup.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(80), 'HTTP redirect');
     this.albSecurityGroup.addIngressRule(ec2.Peer.anyIpv6(), ec2.Port.tcp(80), 'HTTP redirect');
 

@@ -44,6 +44,33 @@ export interface EnvironmentConfig {
    */
   cdnCertificateArn?: string;
 
+  /**
+   * Pre-issued certificate for the load balancer, in the deployment's own region.
+   *
+   * The regional counterpart to `cdnCertificateArn`, and genuinely a second
+   * certificate: CloudFront accepts a viewer certificate only from us-east-1, and an
+   * ALB accepts one only from its own region. Substituting one for the other fails
+   * when CloudFormation tries to attach it, not at synth.
+   *
+   * When absent, one is issued for `apiHost` provided the hosted zone is in this
+   * account. Production refuses to synthesize with neither — see ComputeStack.
+   */
+  apiCertificateArn?: string;
+
+  /**
+   * This environment's distribution id, pinning the bucket's read grant to it.
+   *
+   * Supplied out of band rather than referenced: naming the CDN stack's construct
+   * here would make storage depend on CDN, which depends on compute, which depends on
+   * storage. Without it the grant admits any distribution in the account, so a
+   * staging distribution can read production's derivatives — the one place the
+   * per-environment isolation everything else here relies on does not hold.
+   *
+   * First deploy of an environment runs without it; take `DistributionId` from the
+   * CDN stack's outputs, set `CDN_DISTRIBUTION_ID`, and redeploy storage.
+   */
+  cdnDistributionId?: string;
+
   network: {
     maxAzs: number;
     /**
@@ -53,6 +80,14 @@ export interface EnvironmentConfig {
      * only for AWS APIs that have no endpoint configured. Zero is viable and cheaper
      * once every dependency is endpoint-backed, but it fails closed and obscurely —
      * a missing endpoint looks like a hang, not an error — so the default is one.
+     *
+     * The residual, stated so it is priced deliberately rather than discovered: one
+     * NAT gateway lives in one availability zone, and everything not endpoint-backed
+     * goes through it — including ECR image pulls for task launches, X-Ray, and STS.
+     * Losing that zone costs egress and new task launches for the survivors, not just
+     * the tasks in it. Two NATs in production is one line and roughly one extra
+     * hourly charge; it is deliberately not taken by default because the endpoints
+     * already keep the hot paths off it.
      */
     natGateways: number;
   };
@@ -65,6 +100,34 @@ export interface EnvironmentConfig {
     /** Untrusted uploads are short-lived by policy, not by convention. */
     stagingExpiryDays: number;
     abortIncompleteMultipartDays: number;
+    /**
+     * How long a replaced or deleted object survives as a noncurrent version.
+     *
+     * The bucket is versioned, so a delete does not destroy bytes — it writes a
+     * delete marker and keeps the old copy. That is the point for originals: a defect
+     * in reclamation becomes recoverable instead of permanent. It is also why this
+     * number exists at all, since without an expiry the recovery copies accumulate
+     * forever and reclamation stops reducing the bill.
+     */
+    noncurrentVersionExpiryDays: number;
+    /**
+     * The same window for `staging/`, and deliberately much shorter.
+     *
+     * Staging holds unvalidated bytes, including whatever a malware scan is about to
+     * reject. Under versioning both the hard expiry rule and the quarantine handler's
+     * delete leave the original copy behind as a noncurrent version — so a window
+     * sized for "recover a deleted original" would silently become "retain flagged
+     * malware for a month".
+     */
+    stagingNoncurrentExpiryDays: number;
+    /**
+     * How long access logs are kept.
+     *
+     * Long enough to investigate something noticed weeks later, short enough that the
+     * log bucket does not become a storage tier of its own — it is the one line that
+     * grows with traffic rather than with content.
+     */
+    accessLogRetentionDays: number;
   };
 
   database: {
@@ -80,6 +143,15 @@ export interface EnvironmentConfig {
     desiredCount: number;
     minCapacity: number;
     maxCapacity: number;
+    /**
+     * The image the service and the migration task both run.
+     *
+     * Required, and never `latest`. The tag is the rollback coordinate: with a
+     * mutable one, "redeploy the previous version" is ambiguous — the same tag can
+     * point at different bytes on two consecutive days — and the service and the
+     * migration task can silently disagree about which version they are.
+     */
+    imageTag: string;
   };
 
   lambda: {
@@ -92,6 +164,22 @@ export interface EnvironmentConfig {
      * Excess requests fail fast with a short-lived error rather than fanning out.
      */
     generatorReservedConcurrency: number;
+    /**
+     * Ceiling on how many optimizer invocations SQS may run at once.
+     *
+     * This is a database-connection budget, not a throughput dial. Each optimizer
+     * invocation opens its own Postgres connection (the Lambda client is pinned to a
+     * pool of one), and it shares one small instance with the control plane — so an
+     * unbounded consumer means a bulk import can cure its own backlog by exhausting
+     * the connections the API needs to accept uploads. The backlog drains slightly
+     * slower and the control plane stays up.
+     *
+     * Event-source concurrency rather than reserved concurrency on the function:
+     * reserved concurrency permanently carves capacity out of the account pool, which
+     * is right for the generator (it is the viewer path, and its cap exists to bound
+     * spend) and wrong here, where the only thing being protected is the database.
+     */
+    optimizerMaxConcurrency: number;
   };
 
   queue: {
@@ -146,6 +234,9 @@ export interface EnvironmentConfig {
     supersededRetentionDays: number;
     pendingUploadTtlHours: number;
     maxDeletionsPerRun: number;
+    /** How long an asset may sit unoptimized before its job is queued again. */
+    stalledOptimizeHours: number;
+    maxReenqueuesPerRun: number;
     dryRun: boolean;
   };
 
@@ -164,6 +255,10 @@ export interface EnvironmentConfig {
     generationFailurePercent: number;
     cacheHitRatePercent: number;
     apiServerErrorsPer5Min: number;
+    /** Runtime-level Lambda failures per 5 minutes: init, OOM, timeout, crash. */
+    lambdaErrorsPer5Min: number;
+    /** CloudFront 5xx as a percentage of requests. */
+    cdnServerErrorPercent: number;
   };
 
   /** Retain on stateful stacks everywhere; only a throwaway environment differs. */
@@ -177,8 +272,31 @@ const BASE = {
     originalsArchiveDays: 180,
     stagingExpiryDays: 1,
     abortIncompleteMultipartDays: 1,
+    // Long enough to notice that something was deleted that should not have been —
+    // a maintenance run happens daily, and a broken image is usually reported within
+    // days — and short enough that recovery copies do not become a storage tier of
+    // their own.
+    noncurrentVersionExpiryDays: 30,
+    // One day: unvalidated bytes get no recovery window worth the name.
+    stagingNoncurrentExpiryDays: 1,
+    accessLogRetentionDays: 90,
   },
-  queue: { maxReceiveCount: 5, visibilityTimeout: Duration.minutes(6) },
+  /*
+   * Visibility must be about six times the consumer's timeout, not merely greater.
+   *
+   * The clock starts when the poller receives the batch, not when the function
+   * starts, so a batch that runs to the optimizer's own 5-minute timeout would be
+   * redelivered while the first attempt's writes were still landing. The work is
+   * idempotent, so the cost is not corruption — it is burnt receives: five of them
+   * dead-letter a message that never actually failed, and the DLQ alarm then reports
+   * a problem that does not exist while hiding one that might.
+   *
+   * The resulting envelope is 5 receives x 30 minutes = 2.5 hours worst case in
+   * flight, comfortably inside the queue's 4-day retention. Do not instead shorten
+   * the optimizer's timeout: 5 minutes is sized for the warm set on a large source,
+   * and shortening it trades a rare redelivery for a real failure.
+   */
+  queue: { maxReceiveCount: 5, visibilityTimeout: Duration.minutes(30) },
   processing: { warmWidths: '1080', warmFormats: 'avif' },
   lifecycle: {
     // A full day. The generator writes a derivative before its bookkeeping row
@@ -190,6 +308,10 @@ const BASE = {
     supersededRetentionDays: 30,
     pendingUploadTtlHours: 24,
     maxDeletionsPerRun: 10_000,
+    // Clear of SQS's own retry ceiling (visibility timeout x maxReceiveCount), so
+    // re-enqueueing never races a redelivery that is still in flight.
+    stalledOptimizeHours: 6,
+    maxReenqueuesPerRun: 500,
     dryRun: false,
   },
   observability: {
@@ -201,6 +323,12 @@ const BASE = {
     generationFailurePercent: 5,
     cacheHitRatePercent: 80,
     apiServerErrorsPer5Min: 10,
+    // Runtime-level failures — init errors, OOM kills, timeouts — which the
+    // handler-emitted metrics structurally cannot report, because the handler did
+    // not run.
+    lambdaErrorsPer5Min: 5,
+    // A percentage, not a count: CloudFront publishes 5xx as a rate.
+    cdnServerErrorPercent: 1,
   },
 } as const;
 
@@ -219,6 +347,19 @@ const LAMBDA = {
   generatorMemoryMb: 3008,
   generatorTimeout: Duration.seconds(30),
   generatorReservedConcurrency: 50,
+  /*
+   * Sized against the database, with the arithmetic written down because the number
+   * looks arbitrary otherwise.
+   *
+   * One connection per concurrent invocation. Production budget: the API can hold up
+   * to 10 connections per task across 10 tasks (100), the generator's own bookkeeping
+   * writes can add up to its reserved concurrency (50), and a `t4g.small`'s default
+   * `max_connections` is around 225. 100 + 50 + 10 fits with room to spare. Staging
+   * overrides this to 5 against a `t4g.micro` (~112).
+   *
+   * Revisit after 13.7 with observed numbers, not before.
+   */
+  optimizerMaxConcurrency: 10,
 };
 
 export const ENVIRONMENTS: Record<string, () => EnvironmentConfig> = {
@@ -231,6 +372,8 @@ export const ENVIRONMENTS: Record<string, () => EnvironmentConfig> = {
     ...optional('hostedZoneId', process.env['HOSTED_ZONE_ID']),
     ...optional('hostedZoneName', process.env['HOSTED_ZONE_NAME']),
     ...optional('cdnCertificateArn', process.env['CDN_CERTIFICATE_ARN']),
+    ...optional('apiCertificateArn', process.env['API_CERTIFICATE_ARN']),
+    ...optional('cdnDistributionId', process.env['CDN_DISTRIBUTION_ID']),
     ...BASE,
     database: {
       instanceType: ec2.InstanceType.of(ec2.InstanceClass.T4G, ec2.InstanceSize.MICRO),
@@ -238,8 +381,17 @@ export const ENVIRONMENTS: Record<string, () => EnvironmentConfig> = {
       multiAz: false,
       backupRetention: Duration.days(3),
     },
-    api: { cpu: 512, memoryMb: 1024, desiredCount: 1, minCapacity: 1, maxCapacity: 3 },
-    lambda: { ...LAMBDA, generatorReservedConcurrency: 10 },
+    api: {
+      cpu: 512,
+      memoryMb: 1024,
+      desiredCount: 1,
+      minCapacity: 1,
+      maxCapacity: 3,
+      imageTag: requireImageTag(),
+    },
+    // A t4g.micro allows roughly half the connections of a small, and staging's API
+    // holds fewer — so the consumer's share shrinks with it.
+    lambda: { ...LAMBDA, generatorReservedConcurrency: 10, optimizerMaxConcurrency: 5 },
     delivery: { priceClass: cloudfront.PriceClass.PRICE_CLASS_100, encoderEpoch: 1 },
     // Charged per gigabyte scanned; off in staging unless a change to the upload
     // path is being exercised.
@@ -259,6 +411,8 @@ export const ENVIRONMENTS: Record<string, () => EnvironmentConfig> = {
     ...optional('hostedZoneId', process.env['HOSTED_ZONE_ID']),
     ...optional('hostedZoneName', process.env['HOSTED_ZONE_NAME']),
     ...optional('cdnCertificateArn', process.env['CDN_CERTIFICATE_ARN']),
+    ...optional('apiCertificateArn', process.env['API_CERTIFICATE_ARN']),
+    ...optional('cdnDistributionId', process.env['CDN_DISTRIBUTION_ID']),
     ...BASE,
     database: {
       instanceType: ec2.InstanceType.of(ec2.InstanceClass.T4G, ec2.InstanceSize.SMALL),
@@ -266,7 +420,14 @@ export const ENVIRONMENTS: Record<string, () => EnvironmentConfig> = {
       multiAz: true,
       backupRetention: Duration.days(14),
     },
-    api: { cpu: 1024, memoryMb: 2048, desiredCount: 2, minCapacity: 2, maxCapacity: 10 },
+    api: {
+      cpu: 1024,
+      memoryMb: 2048,
+      desiredCount: 2,
+      minCapacity: 2,
+      maxCapacity: 10,
+      imageTag: requireImageTag(),
+    },
     lambda: LAMBDA,
     delivery: { priceClass: cloudfront.PriceClass.PRICE_CLASS_ALL, encoderEpoch: 1 },
     malwareScanning: process.env['MALWARE_SCANNING'] !== 'false',
@@ -278,6 +439,26 @@ export const ENVIRONMENTS: Record<string, () => EnvironmentConfig> = {
 /** Omits the key entirely when unset, so `exactOptionalPropertyTypes` holds. */
 function optional<K extends string>(key: K, value: string | undefined): Record<K, string> | object {
   return value === undefined || value === '' ? {} : { [key]: value };
+}
+
+/**
+ * The control-plane image tag, required and never mutable.
+ *
+ * `latest` is refused rather than defaulted to. A release is defined by an image tag
+ * (docs/release.md), and a rollback is "redeploy the previous tag" — which means
+ * nothing if the tag can be repointed. It also lets the service and the migration
+ * task, which take the tag from the same place, end up running different bytes.
+ */
+function requireImageTag(): string {
+  const tag = requireEnv('API_IMAGE_TAG');
+  if (tag === 'latest') {
+    throw new Error(
+      'API_IMAGE_TAG must name an immutable tag, not "latest". The tag is the ' +
+        'rollback coordinate: a mutable one makes "redeploy the previous version" ' +
+        'ambiguous. Tag by commit, e.g. API_IMAGE_TAG=v1 or the short SHA.',
+    );
+  }
+  return tag;
 }
 
 /**

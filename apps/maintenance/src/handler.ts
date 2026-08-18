@@ -13,6 +13,7 @@ import type { ScheduledEvent } from 'aws-lambda';
 import pino from 'pino';
 import { loadConfig } from '@imgopt/config';
 import { S3Storage } from '@imgopt/storage';
+import { SqsQueue } from '@imgopt/queue';
 import { AssetRepository, createPrismaClient, hydrateDatabaseCredentials } from '@imgopt/db';
 import { Maintenance, type MaintenanceReport } from './maintenance.js';
 
@@ -31,12 +32,21 @@ const storage = new S3Storage({
   forcePathStyle: config.storage.forcePathStyle,
 });
 
+// Only ever used to *send*: the reconciliation job re-enqueues optimizations whose
+// original enqueue failed after the upload had already succeeded. This function is
+// not a consumer of that queue and its role carries no receive permission.
+const queue = new SqsQueue({
+  queueUrl: config.queue.optimizeQueueUrl,
+  region: config.storage.region,
+  ...(config.queue.endpoint !== undefined ? { endpoint: config.queue.endpoint } : {}),
+});
+
 const prisma = createPrismaClient({
   connectionString: config.database.url,
   context: 'lambda',
 });
 
-const maintenance = new Maintenance(storage, new AssetRepository(prisma), config, logger);
+const maintenance = new Maintenance(storage, new AssetRepository(prisma), queue, config, logger);
 
 export async function handler(_event: ScheduledEvent): Promise<MaintenanceReport> {
   return maintenance.run();

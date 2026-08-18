@@ -107,6 +107,15 @@ export interface StoragePort {
   list(prefix: string, options?: ListOptions): Promise<ListResult>;
 
   presignUpload(key: string, options: PresignedUploadOptions): Promise<PresignedUploadTarget>;
+  /**
+   * Time-limited read URL for one object.
+   *
+   * Exists for one caller: a derivative too large to travel inside a Lambda Function
+   * URL response, which is already written to storage and only needs the viewer
+   * pointed at it. Nothing in the ordinary delivery path uses this — viewers read
+   * through CloudFront, which reads through OAC.
+   */
+  presignDownload(key: string, options: { expiresInSeconds: number }): Promise<string>;
   createMultipartUpload(
     key: string,
     partCount: number,

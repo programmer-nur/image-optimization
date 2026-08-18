@@ -41,6 +41,35 @@ export const METRICS = {
   requestCount: 'RequestCount',
   requestLatency: 'RequestLatencyMs',
   requestErrors: 'RequestErrors',
+
+  /**
+   * One per completed maintenance run. A heartbeat, and the only one in the system.
+   *
+   * Reclamation stopping is otherwise entirely silent: no errors, no 5xx, no failed
+   * requests — storage simply grows, and the first evidence is a bill months later.
+   * The alarm on this metric is inverted (fires on *absence*), which is why it has
+   * to be emitted on success rather than derived from Lambda invocations: an
+   * invocation that dies mid-walk still counts as an invocation while reclaiming
+   * nothing.
+   */
+  maintenanceRuns: 'MaintenanceRuns',
+  /** Objects reclaimed in a run, so a run that suddenly deletes far more is visible. */
+  maintenanceReclaimed: 'MaintenanceReclaimed',
+
+  /**
+   * Deployment-wide storage, sampled once per maintenance run.
+   *
+   * Split by tier rather than totalled because each is driven by a different
+   * decision — originals by ingest, masters by the conditional-master threshold,
+   * derivatives by the warm set — and one number hides the effect of changing any of
+   * them. This is also the only read on the largest slow-moving variable in the cost
+   * model, which was previously log-only.
+   */
+  storedOriginalBytes: 'StoredOriginalBytes',
+  storedMasterBytes: 'StoredMasterBytes',
+  storedDerivativeBytes: 'StoredDerivativeBytes',
+  storedAssetCount: 'StoredAssetCount',
+  storedDerivativeCount: 'StoredDerivativeCount',
 } as const;
 
 export const DIMENSIONS = {
@@ -190,4 +219,63 @@ export function recordRequest(input: { route: string; status: number; durationMs
     },
     dimensionSets: [[DIMENSIONS.route], [DIMENSIONS.statusClass], []],
   });
+}
+
+/**
+ * Records that a maintenance run completed, and how much it reclaimed.
+ *
+ * Emitted only on a successful run, because the alarm watching it fires on absence.
+ * A run that throws halfway leaves no datapoint, which is exactly the signal wanted:
+ * the job is the only thing keeping storage bounded, and it fails without producing
+ * a single error anyone sees.
+ */
+export function recordMaintenanceRun(input: { reclaimed: number; dryRun: boolean }): void {
+  emit(
+    [
+      { name: METRICS.maintenanceRuns, value: 1, unit: 'Count' },
+      { name: METRICS.maintenanceReclaimed, value: input.reclaimed, unit: 'Count' },
+    ],
+    {
+      // No dimensions: there is one maintenance job per deployment, and a dry run is
+      // still a run that proves the path works. `dryRun` travels as a property so it
+      // is visible in the log line without splitting the series an alarm watches.
+      dimensionSets: [[]],
+      properties: { dryRun: input.dryRun },
+    },
+  );
+}
+
+/**
+ * Records deployment-wide storage totals, once per maintenance run.
+ *
+ * The byte values also travel as string properties. CloudWatch stores metric values
+ * as doubles, so a total past 2^53 loses integer precision on the graph; the log line
+ * beside it is where the exact number stays available.
+ */
+export function recordStorageTotals(totals: {
+  originalBytes: bigint;
+  masterBytes: bigint;
+  derivativeBytes: bigint;
+  assetCount: number;
+  derivativeCount: number;
+}): void {
+  emit(
+    [
+      { name: METRICS.storedOriginalBytes, value: Number(totals.originalBytes), unit: 'Bytes' },
+      { name: METRICS.storedMasterBytes, value: Number(totals.masterBytes), unit: 'Bytes' },
+      { name: METRICS.storedDerivativeBytes, value: Number(totals.derivativeBytes), unit: 'Bytes' },
+      { name: METRICS.storedAssetCount, value: totals.assetCount, unit: 'Count' },
+      { name: METRICS.storedDerivativeCount, value: totals.derivativeCount, unit: 'Count' },
+    ],
+    {
+      // Deployment-wide gauges. Nothing to slice them by that would not be an
+      // unbounded dimension value, which is the one way to make EMF expensive.
+      dimensionSets: [[]],
+      properties: {
+        originalBytesExact: totals.originalBytes.toString(),
+        masterBytesExact: totals.masterBytes.toString(),
+        derivativeBytesExact: totals.derivativeBytes.toString(),
+      },
+    },
+  );
 }

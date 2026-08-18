@@ -47,6 +47,43 @@ const data = new DataStack(app, `${prefix}-Data`, {
   databaseSecurityGroup: network.databaseSecurityGroup,
 });
 
+/*
+ * Two certificates, in two regions, for two different names.
+ *
+ * The distribution's must be in us-east-1 whatever region everything else is in —
+ * a CloudFront constraint — while the load balancer's must be in the deployment's own
+ * region. Each is issued here only when the hosted zone is in this account, since DNS
+ * validation cannot complete otherwise; with an external zone the operator supplies
+ * an ARN and the corresponding stack is skipped entirely.
+ *
+ * The API certificate is created before the compute stack because compute consumes
+ * it. Missing that wiring is how the control plane came to serve plain HTTP: the prop
+ * existed, and nothing ever passed it.
+ */
+const zoneIsOurs = config.hostedZoneId !== undefined && config.hostedZoneName !== undefined;
+
+const certificate =
+  config.cdnCertificateArn === undefined && zoneIsOurs
+    ? new CertificateStack(app, `${prefix}-Certificate`, {
+        env: { account: config.account, region: 'us-east-1' },
+        domainName: config.cdnHost,
+        hostedZoneId: config.hostedZoneId!,
+        hostedZoneName: config.hostedZoneName!,
+        crossRegionReferences: true,
+      })
+    : undefined;
+
+const apiCertificate =
+  config.apiCertificateArn === undefined && config.apiHost !== undefined && zoneIsOurs
+    ? new CertificateStack(app, `${prefix}-ApiCertificate`, {
+        // Same region as the ALB: an ALB cannot attach a certificate from another.
+        env,
+        domainName: config.apiHost,
+        hostedZoneId: config.hostedZoneId!,
+        hostedZoneName: config.hostedZoneName!,
+      })
+    : undefined;
+
 const compute = new ComputeStack(app, `${prefix}-Compute`, {
   env,
   config,
@@ -58,27 +95,8 @@ const compute = new ComputeStack(app, `${prefix}-Compute`, {
   database: data.instance,
   databaseSecret: data.secret,
   databaseName: data.databaseName,
+  ...(apiCertificate !== undefined ? { apiCertificate: apiCertificate.certificate } : {}),
 });
-
-/*
- * The viewer certificate has to be in us-east-1 whatever region everything else is
- * in, so it gets its own stack. Only issued here when the hosted zone is in this
- * account; otherwise the operator supplies an ARN and this is skipped entirely.
- */
-const needsCertificate =
-  config.cdnCertificateArn === undefined &&
-  config.hostedZoneId !== undefined &&
-  config.hostedZoneName !== undefined;
-
-const certificate = needsCertificate
-  ? new CertificateStack(app, `${prefix}-Certificate`, {
-      env: { account: config.account, region: 'us-east-1' },
-      config,
-      hostedZoneId: config.hostedZoneId!,
-      hostedZoneName: config.hostedZoneName!,
-      crossRegionReferences: true,
-    })
-  : undefined;
 
 const cdn = new CdnStack(app, `${prefix}-Cdn`, {
   env,
@@ -103,7 +121,11 @@ const observability = new ObservabilityStack(app, `${prefix}-Observability`, {
   optimizeQueueName: queue.optimizeQueue.queueName,
   deadLetterQueueName: queue.deadLetterQueue.queueName,
   generatorFunctionName: compute.generator.functionName,
-  optimizerFunctionName: `imgopt-${config.name}-optimizer`,
+  // Read off the constructs, not retyped. A hand-written name is a latent
+  // silent disarm: rename the function and the alarm watches a name nothing
+  // publishes, which reads as permanent health.
+  optimizerFunctionName: compute.optimizer.functionName,
+  maintenanceFunctionName: compute.maintenance.functionName,
   distributionId: cdn.distribution.distributionId,
   loadBalancerFullName: compute.loadBalancer.loadBalancerFullName,
   targetGroupFullName: compute.targetGroupFullName,
@@ -117,6 +139,7 @@ const observability = new ObservabilityStack(app, `${prefix}-Observability`, {
  * removes one reference from silently reordering the deployment.
  */
 if (certificate !== undefined) cdn.addStackDependency(certificate);
+if (apiCertificate !== undefined) compute.addStackDependency(apiCertificate);
 cdn.addStackDependency(compute);
 cdn.addStackDependency(storage);
 compute.addStackDependency(data);
@@ -126,7 +149,23 @@ data.addStackDependency(network);
 observability.addStackDependency(cdn);
 observability.addStackDependency(compute);
 
-for (const stack of [network, storage, queue, data, compute, cdn, observability]) {
+// Every stack, including the certificate stacks — which were previously omitted, so
+// the two resources most likely to be found by someone auditing a bill carried no
+// Application or Environment tag.
+const tagged = [
+  network,
+  storage,
+  queue,
+  data,
+  compute,
+  cdn,
+  observability,
+  certificate,
+  apiCertificate,
+];
+
+for (const stack of tagged) {
+  if (stack === undefined) continue;
   Tags.of(stack).add('Application', 'imgopt');
   Tags.of(stack).add('Environment', config.name);
 }

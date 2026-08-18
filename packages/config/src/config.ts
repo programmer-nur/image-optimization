@@ -23,6 +23,30 @@ const csv = z.string().transform((s) =>
 
 const csvInts = csv.pipe(z.array(z.coerce.number().int().positive()));
 
+/**
+ * Environment booleans, parsed by spelling rather than by truthiness.
+ *
+ * `z.coerce.boolean()` is `Boolean(value)`, and every environment variable is a
+ * string — so `"false"` coerces to **true**. That is not a hypothetical here: the CDK
+ * writes these values literally (`String(config.malwareScanning)`), so a deployment
+ * with scanning switched off would set `UPLOAD_MALWARE_SCAN_ENABLED=false`, the app
+ * would read `true`, and — fail-closed being the default — it would hold every upload
+ * forever waiting on a scanner that was never provisioned. The same coercion turned
+ * `MAINTENANCE_DRY_RUN=false` into a reclamation job that never deletes anything.
+ *
+ * Unrecognized spellings are rejected rather than resolved to whichever side happens
+ * to be truthy: a typo in a flag that decides whether uploads are held should stop
+ * the process, not pick an answer.
+ */
+const bool = z
+  .preprocess(
+    (value) => (typeof value === 'string' ? value.trim().toLowerCase() : value),
+    z.union([z.boolean(), z.enum(['true', 'false', '1', '0', 'yes', 'no', 'on', 'off'])]),
+  )
+  .transform((value) =>
+    typeof value === 'boolean' ? value : ['true', '1', 'yes', 'on'].includes(value),
+  );
+
 export const appConfigSchema = z.object({
   nodeEnv: z.enum(['development', 'test', 'production']).default('development'),
   logLevel: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
@@ -32,7 +56,7 @@ export const appConfigSchema = z.object({
     bucket: z.string().min(1),
     /** Set for MinIO locally; unset in AWS so the SDK resolves the real endpoint. */
     endpoint: z.string().url().optional(),
-    forcePathStyle: z.coerce.boolean().default(false),
+    forcePathStyle: bool.default(false),
   }),
 
   database: z.object({
@@ -55,8 +79,23 @@ export const appConfigSchema = z.object({
     acceptedFormats: csv
       .pipe(z.array(z.enum(['jpeg', 'png', 'webp', 'avif', 'gif', 'tiff'])))
       .default('jpeg,png,webp,avif'),
-    /** SVG is an XML attack surface; off unless explicitly enabled. See design.md D12. */
-    allowSvg: z.coerce.boolean().default(false),
+    /**
+     * SVG is an XML attack surface; off unless explicitly enabled. See design.md D12.
+     *
+     * Enabling it currently fails the process at startup, on purpose. The sanitize
+     * -and-rasterize path the spec describes does not exist yet, and the validator's
+     * "enabled" branch is a stub that rejects every SVG with a 422 — so the flag as
+     * shipped does not enable SVG, it enables a confusing error. A deployment that
+     * sets it has made a decision it cannot get: better to refuse to boot, where the
+     * message is read by the operator who set it, than to accept the setting and
+     * surface it later as an upload failure nobody connects back to a config flag.
+     */
+    allowSvg: bool.default(false).refine((enabled) => !enabled, {
+      message:
+        'UPLOAD_ALLOW_SVG is not supported yet: SVG sanitization and rasterization ' +
+        'are unimplemented, so enabling it would reject every SVG upload with a 422. ' +
+        'Leave it unset until the sanitizer ships.',
+    }),
     /**
      * Whether malware scanning is configured for this deployment.
      *
@@ -67,9 +106,9 @@ export const appConfigSchema = z.object({
      * without GuardDuty holds every upload forever and looks like a broken uploader.
      * Turned on by the infrastructure that provisions the scanner.
      */
-    malwareScanEnabled: z.coerce.boolean().default(false),
+    malwareScanEnabled: bool.default(false),
     /** When scanning is enabled but a verdict is unavailable, hold rather than promote. */
-    failClosedOnScanUnavailable: z.coerce.boolean().default(true),
+    failClosedOnScanUnavailable: bool.default(true),
   }),
 
   processing: z.object({
@@ -114,8 +153,22 @@ export const appConfigSchema = z.object({
     pendingUploadTtlHours: z.coerce.number().int().positive().default(24),
     /** Objects deleted per maintenance run, so one run cannot become unbounded. */
     maxDeletionsPerRun: z.coerce.number().int().positive().default(10_000),
+    /**
+     * How long an asset may sit in `stored` before its optimization is re-enqueued.
+     *
+     * A failed enqueue must never fail an upload — the bytes are already durable — so
+     * the job is simply lost, and the asset stays servable with no LQIP, no metadata,
+     * no warm set, and no path back to `ready`. Nothing else notices.
+     *
+     * The window has to clear SQS's own retry ceiling (visibility timeout times
+     * `maxReceiveCount`), so reconciliation never races a redelivery still in flight.
+     * Past that the cost of being wrong is one idempotent invocation.
+     */
+    stalledOptimizeHours: z.coerce.number().int().positive().default(6),
+    /** Re-enqueues per run, so a stalled optimizer cannot become a queue flood. */
+    maxReenqueuesPerRun: z.coerce.number().int().positive().default(500),
     /** Set to true to log what would be deleted without deleting it. */
-    dryRun: z.coerce.boolean().default(false),
+    dryRun: bool.default(false),
   }),
 
   delivery: z.object({
@@ -187,6 +240,8 @@ function shape(env: NodeJS.ProcessEnv): unknown {
       supersededRetentionDays: env['SUPERSEDED_RETENTION_DAYS'],
       pendingUploadTtlHours: env['PENDING_UPLOAD_TTL_HOURS'],
       maxDeletionsPerRun: env['MAX_DELETIONS_PER_RUN'],
+      stalledOptimizeHours: env['STALLED_OPTIMIZE_HOURS'],
+      maxReenqueuesPerRun: env['MAX_REENQUEUES_PER_RUN'],
       dryRun: env['MAINTENANCE_DRY_RUN'],
     },
     processing: {

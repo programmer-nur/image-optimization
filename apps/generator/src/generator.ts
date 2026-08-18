@@ -70,6 +70,29 @@ export const ERROR_CACHE = 'public, max-age=60';
 /** Generation failures are never persisted at the edge — the next request retries. */
 export const NO_STORE = 'no-store';
 
+/**
+ * Largest derivative this function can hand back in its own response.
+ *
+ * A Lambda Function URL caps the response payload at 6MB, and binary bodies travel
+ * base64-encoded — 4/3 the bytes — so the real ceiling on image data is about 4.5MB.
+ * Past it the invocation fails outright, and the viewer who happened to be first for
+ * that variant gets an error for an object that is, by then, sitting in S3 perfectly
+ * intact. Rare (an AVIF or WebP derivative that large is close to pathological) but
+ * not impossible: PNG at 3840px wide with photographic content clears it easily.
+ *
+ * A margin is left for headers and the JSON envelope.
+ */
+export const MAX_INLINE_BYTES = Math.floor((6 * 1024 * 1024 * 3) / 4) - 64 * 1024;
+
+/**
+ * Lifetime of the oversize redirect target.
+ *
+ * Long enough for a viewer to follow a redirect, short enough that the URL is not
+ * worth passing around. Every later request for this variant is an ordinary S3 hit
+ * through CloudFront and never sees a presigned URL at all.
+ */
+export const OVERSIZE_REDIRECT_TTL_SECONDS = 300;
+
 export interface GeneratorResponse {
   status: number;
   headers: Record<string, string>;
@@ -174,6 +197,27 @@ export class Generator {
         'derivative generated on demand',
       );
 
+      /*
+       * Too large to travel inside the response — point the viewer at the object.
+       *
+       * The bytes are already written to this exact key, so nothing is regenerated;
+       * only the delivery of this one first request changes. The target is a
+       * short-lived presigned URL rather than the delivery URL the viewer came from:
+       * the generator is handed the rewritten path and never sees the viewer's own
+       * URL, and a redirect back into `/derived/...` is refused at the edge by design.
+       *
+       * `no-store`, always. A cached redirect would shadow the object it points at
+       * for a year, and the presigned URL inside it expires in minutes.
+       *
+       * Without this the viewer who happens to be first for an oversized variant gets
+       * a failed invocation for an object sitting intact in storage. It self-heals on
+       * the next request either way — this makes the first one work too.
+       */
+      if (result.data.byteLength > MAX_INLINE_BYTES) {
+        const redirect = await this.redirectToStoredObject(canonicalKey, result.bytes);
+        if (redirect !== undefined) return redirect;
+      }
+
       return {
         status: 200,
         headers: this.deliveryHeaders(spec.format, written.etag),
@@ -248,6 +292,46 @@ export class Generator {
     };
     if (etag !== '') headers['etag'] = `"${etag}"`;
     return headers;
+  }
+
+  /**
+   * Builds the oversize redirect, or gives up and lets the caller return the bytes.
+   *
+   * Returning the (too large) body is not a working response, but it is the same
+   * failure that existed before this path, and it is strictly better than turning a
+   * presign outage into a second failure mode nobody has seen. The signing itself is
+   * local — no network call — so this failing at all means something structural.
+   */
+  private async redirectToStoredObject(
+    canonicalKey: string,
+    bytes: number,
+  ): Promise<GeneratorResponse | undefined> {
+    try {
+      const location = await this.storage.presignDownload(canonicalKey, {
+        expiresInSeconds: OVERSIZE_REDIRECT_TTL_SECONDS,
+      });
+
+      this.logger.warn(
+        { key: canonicalKey, bytes },
+        'derivative exceeds the inline response limit; redirecting to the stored object',
+      );
+
+      return {
+        status: 307,
+        headers: {
+          location,
+          'cache-control': NO_STORE,
+          'content-type': 'application/json',
+        },
+        error: { code: 'derivative_too_large_to_inline', message: 'Served from storage.' },
+      };
+    } catch (error) {
+      this.logger.error(
+        { err: error, key: canonicalKey, bytes },
+        'could not presign the oversized derivative; returning it inline may exceed the limit',
+      );
+      return undefined;
+    }
   }
 
   private clientError(status: number, code: string, message: string): GeneratorResponse {

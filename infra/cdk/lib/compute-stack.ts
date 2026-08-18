@@ -27,14 +27,16 @@ import { ApplicationProtocol } from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as logs from 'aws-cdk-lib/aws-logs';
+import * as route53 from 'aws-cdk-lib/aws-route53';
+import * as targets from 'aws-cdk-lib/aws-route53-targets';
 import * as wafv2 from 'aws-cdk-lib/aws-wafv2';
 import type * as rds from 'aws-cdk-lib/aws-rds';
-import type * as s3 from 'aws-cdk-lib/aws-s3';
+import * as s3 from 'aws-cdk-lib/aws-s3';
 import type * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import type * as sqs from 'aws-cdk-lib/aws-sqs';
-import type * as acm from 'aws-cdk-lib/aws-certificatemanager';
+import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import type { Construct } from 'constructs';
-import type { EnvironmentConfig } from './config.js';
+import { bucketNameFor, type EnvironmentConfig } from './config.js';
 import { generatorBundle, maintenanceBundle, optimizerBundle, sharpLayer } from './artifacts.js';
 import { NetworkStack } from './network-stack.js';
 import { createControlPlaneWebAcl } from './waf.js';
@@ -57,6 +59,9 @@ export interface ComputeStackProps extends StackProps {
 export class ComputeStack extends Stack {
   readonly generatorFunctionUrl: lambda.FunctionUrl;
   readonly generator: lambda.Function;
+  /** Exposed for alarms, which take names rather than constructs. */
+  readonly optimizer: lambda.Function;
+  readonly maintenance: lambda.Function;
   readonly service: ecs.FargateService;
   readonly loadBalancer: elbv2.ApplicationLoadBalancer;
   /** Dimension value the ALB target-group metrics are published under. */
@@ -119,7 +124,7 @@ export class ComputeStack extends Stack {
 
     // ---- optimizer: the eager warm set, behind a queue --------------------
 
-    const optimizer = new lambda.Function(this, 'Optimizer', {
+    const optimizer = (this.optimizer = new lambda.Function(this, 'Optimizer', {
       functionName: `imgopt-${config.name}-optimizer`,
       runtime: lambda.Runtime.NODEJS_22_X,
       architecture: lambda.Architecture.ARM_64,
@@ -135,7 +140,7 @@ export class ComputeStack extends Stack {
       // Control path: the optimizer runs once per upload, behind a queue.
       tracing: lambda.Tracing.ACTIVE,
       environment: { ...sharedEnv, DB_SECRET_ARN: databaseSecret.secretArn },
-    });
+    }));
 
     optimizer.addEventSource(
       new eventsources.SqsEventSource(optimizeQueue, {
@@ -143,6 +148,16 @@ export class ComputeStack extends Stack {
         // Only genuinely retriable failures are reported back, so a corrupt source
         // is recorded and acknowledged instead of cycling to the DLQ the slow way.
         reportBatchItemFailures: true,
+        /*
+         * A ceiling on the poller's fan-out, sized as a database-connection budget.
+         *
+         * Without it, a bulk import scales this consumer into hundreds of concurrent
+         * invocations, each opening its own connection to a small Postgres instance
+         * that the control plane shares — so the backlog cures itself by taking down
+         * the API that accepts uploads. See `optimizerMaxConcurrency` in config.ts
+         * for the arithmetic.
+         */
+        maxConcurrency: config.lambda.optimizerMaxConcurrency,
       }),
     );
 
@@ -201,7 +216,7 @@ export class ComputeStack extends Stack {
      * and never decodes one, so it needs no native binary. That also keeps it out of
      * the encoder-epoch coupling — a libvips upgrade cannot affect it.
      */
-    const maintenance = new lambda.Function(this, 'Maintenance', {
+    const maintenance = (this.maintenance = new lambda.Function(this, 'Maintenance', {
       functionName: `imgopt-${config.name}-maintenance`,
       runtime: lambda.Runtime.NODEJS_22_X,
       architecture: lambda.Architecture.ARM_64,
@@ -224,16 +239,26 @@ export class ComputeStack extends Stack {
         SUPERSEDED_RETENTION_DAYS: String(config.lifecycle.supersededRetentionDays),
         PENDING_UPLOAD_TTL_HOURS: String(config.lifecycle.pendingUploadTtlHours),
         MAX_DELETIONS_PER_RUN: String(config.lifecycle.maxDeletionsPerRun),
+        STALLED_OPTIMIZE_HOURS: String(config.lifecycle.stalledOptimizeHours),
+        MAX_REENQUEUES_PER_RUN: String(config.lifecycle.maxReenqueuesPerRun),
         MAINTENANCE_DRY_RUN: String(config.lifecycle.dryRun),
       },
-    });
+    }));
 
     /*
-     * The only role in the deployment that can delete an original.
+     * One of the two roles that can delete an original — the other is the Fargate
+     * task role, which backs the API's explicit `DELETE /v1/images/:id`.
      *
-     * Granted knowingly: reclaiming a superseded version means deleting its source,
-     * and nothing else in the system is allowed to. Staging is included so an
-     * abandoned upload's bytes can be removed; the derivative prefix so orphans can.
+     * Granted knowingly: reclaiming a superseded version means deleting its source.
+     * Staging is included so an abandoned upload's bytes can be removed; the
+     * derivative prefix so orphans can.
+     *
+     * Neither role gets `s3:DeleteObjectVersion`, and that omission is the point.
+     * The bucket is versioned, so these deletes write a delete marker and leave the
+     * previous copy recoverable — a defect here costs a delete marker rather than an
+     * irreplaceable source. A role holding DeleteObjectVersion would defeat that
+     * safety net using the very code path that caused the incident, so do not widen
+     * these grants to "fix" a delete that appears not to have worked.
      */
     grantRead(maintenance, bucket, [
       STAGING_PREFIX,
@@ -255,9 +280,23 @@ export class ComputeStack extends Stack {
     ]);
     databaseSecret.grantRead(maintenance);
 
+    /*
+     * Send only, for the one job here that creates work rather than reclaiming it.
+     *
+     * An enqueue that fails after an upload has already stored its bytes leaves the
+     * asset servable but unprocessed forever — no LQIP, no metadata, no warm set —
+     * because a failed enqueue deliberately cannot fail the upload. This is the job
+     * that notices. `grantSendMessages` gives SendMessage and the queue-attribute
+     * reads it needs and nothing else: this function is not a consumer, and must
+     * never be able to receive or delete a message another consumer is working on.
+     */
+    optimizeQueue.grantSendMessages(maintenance);
+
     new events.Rule(this, 'MaintenanceSchedule', {
       ruleName: `imgopt-${config.name}-maintenance`,
-      description: 'Orphan reconciliation, superseded-version expiry, and upload reaping',
+      description:
+        'Orphan reconciliation, superseded-version expiry, upload reaping, and ' +
+        're-enqueue of optimizations that were never queued',
       // Daily. The windows this job enforces are measured in hours and days, so a
       // tighter schedule would only re-examine objects it already decided to keep.
       schedule: events.Schedule.rate(Duration.days(1)),
@@ -278,8 +317,9 @@ export class ComputeStack extends Stack {
       containerInsightsV2: ecs.ContainerInsights.ENABLED,
     });
 
-    const imageTag = process.env['API_IMAGE_TAG'] ?? 'latest';
-    const image = ecs.ContainerImage.fromEcrRepository(this.repository, imageTag);
+    // Required and validated in config: never `latest`, because the tag is what a
+    // rollback names and a mutable one makes "the previous version" ambiguous.
+    const image = ecs.ContainerImage.fromEcrRepository(this.repository, config.api.imageTag);
 
     const logging = new ecs.AwsLogDriver({
       streamPrefix: 'api',
@@ -318,7 +358,10 @@ export class ComputeStack extends Stack {
      * invocation spend its time". See design.md D17.
      */
     taskDefinition.addContainer('xray', {
-      image: ecs.ContainerImage.fromRegistry('public.ecr.aws/xray/aws-xray-daemon:latest'),
+      // `3.x`, not `latest`: a rolling minor still picks up fixes, but a redeploy of
+      // an unchanged task definition cannot silently cross a major version of a
+      // sidecar that sits in the same task as the API.
+      image: ecs.ContainerImage.fromRegistry('public.ecr.aws/xray/aws-xray-daemon:3.x'),
       essential: false,
       cpu: 32,
       memoryReservationMiB: 256,
@@ -372,14 +415,51 @@ export class ComputeStack extends Stack {
       vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
     });
 
+    // Request-level logs for the control plane, which is where credentials are
+    // presented — a WAF metric says a limit was hit, and only these say by whom.
+    this.loadBalancer.logAccessLogs(
+      s3.Bucket.fromBucketName(this, 'LogBucket', `${bucketNameFor(config)}-logs`),
+      'alb',
+    );
+
+    /*
+     * TLS, or a synth failure in production.
+     *
+     * This listener was always written to terminate TLS when handed a certificate —
+     * and nothing ever handed it one, so every environment served the control plane
+     * over plain HTTP: `x-api-key` credentials and upload payloads crossing the
+     * internet in cleartext, with a comment in the network stack claiming port 80
+     * existed only to redirect.
+     *
+     * The guard lives here rather than in `bin/app.ts` because that is what the tests
+     * construct. Staging is deliberately still allowed to run without a certificate,
+     * so a first deploy is possible before DNS exists.
+     */
+    const certificate = this.resolveApiCertificate(config, apiCertificate);
+
+    if (certificate === undefined && config.name === 'production') {
+      throw new Error(
+        'Production must terminate TLS at the load balancer. Set API_CERTIFICATE_ARN, ' +
+          'or set API_HOST together with HOSTED_ZONE_ID and HOSTED_ZONE_NAME so a ' +
+          'certificate can be issued and validated automatically.',
+      );
+    }
+
     const listener = this.loadBalancer.addListener('Listener', {
-      port: apiCertificate !== undefined ? 443 : 80,
-      protocol: apiCertificate !== undefined ? ApplicationProtocol.HTTPS : ApplicationProtocol.HTTP,
-      ...(apiCertificate !== undefined ? { certificates: [apiCertificate] } : {}),
+      port: certificate !== undefined ? 443 : 80,
+      protocol: certificate !== undefined ? ApplicationProtocol.HTTPS : ApplicationProtocol.HTTP,
+      ...(certificate !== undefined
+        ? {
+            certificates: [certificate],
+            // CDK's default policy still negotiates TLS 1.0 and 1.1. This one is
+            // TLS 1.2+, which is the whole point of terminating TLS here.
+            sslPolicy: elbv2.SslPolicy.RECOMMENDED_TLS,
+          }
+        : {}),
       open: false,
     });
 
-    if (apiCertificate !== undefined) {
+    if (certificate !== undefined) {
       // Plain HTTP is answered only to send the client to HTTPS.
       this.loadBalancer.addRedirect({
         sourceProtocol: ApplicationProtocol.HTTP,
@@ -462,7 +542,19 @@ export class ComputeStack extends Stack {
 
     migrationTask.addContainer('migrate', {
       image,
-      command: ['node', 'node_modules/prisma/build/index.js', 'migrate', 'deploy'],
+      /*
+       * A script in the image, not the CLI directly.
+       *
+       * The CLI needs `DATABASE_URL`, and this container is given the parts instead
+       * so the password stays out of the task definition — the script composes the
+       * URL in-process and points the CLI at `prisma.config.ts`, whose schema and
+       * migration paths are relative to itself. It also propagates the child's exit
+       * code, which is the only thing ECS reads to decide the task succeeded.
+       *
+       * See packages/db/scripts/migrate.mjs, which fails loudly and by name if the
+       * image is missing the CLI or the schema.
+       */
+      command: ['node', 'packages/db/scripts/migrate.mjs'],
       environment: databaseEnv,
       secrets: { DB_PASSWORD: ecs.Secret.fromSecretsManager(databaseSecret, 'password') },
       logging: new ecs.AwsLogDriver({
@@ -477,11 +569,23 @@ export class ComputeStack extends Stack {
     });
     databaseSecret.grantRead(migrationTask.taskRole);
 
+    this.createApiDnsRecord(config, certificate !== undefined);
+
     new CfnOutput(this, 'MaintenanceFunctionName', { value: maintenance.functionName });
     new CfnOutput(this, 'GeneratorFunctionUrl', { value: this.generatorFunctionUrl.url });
     new CfnOutput(this, 'GeneratorFunctionName', { value: this.generator.functionName });
     new CfnOutput(this, 'ApiEndpoint', {
-      value: this.loadBalancer.loadBalancerDnsName,
+      // Scheme-qualified, so what is pasted into a client is a URL rather than a
+      // hostname someone has to guess the scheme for — and guessing wrong here means
+      // sending an API key over plain HTTP.
+      value:
+        certificate !== undefined && config.apiHost !== undefined
+          ? `https://${config.apiHost}`
+          : `http://${this.loadBalancer.loadBalancerDnsName}`,
+      description:
+        certificate !== undefined
+          ? 'Control-plane base URL; set this as the client base URL'
+          : 'Control-plane base URL. PLAIN HTTP — staging only, until a certificate is configured',
     });
     new CfnOutput(this, 'ApiRepositoryUri', { value: this.repository.repositoryUri });
     new CfnOutput(this, 'MigrationTaskDefinition', {
@@ -489,6 +593,79 @@ export class ComputeStack extends Stack {
       description: 'Run with: aws ecs run-task --task-definition <this> --launch-type FARGATE',
     });
     new CfnOutput(this, 'ClusterName', { value: cluster.clusterName });
+
+    // The inputs an operator needs to run the migration task, emitted rather than
+    // looked up: the task runs in private subnets with the application security
+    // group, and finding those ids by hand is the step where a bootstrap stalls.
+    new CfnOutput(this, 'MigrationSubnetIds', {
+      value: vpc
+        .selectSubnets({ subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS })
+        .subnetIds.join(','),
+      description: 'Pass as --network-configuration subnets when running the migration task',
+    });
+    new CfnOutput(this, 'MigrationSecurityGroupId', {
+      value: appSecurityGroup.securityGroupId,
+      description: 'Pass as --network-configuration securityGroups when running the migration task',
+    });
+  }
+
+  /**
+   * The regional certificate for the load balancer.
+   *
+   * Mirrors `CdnStack.resolveCertificate`, and is a different certificate from that
+   * one: CloudFront requires us-east-1, an ALB requires its own region. An explicit
+   * ARN wins, so an externally managed zone — or a certificate shared across
+   * environments — can be brought in without this stack issuing anything.
+   */
+  private resolveApiCertificate(
+    config: EnvironmentConfig,
+    issued: acm.ICertificate | undefined,
+  ): acm.ICertificate | undefined {
+    if (config.apiCertificateArn !== undefined) {
+      return acm.Certificate.fromCertificateArn(this, 'ApiCertificate', config.apiCertificateArn);
+    }
+    return issued;
+  }
+
+  /**
+   * Points `apiHost` at the load balancer, when the zone is in this account.
+   *
+   * Fail-soft in the same shape as the CDN stack's: with an externally managed zone
+   * the deploy still succeeds and emits the record to create by hand, because a
+   * DNS-validated certificate for a name nobody can resolve is not an improvement.
+   */
+  private createApiDnsRecord(config: EnvironmentConfig, secure: boolean): void {
+    if (config.apiHost === undefined) return;
+
+    if (config.hostedZoneId === undefined || config.hostedZoneName === undefined) {
+      new CfnOutput(this, 'ManualApiDnsRecord', {
+        value: `${config.apiHost} ALIAS ${this.loadBalancer.loadBalancerDnsName}`,
+        description: secure
+          ? 'No hosted zone configured. Create this record, then the certificate validates.'
+          : 'No hosted zone configured. Create this record by hand.',
+      });
+      return;
+    }
+
+    const zone = route53.HostedZone.fromHostedZoneAttributes(this, 'ApiZone', {
+      hostedZoneId: config.hostedZoneId,
+      zoneName: config.hostedZoneName,
+    });
+
+    const target = route53.RecordTarget.fromAlias(
+      new targets.LoadBalancerTarget(this.loadBalancer),
+    );
+
+    new route53.ARecord(this, 'ApiAliasRecord', {
+      zone,
+      recordName: config.apiHost,
+      target,
+    });
+    new route53.AaaaRecord(this, 'ApiAliasRecordV6', {
+      zone,
+      recordName: config.apiHost,
+      target,
+    });
   }
 }
 

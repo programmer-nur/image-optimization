@@ -69,6 +69,181 @@ jobs:
       - name: Infrastructure synthesis
         run: pnpm --filter @imgopt/infra test
 
+  # The two artifacts that are assembled by hand and therefore drift silently.
+  #
+  # Nothing else in CI builds either one: the synthesis tests run against stub
+  # directories, and `pnpm test` never opens the Dockerfile. Both failure modes are
+  # invisible until a deploy — the API image's workspace-dependency list is maintained
+  # manually and pnpm reports a missing entry as a smaller workspace rather than an
+  # error, and a Lambda bundle emitted with the wrong module shape deploys cleanly and
+  # then fails at init on every invocation.
+  #
+  # So: build them for real, and run the image far enough to prove it starts.
+  packaging:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        ports:
+          - 5434:5432
+        env:
+          POSTGRES_USER: imgopt
+          POSTGRES_PASSWORD: imgopt
+          POSTGRES_DB: imgopt
+        options: >-
+          --health-cmd "pg_isready -U imgopt -d imgopt"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm --filter @imgopt/db db:generate
+
+      # A build alone proves nothing here: a missing workspace package produces an
+      # image that builds and cannot start.
+      #
+      # `--platform linux/amd64` is not decoration. Both Fargate task definitions
+      # declare X86_64, so an image built on an arm64 host pushes and deploys cleanly
+      # and then never starts, with an error about the manifest rather than about the
+      # architecture. CI runs on amd64 anyway; the flag is here so this command and
+      # the one in docs/bootstrap.md are the same command.
+      - name: Build the API image
+        run: docker build --platform linux/amd64 -f apps/api/Dockerfile -t imgopt-api:ci .
+
+      # The container needs no database to answer /healthz — /readyz is the one that
+      # touches dependencies — so this is a genuine "does the process boot with the
+      # modules it was shipped" check, which is the drift being guarded.
+      - name: Start the container
+        run: |
+          docker run -d --name imgopt-api-ci -p 3000:3000 \
+            -e NODE_ENV=production \
+            -e S3_BUCKET=imgopt-ci \
+            -e AWS_REGION=us-east-1 \
+            -e SQS_OPTIMIZE_QUEUE_URL=http://localhost:9324/queue/imgopt-optimize \
+            -e DATABASE_URL=postgres://imgopt:imgopt@127.0.0.1:5434/imgopt \
+            -e CDN_HOST=cdn.example.test \
+            imgopt-api:ci
+
+      - name: Probe /healthz
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3000/healthz > /dev/null; then
+              echo "container answered /healthz"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::the API container never answered /healthz"
+          docker logs imgopt-api-ci
+          exit 1
+
+      - name: Container logs
+        if: always()
+        run: docker logs imgopt-api-ci || true
+
+      - name: Stop the container
+        if: always()
+        run: docker rm -f imgopt-api-ci || true
+
+      # The deploy step with no way around it.
+      #
+      # The same image runs migrations as a one-off ECS task against a database in
+      # isolated subnets — if that fails, the bootstrap dead-ends with no fallback
+      # path. It has four independent ways to fail (the CLI pruned by the production
+      # install, a missing schema, a missing prisma.config.ts, an uncomposed
+      # DATABASE_URL) and this one command exercises all four.
+      - name: Migrations run from inside the image
+        run: |
+          docker run --rm --network host \
+            -e DB_HOST=127.0.0.1 -e DB_PORT=5434 \
+            -e DB_USER=imgopt -e DB_PASSWORD=imgopt -e DB_NAME=imgopt \
+            imgopt-api:ci node packages/db/scripts/migrate.mjs
+
+      # esbuild output for all three Lambdas. The assertion that matters is the
+      # entrypoint's name: the bundles are ESM, and a deployed function has no
+      # package.json above it, so an `index.js` is read as CommonJS and throws
+      # "Cannot use import statement outside a module" during init.
+      - name: Build the Lambda bundles
+        run: pnpm --filter @imgopt/infra build:bundles
+
+      - name: Bundles carry an ESM entrypoint
+        run: |
+          for app in optimizer generator maintenance; do
+            path="apps/$app/dist-bundle/index.mjs"
+            if [ ! -f "$path" ]; then
+              echo "::error::missing $path"
+              exit 1
+            fi
+            node --input-type=module -e "
+              import { readFileSync } from 'node:fs';
+              const src = readFileSync('$path', 'utf8');
+              if (!/(^|\W)(import|export)\W/.test(src)) {
+                console.error('::error::$path does not look like an ES module');
+                process.exit(1);
+              }
+            "
+          done
+
+      # The failure the .mjs rename uncovers rather than fixes.
+      #
+      # sharp is not bundled — it ships in a layer, which Lambda exposes by putting
+      # /opt/nodejs/node_modules on NODE_PATH. NODE_PATH is a CommonJS mechanism that
+      # Node's ESM resolver ignores, so a bare `import 'sharp'` inside an .mjs bundle
+      # fails at init with the layer attached and everything else correct. The bundles
+      # go through createRequire instead (scripts/esbuild-sharp-layer.mjs); this proves
+      # it, using a stub in place of the real native binary so no arm64 emulation is
+      # needed. Copied out of the repo first — inside it, the workspace's own
+      # node_modules would resolve sharp and the test would pass either way.
+      - name: Lambda bundles can reach a layer-provided sharp
+        run: |
+          sim="$RUNNER_TEMP/layer-sim"
+          rm -rf "$sim"
+          mkdir -p "$sim/task" "$sim/layer/node_modules/sharp"
+          cat > "$sim/layer/node_modules/sharp/package.json" <<'JSON'
+          { "name": "sharp", "version": "0.0.0-stub", "main": "index.js" }
+          JSON
+          cat > "$sim/layer/node_modules/sharp/index.js" <<'JS'
+          const stub = () => stub;
+          stub.concurrency = () => 0;
+          stub.cache = () => ({});
+          stub.simd = () => false;
+          module.exports = stub;
+          JS
+
+          for app in optimizer generator; do
+            cp "apps/$app/dist-bundle/index.mjs" "$sim/task/index.mjs"
+            ( cd "$sim/task" && NODE_PATH="$sim/layer/node_modules" node -e "
+              import('./index.mjs')
+                .then(() => console.log('$app: init reached the end'))
+                .catch((error) => {
+                  // Configuration is absent here on purpose; only a sharp
+                  // resolution failure means the layer is unreachable.
+                  if (/Cannot find module 'sharp'|Cannot find package 'sharp'/.test(error.message)) {
+                    console.error('::error::$app cannot resolve sharp from a NODE_PATH layer');
+                    process.exit(1);
+                  }
+                  console.log('$app: sharp resolved (init stopped later: ' + error.message.split('\n')[0] + ')');
+                });
+            " )
+          done
+
+      # Synthesis against the artifacts that were just built for real, rather than
+      # against the stub directories the unit-level synthesis tests create.
+      - name: Synthesize against the real artifacts
+        run: pnpm --filter @imgopt/infra test
+
   integration:
     runs-on: ubuntu-latest
     services:

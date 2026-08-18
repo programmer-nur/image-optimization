@@ -79,19 +79,22 @@ export class ValidationService {
 
     const sniffed = await fileTypeFromBuffer(header);
 
-    // Undetectable includes SVG, which is text rather than a binary signature.
+    /*
+     * Undetectable includes SVG, which is text rather than a binary signature.
+     *
+     * There is no `allowSvg` branch here any more, and that is the honest shape: the
+     * flag cannot be on, because the config schema refuses to load with it set. A
+     * branch reading "support is enabled but not implemented" only ever produced a
+     * 422 that blamed the uploader for an operator's setting. When the sanitizer
+     * ships, both the schema refinement and this comment go.
+     */
     if (sniffed === undefined) {
-      if (this.config.allowSvg && this.looksLikeSvg(header)) {
-        throw new ApiError(
-          'unsupported_format',
-          422,
-          'SVG support is enabled but sanitization is not yet implemented.',
-        );
-      }
       throw new ApiError(
         'unsupported_format',
         422,
-        'Could not determine the file type from its contents.',
+        this.looksLikeSvg(header)
+          ? 'SVG uploads are not supported.'
+          : 'Could not determine the file type from its contents.',
       );
     }
 

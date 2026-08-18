@@ -54,6 +54,10 @@ export class CdnStack extends Stack {
      */
     const bucket = s3.Bucket.fromBucketName(this, 'DerivativeBucket', bucketNameFor(config));
 
+    // Imported by name for the same reason the asset bucket is: taking the construct
+    // would make storage depend on CDN and close a cycle through compute.
+    const logBucket = s3.Bucket.fromBucketName(this, 'LogBucket', `${bucketNameFor(config)}-logs`);
+
     /*
      * The edge normalizer, read from the generated file.
      *
@@ -100,9 +104,24 @@ export class CdnStack extends Stack {
       originShieldRegion: this.region,
     });
 
-    // OAC signs CloudFront's requests to the Function URL, which is `AWS_IAM`-authed
-    // and therefore not reachable directly from the internet.
-    const generatorOrigin = origins.FunctionUrlOrigin.withOriginAccessControl(generatorFunctionUrl);
+    /*
+     * OAC signs CloudFront's requests to the Function URL, which is `AWS_IAM`-authed
+     * and therefore not reachable directly from the internet.
+     *
+     * Origin Shield on the fallback too, and it matters more here than on S3: this is
+     * the expensive origin. A newly published page can put thousands of viewers onto
+     * one uncached variant at once, and without request collapsing each edge location
+     * invokes the generator separately. The writes stay correct — generation is
+     * deterministic and the write is conditional — but every duplicate is a Sharp
+     * render nobody needed.
+     */
+    const generatorOrigin = origins.FunctionUrlOrigin.withOriginAccessControl(
+      generatorFunctionUrl,
+      {
+        originShieldEnabled: true,
+        originShieldRegion: this.region,
+      },
+    );
 
     const origin = new origins.OriginGroup({
       primaryOrigin: s3Origin,
@@ -134,6 +153,14 @@ export class CdnStack extends Stack {
     this.distribution = new cloudfront.Distribution(this, 'Distribution', {
       comment: `imgopt ${config.name}`,
       priceClass: config.delivery.priceClass,
+      /*
+       * Standard access logs. The delivery plane is unauthenticated, so these are the
+       * only record of who asked for what — and the only way to tell a scraper from a
+       * consuming application after the fact. Expired by the log bucket's own rule.
+       */
+      enableLogging: true,
+      logBucket,
+      logFilePrefix: 'cloudfront/',
       httpVersion: cloudfront.HttpVersion.HTTP2_AND_3,
       enableIpv6: true,
       ...(certificate !== undefined ? { certificate } : {}),
@@ -192,6 +219,27 @@ export class CdnStack extends Stack {
 
     this.createDnsRecord(config);
 
+    /*
+     * Additional CloudFront metrics.
+     *
+     * `CacheHitRate` is not published at all unless a distribution subscribes to it.
+     * Without this the cache-hit alarm sits in INSUFFICIENT_DATA and, treated as
+     * not-breaching, reads as healthy forever — the silent-disarm failure this
+     * stack's comments warn about, on one of only two detectors for edge/core
+     * normalization drift. Drift produces no errors, no 5xx, and no latency change;
+     * a hit rate that quietly collapses is most of the evidence there is.
+     *
+     * All-or-nothing: it enables the whole additional-metric set at standard
+     * custom-metric pricing, roughly $2.40 per distribution per month. That is
+     * noise against the unbounded Lambda spend it exists to detect.
+     */
+    new cloudfront.CfnMonitoringSubscription(this, 'AdditionalMetrics', {
+      distributionId: this.distribution.distributionId,
+      monitoringSubscription: {
+        realtimeMetricsSubscriptionConfig: { realtimeMetricsSubscriptionStatus: 'Enabled' },
+      },
+    });
+
     if (privateDelivery !== undefined) {
       new CfnOutput(this, 'PrivateDeliveryKeyGroupId', {
         value: privateDelivery.keyGroup.keyGroupId,
@@ -224,6 +272,28 @@ export class CdnStack extends Stack {
   private responseHeaders(config: EnvironmentConfig): cloudfront.ResponseHeadersPolicy {
     return new cloudfront.ResponseHeadersPolicy(this, 'DeliveryHeaders', {
       responseHeadersPolicyName: `imgopt-${config.name}-delivery`,
+      /*
+       * `Vary: Accept`, added here because S3 cannot store it.
+       *
+       * The edge function reads `Accept` and bakes a concrete format into the path,
+       * so these responses *are* content-negotiated. A stored object carries
+       * Content-Type and Cache-Control and nothing that tells a shared cache the
+       * response depended on a request header — so the generated copy of a key
+       * announced the negotiation and the S3-served copy of the same key did not.
+       * An intermediary cache could then hand an AVIF to a client that cannot decode
+       * it, and only for variants that had already been generated once.
+       *
+       * `override: true` replaces the origin's header rather than appending, so the
+       * failover path carries one `Vary`, not two. It is safe to replace because the
+       * bucket has no CORS configuration and therefore no other `Vary` to clobber —
+       * adding one means revisiting this header and the cache policy together.
+       *
+       * No cache-key interaction: the cache policy forwards no headers, so `Vary`
+       * cannot fragment the CDN cache.
+       */
+      customHeadersBehavior: {
+        customHeaders: [{ header: 'Vary', value: 'Accept', override: true }],
+      },
       securityHeadersBehavior: {
         contentTypeOptions: { override: true },
         frameOptions: {

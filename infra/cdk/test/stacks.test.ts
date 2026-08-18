@@ -26,7 +26,7 @@ import { Match, Template } from 'aws-cdk-lib/assertions';
 import { beforeAll, describe, expect, it } from 'vitest';
 
 import { METRICS } from '@imgopt/metrics';
-import { ENVIRONMENTS, type EnvironmentConfig } from '../lib/config.js';
+import { ENVIRONMENTS, bucketNameFor, type EnvironmentConfig } from '../lib/config.js';
 import { NetworkStack } from '../lib/network-stack.js';
 import { StorageStack } from '../lib/storage-stack.js';
 import { DataStack } from '../lib/data-stack.js';
@@ -48,22 +48,31 @@ const repoRoot = resolve(here, '..', '..', '..');
 /**
  * Stands in for the real build artifacts.
  *
- * Synthesis only needs the directories to exist and be non-empty; what CDK zips is
- * irrelevant to the template. Creating them here keeps these tests runnable on a
+ * Synthesis only needs the directories to exist and hold an entrypoint; what CDK zips
+ * is irrelevant to the template. Creating them here keeps these tests runnable on a
  * fresh clone without a Docker daemon or an esbuild pass.
+ *
+ * The stub is deliberately named `index.mjs`, matching what the real bundles emit:
+ * `artifacts.ts` asserts that name so an ESM bundle written to a bare `.js` fails at
+ * synth instead of at every invocation of the deployed function. A stub that ignored
+ * the rule would make these tests pass over exactly the mistake the rule exists for.
+ * The packaging job in CI builds the real bundles and is what proves they land there.
  */
 function stubArtifacts(): void {
-  const dirs = [
+  const bundleDirs = [
     join(repoRoot, 'apps', 'optimizer', 'dist-bundle'),
     join(repoRoot, 'apps', 'generator', 'dist-bundle'),
     join(repoRoot, 'apps', 'maintenance', 'dist-bundle'),
-    join(here, '..', 'layers', 'sharp'),
   ];
 
-  for (const dir of dirs) {
+  for (const dir of bundleDirs) {
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, '.synth-placeholder'), 'created by infra/cdk tests\n');
+    writeFileSync(join(dir, 'index.mjs'), '// created by infra/cdk tests\n');
   }
+
+  const layer = join(here, '..', 'layers', 'sharp');
+  mkdirSync(layer, { recursive: true });
+  writeFileSync(join(layer, '.synth-placeholder'), 'created by infra/cdk tests\n');
 }
 
 interface Synthesized {
@@ -77,12 +86,34 @@ interface Synthesized {
   observability: Template;
 }
 
-function synthesize(environment: string): Synthesized {
+/**
+ * @param overrides Environment values applied after the defaults. An explicit
+ *   `undefined` deletes the key — which is the only way to test a guard that fires on
+ *   a *missing* variable, since the defaults below would otherwise put it straight
+ *   back and the test would silently assert nothing.
+ */
+function synthesize(
+  environment: string,
+  overrides: Record<string, string | undefined> = {},
+): Synthesized {
   Object.assign(process.env, {
     CDK_ACCOUNT: '123456789012',
     CDK_REGION: 'us-east-1',
     CDN_HOST: 'images.example.com',
+    API_HOST: 'api.example.com',
+    // Required in every environment: the tag is the rollback coordinate, and config
+    // refuses both an absent one and `latest`.
+    API_IMAGE_TAG: 'v-test',
+    // An ARN rather than an issued certificate, so these tests need no certificate
+    // stack. Production refuses to synthesize without one.
+    API_CERTIFICATE_ARN:
+      'arn:aws:acm:us-east-1:123456789012:certificate/11111111-2222-3333-4444-555555555555',
   });
+
+  for (const [key, value] of Object.entries(overrides)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
 
   const config = ENVIRONMENTS[environment]!();
   // Exercise the optional security features rather than synthesizing them away.
@@ -124,7 +155,8 @@ function synthesize(environment: string): Synthesized {
     optimizeQueueName: queue.optimizeQueue.queueName,
     deadLetterQueueName: queue.deadLetterQueue.queueName,
     generatorFunctionName: compute.generator.functionName,
-    optimizerFunctionName: 'imgopt-test-optimizer',
+    optimizerFunctionName: compute.optimizer.functionName,
+    maintenanceFunctionName: compute.maintenance.functionName,
     distributionId: cdn.distribution.distributionId,
     loadBalancerFullName: compute.loadBalancer.loadBalancerFullName,
     targetGroupFullName: compute.targetGroupFullName,
@@ -166,6 +198,30 @@ function entriesOf(template: Template, type: string): Array<[string, CfnResource
 
 function propertyOf<T>(resource: CfnResource | undefined, key: string): T {
   return resource?.Properties?.[key] as T;
+}
+
+/**
+ * The asset bucket, selected by name rather than by position.
+ *
+ * The storage stack holds more than one bucket, and `[0]` is whichever CDK happened
+ * to emit first — so a positional lookup silently retargets the moment another bucket
+ * is added, and a lifecycle assertion starts passing against the wrong resource.
+ */
+function assetBucket(): CfnResource {
+  const bucket = resourcesOf(app.storage, 'AWS::S3::Bucket').find(
+    (candidate) => propertyOf<string>(candidate, 'BucketName') === bucketNameFor(app.config),
+  );
+  if (bucket === undefined) throw new Error('no asset bucket in the storage template');
+  return bucket;
+}
+
+/** The asset bucket's policy, selected the same way and for the same reason. */
+function assetBucketPolicy(): CfnResource {
+  const entry = entriesOf(app.storage, 'AWS::S3::BucketPolicy').find(([logicalId]) =>
+    logicalId.includes('AssetBucket'),
+  );
+  if (entry === undefined) throw new Error('no asset bucket policy in the storage template');
+  return entry[1];
 }
 
 let app: Synthesized;
@@ -227,6 +283,48 @@ describe('delivery plane', () => {
         },
       },
     });
+  });
+
+  it('subscribes to the metrics its own alarms watch', () => {
+    // `CacheHitRate` is not published unless a distribution subscribes. Without this
+    // the cache-hit alarm sits in INSUFFICIENT_DATA and, treated as not-breaching,
+    // reads as healthy forever — on one of only two detectors for normalization
+    // drift, which has no other symptom.
+    app.cdn.hasResourceProperties('AWS::CloudFront::MonitoringSubscription', {
+      MonitoringSubscription: {
+        RealtimeMetricsSubscriptionConfig: { RealtimeMetricsSubscriptionStatus: 'Enabled' },
+      },
+    });
+  });
+
+  it('announces the negotiation on both origins, not just the generator', () => {
+    // The edge bakes a format chosen from Accept into the path, so these responses
+    // are negotiated. S3 cannot store `Vary`, so without this the stored copy of a
+    // key and the generated copy of the same key differ in exactly the header that
+    // stops an intermediary handing AVIF to a client that cannot decode it.
+    app.cdn.hasResourceProperties('AWS::CloudFront::ResponseHeadersPolicy', {
+      ResponseHeadersPolicyConfig: {
+        CustomHeadersConfig: {
+          Items: Match.arrayWith([
+            Match.objectLike({ Header: 'Vary', Value: 'Accept', Override: true }),
+          ]),
+        },
+      },
+    });
+  });
+
+  it('collapses requests on the expensive origin too', () => {
+    // Origin Shield on S3 only left the generator — the origin that costs a Sharp
+    // render per request — without request collapsing.
+    const origins = propertyOf<{ Origins: Array<{ OriginShield?: { Enabled?: boolean } }> }>(
+      resourcesOf(app.cdn, 'AWS::CloudFront::Distribution')[0],
+      'DistributionConfig',
+    ).Origins;
+
+    expect(origins.length).toBeGreaterThanOrEqual(2);
+    for (const origin of origins) {
+      expect(origin.OriginShield?.Enabled).toBe(true);
+    }
   });
 
   it('attaches the generated normalizer on viewer-request', () => {
@@ -295,10 +393,9 @@ describe('storage posture', () => {
   });
 
   it('expires staging and tiers originals, but leaves derivatives alone', () => {
-    const bucket = resourcesOf(app.storage, 'AWS::S3::Bucket')[0];
     const { Rules: rules } = propertyOf<{
       Rules: Array<{ Id: string; Prefix?: string; Transitions?: unknown[] }>;
-    }>(bucket, 'LifecycleConfiguration');
+    }>(assetBucket(), 'LifecycleConfiguration');
 
     expect(rules.find((r) => r.Id === 'expire-staging')?.Prefix).toBe('staging/');
     expect(rules.find((r) => r.Id === 'tier-originals')?.Transitions).toHaveLength(2);
@@ -306,11 +403,52 @@ describe('storage posture', () => {
     expect(rules.some((r) => r.Prefix === 'derived/')).toBe(false);
   });
 
+  /*
+   * Versioning is the only thing standing between a reclamation defect and the
+   * permanent loss of an original — the one object in this system with no upstream
+   * copy, and one that two separate roles are permitted to delete.
+   */
+  it('versions the bucket and bounds what versioning costs', () => {
+    expect(propertyOf<{ Status: string }>(assetBucket(), 'VersioningConfiguration')?.Status).toBe(
+      'Enabled',
+    );
+
+    const { Rules: rules } = propertyOf<{
+      Rules: Array<{
+        Id: string;
+        Prefix?: string;
+        NoncurrentVersionExpiration?: { NoncurrentDays: number };
+        ExpiredObjectDeleteMarker?: boolean;
+      }>;
+    }>(assetBucket(), 'LifecycleConfiguration');
+
+    const sweep = rules.find((r) => r.Id === 'expire-noncurrent-versions');
+    expect(sweep?.NoncurrentVersionExpiration?.NoncurrentDays).toBe(
+      app.config.storage.noncurrentVersionExpiryDays,
+    );
+    expect(sweep?.ExpiredObjectDeleteMarker).toBe(true);
+
+    /*
+     * The half that is a security control rather than a cost control.
+     *
+     * Under versioning, `Expiration` on `staging/` writes a delete marker and keeps
+     * the bytes — so without its own noncurrent rule, the prefix that holds
+     * unvalidated uploads, and whatever the malware quarantine handler deletes,
+     * silently becomes a retention policy for exactly those bytes.
+     */
+    const staging = rules.find((r) => r.Id === 'expire-staging');
+    expect(staging?.NoncurrentVersionExpiration?.NoncurrentDays).toBe(
+      app.config.storage.stagingNoncurrentExpiryDays,
+    );
+    expect(staging!.NoncurrentVersionExpiration!.NoncurrentDays).toBeLessThan(
+      app.config.storage.noncurrentVersionExpiryDays,
+    );
+  });
+
   it('does not deny the encryption-header-less writes this service actually makes', () => {
     // The obvious "deny unencrypted writes" policy denies every write we make, and
     // looks correct in review. This pins the narrower form.
-    const policy = resourcesOf(app.storage, 'AWS::S3::BucketPolicy')[0];
-    const document = JSON.stringify(propertyOf<unknown>(policy, 'PolicyDocument'));
+    const document = JSON.stringify(propertyOf<unknown>(assetBucketPolicy(), 'PolicyDocument'));
 
     expect(document).toContain('DenyExplicitlyUnencryptedWrites');
     expect(document).toContain('"Null":{"s3:x-amz-server-side-encryption":"false"}');
@@ -516,6 +654,103 @@ describe('compute', () => {
     });
   });
 
+  it('bounds optimizer fan-out against the shared database', () => {
+    // Unbounded, a backlog cures itself by opening hundreds of connections to the
+    // small Postgres instance the control plane shares — taking down the API that
+    // accepts the uploads that created the backlog.
+    app.compute.hasResourceProperties('AWS::Lambda::EventSourceMapping', {
+      ScalingConfig: { MaximumConcurrency: app.config.lambda.optimizerMaxConcurrency },
+    });
+  });
+
+  /*
+   * TLS at the load balancer, which is where API keys and upload payloads arrive.
+   *
+   * The listener always knew how to terminate TLS; nothing ever handed it a
+   * certificate, so every environment served the control plane in clear.
+   */
+  it('terminates TLS and answers port 80 only to redirect', () => {
+    app.compute.hasResourceProperties('AWS::ElasticLoadBalancingV2::Listener', {
+      Port: 443,
+      Protocol: 'HTTPS',
+      Certificates: Match.anyValue(),
+      // CDK's default still negotiates TLS 1.0/1.1.
+      SslPolicy: 'ELBSecurityPolicy-TLS13-1-2-2021-06',
+    });
+
+    app.compute.hasResourceProperties('AWS::ElasticLoadBalancingV2::Listener', {
+      Port: 80,
+      Protocol: 'HTTP',
+      DefaultActions: Match.arrayWith([
+        Match.objectLike({
+          Type: 'redirect',
+          RedirectConfig: Match.objectLike({
+            Protocol: 'HTTPS',
+            Port: '443',
+            StatusCode: 'HTTP_301',
+          }),
+        }),
+      ]),
+    });
+  });
+
+  it('refuses to synthesize a production control plane without a certificate', () => {
+    // The failure mode this guards is silent: an optional prop nobody passes, and a
+    // listener that quietly falls back to plain HTTP.
+    expect(() =>
+      synthesize('production', { API_CERTIFICATE_ARN: undefined, API_HOST: undefined }),
+    ).toThrow(/terminate TLS/);
+  });
+
+  it('still lets staging deploy before DNS exists', () => {
+    // Deliberate asymmetry: a first staging deploy has to be possible before a
+    // hostname is decided, and staging is not where credentials are worth stealing.
+    expect(() =>
+      synthesize('staging', { API_CERTIFICATE_ARN: undefined, API_HOST: undefined }),
+    ).not.toThrow();
+  });
+
+  it('runs migrations through the image script, not the CLI directly', () => {
+    // The CLI needs DATABASE_URL, which this container deliberately does not carry.
+    const containers = resourcesOf(app.compute, 'AWS::ECS::TaskDefinition').flatMap(
+      (task) =>
+        propertyOf<Array<{ Name: string; Command?: string[] }>>(task, 'ContainerDefinitions') ?? [],
+    );
+    const migrate = containers.find((container) => container.Name === 'migrate');
+
+    expect(migrate?.Command).toEqual(['node', 'packages/db/scripts/migrate.mjs']);
+  });
+
+  it('pins every container image to something other than latest', () => {
+    // `latest` makes "redeploy the previous version" ambiguous — it lets the service
+    // and the migration task run different bytes under one name, and it lets an
+    // unchanged task definition pick up a new sidecar on the next deploy.
+    const containers = resourcesOf(app.compute, 'AWS::ECS::TaskDefinition').flatMap(
+      (task) => propertyOf<Array<{ Image?: unknown }>>(task, 'ContainerDefinitions') ?? [],
+    );
+
+    expect(containers.length).toBeGreaterThanOrEqual(2);
+    expect(JSON.stringify(containers)).not.toContain(':latest');
+    // And ours really carries the configured tag, rather than merely not saying
+    // `latest` because the image reference was built some other way.
+    expect(JSON.stringify(containers)).toContain(`:${app.config.api.imageTag}`);
+  });
+
+  it('lets maintenance queue work but never consume it', () => {
+    // The re-enqueue job recovers optimizations lost to a failed enqueue. It is not a
+    // consumer, and must never be able to receive or delete another consumer's message.
+    const policies = resourcesOf(app.compute, 'AWS::IAM::Policy').map((policy) =>
+      JSON.stringify(propertyOf<unknown>(policy, 'PolicyDocument')),
+    );
+    const queuePolicies = policies.filter((document) => document.includes('sqs:SendMessage'));
+
+    expect(queuePolicies.length).toBeGreaterThan(0);
+    for (const document of queuePolicies) {
+      expect(document).not.toContain('sqs:ReceiveMessage');
+      expect(document).not.toContain('sqs:DeleteMessage');
+    }
+  });
+
   it('takes the database password from the secret store, never from plain env', () => {
     const containers = resourcesOf(app.compute, 'AWS::ECS::TaskDefinition').flatMap(
       (task) =>
@@ -588,6 +823,58 @@ describe('alarms', () => {
     expect(watched).toContain(METRICS.onDemandGenerations);
     expect(watched).toContain(METRICS.redundantGenerations);
     expect(watched).toContain(METRICS.generationFailures);
+  });
+
+  /*
+   * The failures no handler-emitted metric can report.
+   *
+   * A function that dies at init, gets OOM-killed, times out, or is throttled never
+   * reaches the code that emits our own metrics — so before these, all three
+   * functions could fail continuously while every custom metric read as healthy.
+   */
+  it('watches the runtime, not only the handler', () => {
+    const byName = (fragment: string) =>
+      resourcesOf(app.observability, 'AWS::CloudWatch::Alarm').find((a) =>
+        String(propertyOf<string>(a, 'AlarmName')).includes(fragment),
+      );
+
+    // Throttling is the one failure that makes on-demand generation look better.
+    const throttled = byName('generator-throttled');
+    expect(propertyOf<string>(throttled, 'MetricName')).toBe('Throttles');
+    expect(propertyOf<string>(throttled, 'Namespace')).toBe('AWS/Lambda');
+    expect(propertyOf<number>(throttled, 'Threshold')).toBe(0);
+
+    for (const fragment of ['generator-errors', 'optimizer-errors', 'maintenance-errors']) {
+      const errors = byName(fragment);
+      expect(propertyOf<string>(errors, 'MetricName'), fragment).toBe('Errors');
+      expect(propertyOf<string>(errors, 'Namespace'), fragment).toBe('AWS/Lambda');
+    }
+
+    expect(propertyOf<string>(byName('cdn-5xx'), 'MetricName')).toBe('5xxErrorRate');
+  });
+
+  /*
+   * The one alarm that must fire on silence.
+   *
+   * `MaintenanceRuns` only exists when a run completes, so NOT_BREACHING here would
+   * reproduce the cache-hit-rate defect exactly: a detector reading healthy forever
+   * precisely because nothing is being emitted.
+   */
+  it('treats a missing maintenance heartbeat as the failure', () => {
+    const heartbeat = resourcesOf(app.observability, 'AWS::CloudWatch::Alarm').find((a) =>
+      String(propertyOf<string>(a, 'AlarmName')).includes('maintenance-stalled'),
+    );
+
+    expect(propertyOf<string>(heartbeat, 'MetricName')).toBe(METRICS.maintenanceRuns);
+    expect(propertyOf<string>(heartbeat, 'TreatMissingData')).toBe('breaching');
+    expect(propertyOf<string>(heartbeat, 'ComparisonOperator')).toBe('LessThanThreshold');
+
+    // CloudWatch rejects an alarm whose period x evaluationPeriods exceeds one day,
+    // and does so at CREATE — after a green synth and a green deploy of everything
+    // that came before it.
+    const period = propertyOf<number>(heartbeat, 'Period');
+    const periods = propertyOf<number>(heartbeat, 'EvaluationPeriods');
+    expect(period * periods).toBeLessThanOrEqual(86_400);
   });
 
   it('alarms on any dead letter at all, not on a tolerance', () => {

@@ -17,6 +17,7 @@
  */
 
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
+import { PRIVATE_PATH_PREFIX } from '@imgopt/core';
 import type { Construct } from 'constructs';
 
 /**
@@ -26,8 +27,14 @@ import type { Construct } from 'constructs';
  * pattern and knows nothing about our metadata. An asset's privacy is therefore
  * expressed in its URL, which also means changing it mints a new URL — consistent
  * with everything else here being immutable.
+ *
+ * Read from core rather than spelled out, because three copies of this string exist:
+ * the behavior below, the edge normalizer's prefix table, and the control plane's URL
+ * builder. A behavior that matches a prefix the normalizer does not rewrite is
+ * exactly the failure this deployment already had — signed URLs that verify, then
+ * 403 at S3 and 400 at the generator.
  */
-export const PRIVATE_PATH_PATTERN = '/p/*';
+export const PRIVATE_PATH_PATTERN = `/${PRIVATE_PATH_PREFIX}/*`;
 
 export interface PrivateDeliveryOptions {
   environment: string;

@@ -55,6 +55,14 @@ FROM node:22-slim AS runtime
 ENV NODE_ENV=production
 WORKDIR /repo
 
+# Prisma's migration engine looks for libssl and, not finding it on this base image,
+# warns and guesses `openssl-1.1.x`. The guess currently works, which is the problem:
+# it is one base-image bump away from failing, and it would fail at the deploy's
+# migration step. Installing it costs a few megabytes and removes the guess.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends openssl \
+  && rm -rf /var/lib/apt/lists/*
+
 # Drop privileges. node:22-slim ships a `node` user.
 USER node
 
@@ -68,6 +76,18 @@ COPY --from=build --chown=node:node /repo/packages/db/dist ./packages/db/dist
 COPY --from=build --chown=node:node /repo/packages/metrics/dist ./packages/metrics/dist
 COPY --from=build --chown=node:node /repo/packages/db/src/generated ./packages/db/src/generated
 COPY --from=build --chown=node:node /repo/apps/api/dist ./apps/api/dist
+
+# The migration task's payload, not the API's.
+#
+# This same image runs `packages/db/scripts/migrate.mjs` as a one-off ECS task before
+# a new task definition takes traffic, and `migrate deploy` needs the schema, the
+# migration SQL, and the CLI config — none of which a compiled `dist` contains. An
+# image without them deploys perfectly and then fails at the one step standing
+# between a green deployment and a working database, which is also the step with no
+# other way in: the instance sits in isolated subnets.
+COPY --from=build --chown=node:node /repo/packages/db/prisma ./packages/db/prisma
+COPY --from=build --chown=node:node /repo/packages/db/prisma.config.ts ./packages/db/prisma.config.ts
+COPY --from=build --chown=node:node /repo/packages/db/scripts ./packages/db/scripts
 # Production node_modules, so dev-only deps (sharp-for-tests, swc) are excluded.
 COPY --from=prod-deps --chown=node:node /repo/apps/api/node_modules ./apps/api/node_modules
 

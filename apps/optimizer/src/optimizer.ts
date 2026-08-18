@@ -78,9 +78,27 @@ export class Optimizer {
       const original = await this.storage.get(version.sourceKey);
       const meta = await readMetadata(original, { maxPixels: this.config.upload.maxPixels });
 
-      // Conditional master: convert every future miss from "decode the full original"
-      // to "decode a bounded intermediate". Only worth it for very large sources.
-      let masterKey: string | undefined;
+      // Animation does not survive the pipeline: the transform grammar describes a
+      // still image, so every derivative is the opening frame re-encoded. Logged
+      // where it is first known, because the alternative is discovering it from a
+      // rendered page and having nothing in the record that says why.
+      if (meta.isAnimated) {
+        this.logger.warn(
+          { assetId: job.assetId, format: meta.format, pages: meta.pages },
+          'animated source; derivatives will carry the first frame only',
+        );
+      }
+
+      /*
+       * Conditional master: convert every future miss from "decode the full original"
+       * to "decode a bounded intermediate". Only worth it for very large sources.
+       *
+       * Key and size travel together in one variable so the size cannot be recorded
+       * without the object it measures. A master row with a key and no bytes is
+       * indistinguishable from one written before the column existed, and that is
+       * exactly the row the storage totals silently drop.
+       */
+      let master: { key: string; bytes: number } | undefined;
       let decodeSource = original;
       if (
         needsMaster(meta, {
@@ -88,17 +106,27 @@ export class Optimizer {
           longestEdge: this.config.processing.masterThresholdLongestEdge,
         })
       ) {
-        const master = await generateMaster(original, {
+        const rendition = await generateMaster(original, {
           longestEdge: this.config.processing.masterLongestEdge,
+          maxPixels: this.config.upload.maxPixels,
         });
-        masterKey = toMasterKey(job.assetId, version.version);
-        await this.storage.put(masterKey, master, { contentType: 'image/webp' });
-        decodeSource = master;
+        master = {
+          key: toMasterKey(job.assetId, version.version),
+          bytes: rendition.length,
+        };
+        await this.storage.put(master.key, rendition, { contentType: 'image/webp' });
+        decodeSource = rendition;
       }
 
+      // Both decode the source in full, so both carry the configured pixel ceiling.
       const [lqip, dominantColor] = await Promise.all([
-        generateLqip(original, { width: this.config.processing.lqipWidth }),
-        readDominantColor(original).catch(() => undefined),
+        generateLqip(original, {
+          width: this.config.processing.lqipWidth,
+          maxPixels: this.config.upload.maxPixels,
+        }),
+        readDominantColor(original, { maxPixels: this.config.upload.maxPixels }).catch(
+          () => undefined,
+        ),
       ]);
 
       await this.repo.updateVersionMetadata(job.assetId, version.version, {
@@ -111,7 +139,7 @@ export class Optimizer {
         ...(meta.orientation !== undefined ? { orientation: meta.orientation } : {}),
         ...(dominantColor !== undefined ? { dominantColor } : {}),
         lqip,
-        ...(masterKey !== undefined ? { masterKey } : {}),
+        ...(master !== undefined ? { masterKey: master.key, masterBytes: master.bytes } : {}),
       });
 
       const derivatives = await this.generateWarmSet(
@@ -128,7 +156,7 @@ export class Optimizer {
           assetId: job.assetId,
           version: version.version,
           derivatives,
-          master: masterKey !== undefined,
+          master: master !== undefined,
         },
         'optimization complete',
       );

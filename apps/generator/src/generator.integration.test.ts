@@ -147,9 +147,11 @@ describe('first request for an uncached variant', () => {
 
   it('applies rare parameters recovered from the key', async () => {
     const id = await storeOriginal(await photo(1600, 900));
+    // `pad` is a request-time spelling of `contain` — both reach sharp as the same
+    // call, so both resolve to one key rather than two objects holding one image.
     const path = deliveryPath(id, 'w=640&h=640&fit=pad&background=ff0000');
 
-    expect(path).toContain('w640_h640_pad_q75_bgff0000');
+    expect(path).toContain('w640_h640_contain_q75_bgff0000');
 
     const response = await generator.generate(path);
     const meta = await sharp(response.body).metadata();

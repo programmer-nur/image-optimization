@@ -30,26 +30,92 @@ export interface StorageStackProps extends StackProps {
 
 export class StorageStack extends Stack {
   readonly bucket: s3.Bucket;
+  /** Access logs for the distribution, the load balancer, and the asset bucket. */
+  readonly logBucket: s3.Bucket;
 
   constructor(scope: Construct, id: string, props: StorageStackProps) {
     super(scope, id, props);
 
     const { config } = props;
 
+    /*
+     * One bucket for every access log in the deployment.
+     *
+     * There were none at all, which meant incident forensics had aggregate metrics
+     * and nothing else: no way to answer "which key", "from where", or "how did they
+     * find it" — and the delivery plane is unauthenticated, so those are the only
+     * questions worth asking about it.
+     *
+     * `OBJECT_WRITER` ownership rather than the account default: CloudFront's
+     * standard logging and S3 server-access logging both write with an ACL, and a
+     * bucket with ACLs disabled rejects them — at delivery time, silently, long after
+     * a green deploy. Public access is still blocked and SSL still enforced.
+     *
+     * Expired rather than retained: logs are for the incident you are in, and a
+     * never-expiring log bucket is the one storage line that grows with traffic
+     * rather than with content.
+     */
+    this.logBucket = new s3.Bucket(this, 'LogBucket', {
+      bucketName: `${bucketNameFor(config)}-logs`,
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      enforceSSL: true,
+      objectOwnership: s3.ObjectOwnership.OBJECT_WRITER,
+      removalPolicy: config.removalPolicy,
+      lifecycleRules: [
+        {
+          id: 'expire-logs',
+          expiration: Duration.days(config.storage.accessLogRetentionDays),
+          abortIncompleteMultipartUploadAfter: Duration.days(
+            config.storage.abortIncompleteMultipartDays,
+          ),
+        },
+      ],
+    });
+
     this.bucket = new s3.Bucket(this, 'AssetBucket', {
       bucketName: bucketNameFor(config),
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       encryption: s3.BucketEncryption.S3_MANAGED,
       enforceSSL: true,
-      versioned: false,
+      /*
+       * Versioning, for one reason: originals cannot be regenerated.
+       *
+       * "Write-once" is enforced by code alone — no path reads an object under
+       * `original/`, modifies it, and writes it back — and two roles can delete
+       * there: maintenance, which reclaims superseded versions, and the API task
+       * role, which backs `DELETE /v1/images/:id`. A defect in either destroys the
+       * one thing in this system with no upstream copy. With versioning, the same
+       * defect writes a delete marker and the bytes remain recoverable for
+       * `noncurrentVersionExpiryDays`.
+       *
+       * The cost of that safety is that every delete now leaves a copy behind, which
+       * is why each lifecycle rule below carries its own noncurrent expiry. A
+       * versioned bucket without those rules grows forever and — worse — quietly
+       * retains the untrusted bytes that `staging/`'s hard expiry exists to destroy.
+       */
+      versioned: true,
       removalPolicy: config.removalPolicy,
+      // Object-level reads and writes on the asset bucket, so a takedown or a leak
+      // can be traced to a principal rather than inferred.
+      serverAccessLogsBucket: this.logBucket,
+      serverAccessLogsPrefix: 's3/',
       lifecycleRules: [
         {
-          // Untrusted bytes have a hard expiry rather than a cleanup job, so an
-          // abandoned presigned upload cannot linger even if the reaper is broken.
+          /*
+           * Untrusted bytes have a hard expiry rather than a cleanup job, so an
+           * abandoned presigned upload cannot linger even if the reaper is broken.
+           *
+           * Under versioning, `expiration` only writes a delete marker — so this rule
+           * without its noncurrent half would leave every expired upload, and every
+           * object the malware quarantine handler deletes, sitting in the bucket as a
+           * noncurrent version. That converts a security control into a retention
+           * policy for exactly the bytes it exists to remove.
+           */
           id: 'expire-staging',
           prefix: STAGING_PREFIX,
           expiration: Duration.days(config.storage.stagingExpiryDays),
+          noncurrentVersionExpiration: Duration.days(config.storage.stagingNoncurrentExpiryDays),
           abortIncompleteMultipartUploadAfter: Duration.days(
             config.storage.abortIncompleteMultipartDays,
           ),
@@ -88,6 +154,26 @@ export class StorageStack extends Stack {
           abortIncompleteMultipartUploadAfter: Duration.days(
             config.storage.abortIncompleteMultipartDays,
           ),
+        },
+        {
+          /*
+           * What versioning costs, bounded.
+           *
+           * Every delete and every overwrite anywhere in the bucket leaves the
+           * previous copy as a noncurrent version. This is the recovery window for
+           * originals — the reason versioning is on — and the ceiling that keeps
+           * recovery copies from becoming a permanent second copy of the bucket.
+           * `staging/` has its own, much shorter, rule above; S3 applies the most
+           * specific matching rule, so this one governs everything else.
+           *
+           * `expiredObjectDeleteMarker` sweeps the markers left behind once the
+           * versions under them are gone. They are zero bytes each, but they are also
+           * what makes a `list-objects` walk slower and stranger over time, and the
+           * orphan collector walks the whole bucket.
+           */
+          id: 'expire-noncurrent-versions',
+          noncurrentVersionExpiration: Duration.days(config.storage.noncurrentVersionExpiryDays),
+          expiredObjectDeleteMarker: true,
         },
       ],
     });
@@ -138,11 +224,18 @@ export class StorageStack extends Stack {
      *    403. Granting list here would change that status and quietly alter the
      *    delivery path's behaviour.
      *
-     * The source condition is scoped to distributions in this account rather than to
-     * one distribution id. Naming the id would make this stack reference the CDN
-     * stack, which references compute, which references this one. In a single-tenant
-     * deployment with one distribution the difference is immaterial; the cycle is
-     * not.
+     * 3. **Pinned to one distribution, when the id is known.** The condition falls
+     *    back to "any distribution in this account", and that fallback is not
+     *    immaterial: environments are otherwise fully isolated, but two of them in
+     *    one account means staging's distribution satisfies production's condition
+     *    and can read production's derivatives. The id is supplied out of band
+     *    (`CDN_DISTRIBUTION_ID`, emitted by the CDN stack on first deploy) rather
+     *    than referenced, because naming the construct would make storage depend on
+     *    CDN, which depends on compute, which depends on storage — a cycle
+     *    CloudFormation reports as a wall of unrelated resources.
+     *
+     *    So the first deploy of a new environment runs unpinned, and pinning is a
+     *    second pass. Documented in the bootstrap guide rather than left as folklore.
      */
     this.bucket.addToResourcePolicy(
       new iam.PolicyStatement({
@@ -151,11 +244,18 @@ export class StorageStack extends Stack {
         principals: [new iam.ServicePrincipal('cloudfront.amazonaws.com')],
         actions: ['s3:GetObject'],
         resources: [this.bucket.arnForObjects(`${DERIVED_PREFIX}*`)],
-        conditions: {
-          StringLike: {
-            'AWS:SourceArn': `arn:aws:cloudfront::${this.account}:distribution/*`,
-          },
-        },
+        conditions:
+          config.cdnDistributionId === undefined
+            ? {
+                StringLike: {
+                  'AWS:SourceArn': `arn:aws:cloudfront::${this.account}:distribution/*`,
+                },
+              }
+            : {
+                StringEquals: {
+                  'AWS:SourceArn': `arn:aws:cloudfront::${this.account}:distribution/${config.cdnDistributionId}`,
+                },
+              },
       }),
     );
 

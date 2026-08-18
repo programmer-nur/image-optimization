@@ -170,33 +170,35 @@ Worked examples (key column is what both the edge and the generator compute; ser
 - `h` only → snap `h` on the ladder, derive width.
 - both → snap `w` to a bucket `W`, quantize the requested ratio `r = h/w` to the nearest entry in `RATIOS = [1/1, 4/3, 3/2, 16/9, 21/9, 3/4, 2/3, 9/16]` within a 3% tolerance; outside tolerance, round `r` to 2 decimals. Final `H = round(W * r)`.
 
-This caps the two-dimensional space at roughly `20 widths × ~10 ratios` instead of `20 × 3840`.
+This caps the two-dimensional space at `20 widths × ~2000 heights` instead of `20 × 3840`. The nine listed ratios cover the shapes anyone asks for by name; the two-decimal fallback is what keeps unusual crops expressible, and it is what actually sets the bound. `isQuantizedHeight` in `packages/core/src/breakpoints.ts` is the acceptance twin of that arithmetic and is deliberately a _superset_ of it — refusing a height the normalizer can emit would 400 a legitimate viewer URL forever, and only for shapes nobody types by hand. Tightening the bound means changing `quantizeRatio`'s rounding granularity, which is a grammar change: it must happen before anything is cached, and the acceptance twin has to move in the same commit.
 
 **Everything else quantizes too.** A dimension that isn't quantized is a cache-fragmentation hole:
 
-| Parameter    | Allowed values after normalization                                                                                |
-| ------------ | ----------------------------------------------------------------------------------------------------------------- |
-| `q`          | snap to nearest of `{50, 65, 75, 85, 95}` — a _perceptual_ scale, translated per codec at encode time             |
-| `fit`        | enum: `cover \| contain \| inside \| outside \| fill \| pad`                                                      |
-| `format`     | `auto \| avif \| webp \| jpeg \| png`; `auto` resolves to a concrete format at the edge                           |
-| `blur`       | snap to nearest of `{0, 2, 5, 10, 20, 40}`                                                                        |
-| `sharpen`    | `{0, 1, 2}`                                                                                                       |
-| `background` | lowercase 6- or 8-digit hex; only meaningful with `fit=pad\|contain`                                              |
-| `crop`       | named gravity only on the public URL: `center \| top \| bottom \| left \| right \| entropy \| attention \| focal` |
-| `dpr`        | `{1, 2, 3}` — folded into width, never appears in the key                                                         |
+| Parameter    | Allowed values after normalization                                                                                                                                                   |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `q`          | snap to nearest of `{50, 65, 75, 85, 95}` — a _perceptual_ scale, translated per codec at encode time                                                                                |
+| `fit`        | enum: `cover \| contain \| inside \| outside \| fill \| pad`; `pad` is an accepted spelling that collapses to `contain` at parse time, since both reach the encoder as the same call |
+| `format`     | `auto \| avif \| webp \| jpeg \| png`; `auto` resolves to a concrete format at the edge                                                                                              |
+| `blur`       | snap to nearest of `{0, 2, 5, 10, 20, 40}`                                                                                                                                           |
+| `sharpen`    | `{0, 1, 2}`                                                                                                                                                                          |
+| `background` | lowercase 6- or 8-digit hex with each channel snapped to the 4-bit grid (`00, 11, … ff`); only meaningful with `fit=contain`. Unquantized, this axis alone is 2^24 keys per box      |
+| `crop`       | named gravity only on the public URL: `center \| top \| bottom \| left \| right \| entropy \| attention`                                                                             |
+| `dpr`        | `{1, 2, 3}` — folded into width, never appears in the key                                                                                                                            |
 
 **Parameters that cannot affect the output are elided from the key.** A parameter that is present but inert is a cache-fragmentation hole exactly like an unquantized one: `?w=640` and `?w=640&fit=cover` produce identical pixels, so they must produce identical keys. Normalization drops:
 
 - `fit` unless **both** dimensions are constrained — with only one, the resize is proportional and every fit mode yields identical pixels.
-- `background` when `fit` never produces empty area (only `pad` and `contain` can).
-- `crop` gravity when no cropping occurs (needs both dimensions and a cropping fit).
+- `background` when `fit` never produces empty area — only `contain` can, and `pad` is a spelling of it.
+- `crop` gravity on every fit but `cover`, the one fit that discards pixels. `outside` resizes past the requested box and returns the result whole, so sharp never crops it and every gravity yields identical bytes.
 - `blur` and `sharpen` at level 0.
 - `dpr`, always — it is folded into the width before snapping.
 - any unrecognized parameter.
 
 **Quality is perceptual, not a raw codec value.** The levels describe how an image should _look_; `encoder-options.ts` maps each onto per-codec settings, so nominal 75 becomes mozjpeg 78, WebP 72, and AVIF 50. Treating `q` as a raw codec number instead would mean a caller asking for the perfectly reasonable `?q=75` hands AVIF a near-lossless setting, producing files several times larger than needed and giving back most of what AVIF was adopted for — on the line item that is ~75% of the bill.
 
-**Absolute pixel crops are deliberately not a public URL parameter.** `crop=x,y,w,h` reintroduces an unbounded key space through the back door — it is the one parameter that could single-handedly undo bucketing. Instead: `crop=focal` uses a focal point stored on the asset (settable via `PATCH /v1/images/:id`), and true arbitrary rectangles are performed through the authenticated API, which materializes the result as a **new asset** with its own id. This matches how the cost actually behaves: an arbitrary crop is a new image, not a rendition of an existing one.
+**Absolute pixel crops are deliberately not a public URL parameter.** `crop=x,y,w,h` reintroduces an unbounded key space through the back door — it is the one parameter that could single-handedly undo bucketing. Instead, arbitrary rectangles are performed through the authenticated API, which materializes the result as a **new asset** with its own id.
+
+**There is no `crop=focal`, and the reason is the same one.** A focal point is registry metadata, and the delivery plane never reads the registry — the generator is handed a key and nothing else — so a stored point could not reach the render. It rendered as centre, which meant `crop=focal` minted a second key holding bytes identical to the elided centre key: fragmentation dressed as a feature. The value is still stored on the asset as advisory metadata for clients that position images themselves; putting it in the URL grammar again requires first deciding how it can reach the generator. This matches how the cost actually behaves: an arbitrary crop is a new image, not a rendition of an existing one.
 
 **Canonical key construction.** After normalization, a deterministic path is built:
 
@@ -215,7 +217,7 @@ Hashing turns out to buy nothing anyway: every one of these values is already qu
 flowchart TD
     A["GET /i/abc123/v3/hero.jpg?w=602&q=82&dpr=2&format=auto"] --> B[CloudFront Function - viewer request]
     B --> C{Params valid?}
-    C -->|no| D["403 with short TTL"]
+    C -->|no| D["400 with short TTL"]
     C -->|yes| E["effective width = 602 * 2 = 1204"]
     E --> F["snap up ladder -> 1440"]
     F --> H["q 82 -> 85"]
@@ -334,7 +336,6 @@ That second mechanism is the escape hatch that makes `immutable` safe to promise
 ```
 Accept contains image/avif  -> avif
 else contains image/webp    -> webp
-else source has alpha       -> png
 else                        -> jpeg
 ```
 
@@ -342,7 +343,7 @@ else                        -> jpeg
 
 AVIF is ~30–50% smaller than JPEG at equivalent perceptual quality and ~20% smaller than WebP. Given that bandwidth is the dominant cost line, this decision is simultaneously the largest cost optimization and the largest performance improvement in the system. It is also why AVIF encoding effort is set high (slow encode, small file): encoding is a one-time cost paid once per variant, delivery is paid millions of times.
 
-PNG is preserved only for images with alpha where the client explicitly asks; AVIF and WebP both support alpha, so `auto` rarely selects PNG.
+**`auto` never resolves to PNG, and that follows from D3 rather than being an oversight.** The original sketch had `auto` fall back to PNG for transparent sources. The edge cannot do it: it has no asset metadata — no network, and a KeyValueStore cannot hold per-asset alpha for millions of assets — and the key has to be derivable from the URL alone, identically at the edge and in the generator, or the two drift. So a client advertising neither modern format receives JPEG, with transparency flattened onto the background colour by the pipeline. Both modern formats carry alpha, so this affects only genuinely legacy clients, and `format=png` remains available to any caller that needs alpha preserved for them.
 
 ### D10 — Sharp configuration and Lambda sizing
 
@@ -361,7 +362,7 @@ sharp(input, { limitInputPixels: 100_000_000, failOn: 'truncated', sequentialRea
 - Metadata is stripped by default — this removes GPS coordinates from user photos (a genuine privacy leak) and typically 10–50KB per image. The ICC profile is the exception: converting to sRGB and _not_ attaching a profile is correct and smaller; attaching the original wide-gamut profile without conversion would render wrong on most displays.
 - `limitInputPixels` is the decompression-bomb defense. A 30KB PNG can decode to 100,000×100,000 pixels — 40GB of RAM. This cap is non-negotiable.
 
-**Lambda runtime:** Node 22 on **arm64/Graviton** (~20% cheaper per GB-second, and Sharp ships prebuilt `linux-arm64` binaries). Memory 2048MB as the starting point, tuned with AWS Lambda Power Tuning before launch. Lambda allocates vCPU proportionally to memory — 1769MB ≈ 1 full vCPU — and because Sharp's work is CPU-bound, _more memory is frequently cheaper overall_: doubling memory can more than halve duration, so GB-seconds go down while latency improves. Sizing this by intuition rather than measurement reliably picks wrong.
+**Lambda runtime:** Node 22 on **arm64/Graviton** (~20% cheaper per GB-second, and Sharp ships prebuilt `linux-arm64` binaries). Memory 3008MB as the starting point (the deployed default — see `docs/tuning.md`), tuned with AWS Lambda Power Tuning before launch. Lambda allocates vCPU proportionally to memory — 1769MB ≈ 1 full vCPU — and because Sharp's work is CPU-bound, _more memory is frequently cheaper overall_: doubling memory can more than halve duration, so GB-seconds go down while latency improves. Sizing this by intuition rather than measurement reliably picks wrong.
 
 **Sharp concurrency:** `sharp.concurrency(1)` and `sharp.cache(false)` in Lambda. libvips defaults its thread pool to the core count, but a Lambda handling one image at a time gets no benefit from intra-image parallelism at low vCPU counts, and the thread pool plus libvips' operation cache both inflate memory across warm invocations — which is how a Lambda that passes testing OOMs in production a week later. The Fargate container, which may process several images concurrently, uses different settings.
 
@@ -581,7 +582,7 @@ Additional controls: lifecycle rules move originals to Standard-IA at 30 days an
 | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `GenerationLatency` p50/p99 by format & bucket | Detects encoder regressions and pathological sources                                                                                                                           |
 | `GenerationFailures` by reason                 | Distinguishes corrupt input from real bugs                                                                                                                                     |
-| `OnDemandGenerationRate`                       | **The health signal.** Should trend to near-zero per asset. Sustained non-zero means normalization drift — a CF-Function-vs-core mismatch that silently invokes Lambda forever |
+| `OnDemandGenerations`                          | **The health signal.** Should trend to near-zero per asset. Sustained non-zero means normalization drift — a CF-Function-vs-core mismatch that silently invokes Lambda forever |
 | `BytesServed` by format                        | Direct proxy for the dominant cost line; tracks AVIF adoption                                                                                                                  |
 | `QueueDepth` / `ApproximateAgeOfOldestMessage` | Backlog detection before users notice                                                                                                                                          |
 | `DLQDepth`                                     | Any non-zero value is an alarm                                                                                                                                                 |
@@ -596,7 +597,7 @@ Additional controls: lifecycle rules move originals to Standard-IA at 30 days an
 
 ## Risks / Trade-offs
 
-- **Edge/core normalization drift** → the highest-severity failure mode. A mismatch means CloudFront caches key A while Lambda writes object B: permanent 100% miss, every request invoking Lambda, no error anywhere. _Mitigation:_ generate the edge function from `packages/core` (D4), run shared conformance vectors against both in CI, and alarm on `OnDemandGenerationRate` staying non-zero — the symptom is invisible in error rates but obvious in that one metric.
+- **Edge/core normalization drift** → the highest-severity failure mode. A mismatch means CloudFront caches key A while Lambda writes object B: permanent 100% miss, every request invoking Lambda, no error anywhere. _Mitigation:_ generate the edge function from `packages/core` (D4), run shared conformance vectors against both in CI, and alarm on `OnDemandGenerations` staying non-zero — the symptom is invisible in error rates but obvious in that one metric.
 
 - **Snap-up wastes bytes at ladder gaps** → a 1081px request serves 1200px, ~22% more pixels than needed. _Mitigation:_ accepted deliberately. The gaps are widest where pixel density is highest and the visual cost of downscaling is lowest. Tightening the ladder trades bytes-per-image against cache fragmentation, and fragmentation is the more expensive failure.
 
@@ -633,7 +634,7 @@ Greenfield — no data migration. Rollout is phased so each phase is independent
 
 ## Open Questions
 
-1. **Warm-set width for the first consuming project** — the 1080px default is a guess until a real workload exists. Resolve by shipping with LQIP + 1080 AVIF and reading `OnDemandGenerationRate` by bucket after two weeks of production traffic.
+1. **Warm-set width for the first consuming project** — the 1080px default is a guess until a real workload exists. Resolve by shipping with LQIP + 1080 AVIF and reading `OnDemandGenerations` by bucket after two weeks of production traffic.
 2. **Is the icon ladder's lower bound right at 16px?** Below ~32px, encoder overhead dominates and AVIF can exceed PNG in size. May need a format-policy exception for very small dimensions.
 3. **Quality ladder granularity** — five levels `{50,65,75,85,95}` may be coarser than needed for photography-heavy consumers. Widening is cheap; narrowing later is an `encoderEpoch` bump.
 4. **`assetVersion` retention window** — how long do superseded versions' derivatives survive before lifecycle expiry? Too short breaks in-flight cached HTML; too long wastes storage. Starting proposal: 30 days.

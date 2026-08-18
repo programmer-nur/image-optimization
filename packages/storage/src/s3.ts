@@ -357,6 +357,21 @@ export class S3Storage implements StoragePort {
     }
   }
 
+  async presignDownload(key: string, options: { expiresInSeconds: number }): Promise<string> {
+    try {
+      return await getSignedUrl(
+        this.client,
+        new GetObjectCommand({ Bucket: this.bucket, Key: key }),
+        { expiresIn: options.expiresInSeconds },
+      );
+    } catch (error) {
+      throw new StorageError('presign_failed', `Failed to presign download for "${key}".`, {
+        key,
+        cause: error,
+      });
+    }
+  }
+
   async createMultipartUpload(
     key: string,
     partCount: number,

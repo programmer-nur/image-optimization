@@ -43,13 +43,24 @@ export class AssetsController {
     private readonly delivery: DeliveryService,
   ) {}
 
+  /*
+   * Reads carry a permission of their own.
+   *
+   * They used to require only a valid key, which meant a key issued with
+   * `permissions: []` — the default for a key created without any — could enumerate
+   * the entire catalog and read every asset's metadata. That is the opposite of what
+   * an empty permission list should grant, and it made "least privilege" impossible
+   * to express: there was no way to hand out a key that can upload but not list.
+   */
   @Get(':id')
+  @RequirePermissions('read')
   async get(@Param('id') id: string): Promise<AssetResponse> {
     const asset = await this.assets.get(id);
     return presentAsset(asset, this.delivery);
   }
 
   @Get(':id/variants')
+  @RequirePermissions('read')
   async variants(@Param('id') id: string): Promise<{
     variants: Array<{
       canonicalKey: string;
@@ -115,6 +126,7 @@ export class AssetsController {
   }
 
   @Get()
+  @RequirePermissions('read')
   async list(
     @Query('limit') limit?: string,
     @Query('cursor') cursor?: string,

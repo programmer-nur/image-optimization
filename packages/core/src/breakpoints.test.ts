@@ -118,8 +118,12 @@ describe('capToSource', () => {
     expect(capToSource(3840, 1000)).toBe(960);
   });
 
-  it('serves native width for sources below the smallest rung', () => {
-    expect(capToSource(16, 12)).toBe(12);
+  it('floors at the smallest rung for sources below it', () => {
+    // A native-width key is a key no viewer URL can ask for: the edge snaps every
+    // requested width up to a rung, so `w12` would be written once and read never.
+    // The pipeline still delivers the source's own 12 pixels under `w16`.
+    expect(capToSource(16, 12)).toBe(16);
+    expect(capToSource(3840, 1)).toBe(16);
   });
 });
 

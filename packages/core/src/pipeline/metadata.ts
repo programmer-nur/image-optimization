@@ -1,10 +1,24 @@
 /**
  * Intrinsic metadata extraction and placeholder generation.
+ *
+ * DECODE GUARD. Every function here that hands bytes to sharp sets
+ * `limitInputPixels`, for the same reason `render` does: a ~30KB PNG can declare
+ * dimensions that decode to tens of gigabytes. Sharp's own default is not "none", but
+ * it is ~268 megapixels — roughly 2.7x the cap this deployment configures — so an
+ * unset option here quietly overrides the operator's ceiling on exactly the paths a
+ * crafted upload reaches first. The cap is a parameter rather than a constant because
+ * `UPLOAD_MAX_PIXELS` is a deployment setting, and a guard that ignores it is a guard
+ * in name only.
  */
 
 import sharp from 'sharp';
 import { classifyError } from './errors.js';
 import { DEFAULT_MAX_PIXELS } from './render.js';
+
+/** Shared by every decode entry point here. */
+export interface DecodeLimits {
+  maxPixels?: number;
+}
 
 export interface SourceMetadata {
   /** Displayed width, after EXIF orientation is accounted for. */
@@ -19,6 +33,18 @@ export interface SourceMetadata {
   orientation?: number;
   /** Whether width/height were swapped relative to the stored dimensions. */
   orientationSwapsAxes: boolean;
+  /** Frames in the source. 1 for a still; GIF and animated WebP can carry more. */
+  pages: number;
+  /**
+   * Whether the source carries more than one frame.
+   *
+   * Reported because the pipeline does not preserve animation: every derivative is
+   * re-encoded from the first frame, which is what a still-image transform grammar
+   * can express. An animated GIF or WebP is therefore accepted and delivered as its
+   * opening frame — a defensible outcome, but a surprising one to discover from the
+   * rendered page, so the fact is surfaced here rather than left implicit.
+   */
+  isAnimated: boolean;
 }
 
 /** EXIF orientations 5-8 involve a 90 degree rotation, transposing the axes. */
@@ -37,7 +63,7 @@ function swapsAxes(orientation: number | undefined): boolean {
  */
 export async function readMetadata(
   input: Buffer | Uint8Array,
-  options: { maxPixels?: number } = {},
+  options: DecodeLimits = {},
 ): Promise<SourceMetadata> {
   try {
     const image = sharp(input, {
@@ -49,6 +75,7 @@ export async function readMetadata(
     const storedWidth = meta.width ?? 0;
     const storedHeight = meta.height ?? 0;
     const swap = swapsAxes(meta.orientation);
+    const pages = meta.pages ?? 1;
 
     return {
       width: swap ? storedHeight : storedWidth,
@@ -59,6 +86,8 @@ export async function readMetadata(
       colorspace: meta.space ?? 'unknown',
       ...(meta.orientation !== undefined ? { orientation: meta.orientation } : {}),
       orientationSwapsAxes: swap,
+      pages,
+      isAnimated: pages > 1,
     };
   } catch (error) {
     throw classifyError(error);
@@ -66,9 +95,18 @@ export async function readMetadata(
 }
 
 /** Average colour of the source, for solid placeholder backgrounds. */
-export async function readDominantColor(input: Buffer | Uint8Array): Promise<string> {
+export async function readDominantColor(
+  input: Buffer | Uint8Array,
+  options: DecodeLimits = {},
+): Promise<string> {
   try {
-    const { dominant } = await sharp(input).stats();
+    // `stats()` decodes the whole image to compute the average, so this is a full
+    // decode wearing a small-sounding name.
+    const { dominant } = await sharp(input, {
+      limitInputPixels: options.maxPixels ?? DEFAULT_MAX_PIXELS,
+      failOn: 'truncated',
+      sequentialRead: true,
+    }).stats();
     const hex = (v: number): string => v.toString(16).padStart(2, '0');
     return `${hex(dominant.r)}${hex(dominant.g)}${hex(dominant.b)}`;
   } catch (error) {
@@ -76,7 +114,7 @@ export async function readDominantColor(input: Buffer | Uint8Array): Promise<str
   }
 }
 
-export interface LqipOptions {
+export interface LqipOptions extends DecodeLimits {
   width?: number;
   quality?: number;
 }
@@ -97,7 +135,11 @@ export async function generateLqip(
   const quality = options.quality ?? 40;
 
   try {
-    const data = await sharp(input, { failOn: 'truncated', sequentialRead: true })
+    const data = await sharp(input, {
+      limitInputPixels: options.maxPixels ?? DEFAULT_MAX_PIXELS,
+      failOn: 'truncated',
+      sequentialRead: true,
+    })
       .rotate()
       .resize({ width, withoutEnlargement: true })
       .webp({ quality, effort: 6, alphaQuality: 50 })
@@ -109,7 +151,7 @@ export async function generateLqip(
   }
 }
 
-export interface MasterOptions {
+export interface MasterOptions extends DecodeLimits {
   longestEdge?: number;
   quality?: number;
 }
@@ -130,7 +172,11 @@ export async function generateMaster(
   const quality = options.quality ?? 92;
 
   try {
-    return await sharp(input, { failOn: 'truncated', sequentialRead: true })
+    return await sharp(input, {
+      limitInputPixels: options.maxPixels ?? DEFAULT_MAX_PIXELS,
+      failOn: 'truncated',
+      sequentialRead: true,
+    })
       .rotate()
       .resize({ width: longestEdge, height: longestEdge, fit: 'inside', withoutEnlargement: true })
       .webp({ quality, effort: 4 })

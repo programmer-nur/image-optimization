@@ -86,8 +86,11 @@ describe('no candidate exceeds the source width', () => {
     expect(widths[widths.length - 1]).toBe(480);
   });
 
-  it('offers the native width when the source is smaller than every rung', () => {
-    expect(candidateWidths({ sourceWidth: 12 })).toEqual([12]);
+  it('offers the smallest rung when the source is smaller than every rung', () => {
+    // Not the native 12: the edge snaps every requested width up to a rung, so a
+    // `12w` candidate would advertise a width the delivered bytes never have and
+    // name a key the generator refuses. `withoutEnlargement` still delivers 12px.
+    expect(candidateWidths({ sourceWidth: 12 })).toEqual([16]);
   });
 
   it('respects an explicit width list, still capped at the source', () => {
@@ -127,7 +130,7 @@ describe('candidate set is chosen by how the image renders', () => {
   });
 
   it('caps a fixed-size candidate set at the source', () => {
-    expect(candidateWidths({ sourceWidth: 12, sizes: '48px', targetWidth: 48 })).toEqual([12]);
+    expect(candidateWidths({ sourceWidth: 12, sizes: '48px', targetWidth: 48 })).toEqual([16]);
   });
 
   it('collapses to one candidate when 1x and 2x share a rung', () => {
@@ -144,9 +147,10 @@ describe('defaultWidth', () => {
     expect(defaultWidth(4000)).toBe(1080);
   });
 
-  it('never exceeds the source', () => {
+  it('never exceeds the source, and never leaves the ladder', () => {
     expect(defaultWidth(500)).toBe(480);
-    expect(defaultWidth(12)).toBe(12);
+    // A sub-rung source still resolves to a rung — every width in a URL is one.
+    expect(defaultWidth(12)).toBe(16);
   });
 });
 

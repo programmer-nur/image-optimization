@@ -104,6 +104,43 @@ The generator gets more memory than the optimizer because its latency is user-vi
 a miss blocks a viewer, while the optimizer runs behind a queue where nobody is
 waiting.
 
+## Optimizer concurrency
+
+`optimizerMaxConcurrency` (10 / 5 in staging) — an event-source cap, not reserved
+concurrency on the function.
+
+**This is a database-connection budget.** Each optimizer invocation opens its own
+Postgres connection (the Lambda client pins its pool to one), against an instance the
+control plane shares. Unbounded, a bulk import scales the consumer into hundreds of
+invocations and cures its own backlog by exhausting the connections the API needs to
+accept uploads.
+
+The production arithmetic: the API can hold up to 10 connections per task across 10
+tasks (100), the generator's bookkeeping writes can add up to its reserved concurrency
+(50), and a `t4g.small`'s default `max_connections` is roughly 225. Staging is 5
+against a `t4g.micro` (~112). Raise it once you have observed headroom — this is one of
+the numbers the load test (13.7) exists to replace.
+
+Event-source concurrency rather than reserved concurrency, deliberately: reserved
+concurrency permanently carves capacity out of the account pool, which is right for the
+generator (its cap bounds spend on the viewer path) and wrong here, where the only
+thing being protected is the database.
+
+## Queue visibility
+
+`queue.visibilityTimeout` (30 min) against `optimizerTimeout` (5 min).
+
+The rule is **about six times the consumer's timeout**, not merely greater than it. The
+visibility clock starts when the poller receives the batch, not when the function
+starts, so a batch that runs to its own timeout would otherwise be redelivered while
+the first attempt's writes were still landing. The work is idempotent, so the cost is
+not corruption — it is burnt receives: five of them dead-letter a message that never
+actually failed, and the DLQ alarm then reports a problem that does not exist.
+
+Envelope: 5 receives x 30 minutes = 2.5 hours worst case in flight, comfortably inside
+the queue's 4-day retention. Do not instead shorten the optimizer's timeout; 5 minutes
+is sized for the warm set on a large source.
+
 ## CloudFront price class
 
 `delivery.priceClass` — `PriceClass_100` in staging, `PriceClass_All` in production.
@@ -115,7 +152,8 @@ improvements for viewers elsewhere. If your audience is regional, this is free m
 ## Lifecycle windows
 
 `ORPHAN_SAFETY_WINDOW_HOURS` (24), `SUPERSEDED_RETENTION_DAYS` (30),
-`PENDING_UPLOAD_TTL_HOURS` (24), `MAX_DELETIONS_PER_RUN` (10000).
+`PENDING_UPLOAD_TTL_HOURS` (24), `MAX_DELETIONS_PER_RUN` (10000),
+`STALLED_OPTIMIZE_HOURS` (6), `MAX_REENQUEUES_PER_RUN` (500).
 
 **These are safety margins, not tuning knobs.** Shortening one makes reclamation race
 the system it is cleaning up after, and the objects at stake include originals — the
@@ -127,7 +165,23 @@ state during generation, not an orphan. Shorten this and you will delete derivat
 that are about to be served, and the generator will regenerate them, forever.
 
 `SUPERSEDED_RETENTION_DAYS` is how long consumer pages referencing the previous
-version's URLs keep working. Lengthen it if your consumers cache HTML aggressively.
+version's URLs keep working, measured from the moment the version was _superseded_ —
+a stored timestamp, not the version's own age. Lengthen it if your consumers cache HTML
+aggressively.
+
+`STALLED_OPTIMIZE_HOURS` is the one window that governs a job which _creates_ work: an
+asset left in `stored` past it has its optimization re-enqueued, because a failed
+enqueue cannot fail an upload and the job is otherwise lost silently. It must clear
+SQS's own retry ceiling (visibility timeout x `maxReceiveCount` — 2.5 hours at the
+defaults) so reconciliation never races a redelivery still in flight. Being wrong in
+the enqueue direction costs one idempotent invocation; being wrong the other way leaves
+an asset that never becomes `ready`.
+
+`NONCURRENT_VERSION_EXPIRY_DAYS` (30) and its staging counterpart (1 day) are the
+recovery window under a versioned bucket — how long a deleted original remains
+restorable, and how long unvalidated staging bytes persist after they are "deleted".
+The staging number is short on purpose: it covers bytes a malware scan may be about to
+reject.
 
 ## Storage tiering
 

@@ -20,6 +20,7 @@ import {
   DEFAULT_FIT,
   DEFAULT_GRAVITY,
   type BlurLevel,
+  type CanonicalFit,
   type CropGravity,
   type FitMode,
   type SharpenLevel,
@@ -28,6 +29,7 @@ import {
   fitCrops,
   fitUsesBackground,
   normalizeBackground,
+  normalizeFit,
   quantizeBlur,
   quantizeSharpen,
 } from './effects.js';
@@ -65,8 +67,11 @@ export interface TransformSpec {
   height?: number;
   format: OutputFormat;
   quality: QualityLevel;
-  /** Present only when a height constraint makes the fit mode meaningful. */
-  fit?: FitMode;
+  /**
+   * Present only when a height constraint makes the fit mode meaningful, and always
+   * canonical — `pad` has already collapsed onto `contain`.
+   */
+  fit?: CanonicalFit;
   /** Present only when the fit crops and gravity is non-default. */
   gravity?: CropGravity;
   /** Present only when the fit pads. Canonical lowercase hex, no leading `#`. */
@@ -231,8 +236,12 @@ export function parseTransform(
   // Fit is meaningful only when *both* dimensions are constrained. With one
   // dimension the resize is proportional and every fit mode yields the same pixels,
   // so `?h=480` and `?h=480&fit=contain` must share a key.
+  //
+  // `pad` collapses onto `contain` here rather than surviving into the key: the two
+  // reach sharp as the same call and produce the same bytes, so two keys would mean
+  // two objects holding one image.
   const boxConstrained = width !== undefined && height !== undefined;
-  const fit = fitRaw ?? DEFAULT_FIT;
+  const fit = normalizeFit(fitRaw ?? DEFAULT_FIT);
 
   if (boxConstrained) {
     spec.fit = fit;

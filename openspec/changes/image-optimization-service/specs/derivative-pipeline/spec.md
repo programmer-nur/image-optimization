@@ -105,7 +105,7 @@ The on-demand generator SHALL have a reserved concurrency limit so that a burst 
 
 ### Requirement: Retry and dead-lettering
 
-Optimization jobs SHALL be retried with backoff on transient failure and MUST be routed to a dead-letter queue after the configured maximum attempts.
+Optimization jobs SHALL be retried with backoff on transient failure and MUST be routed to a dead-letter queue after the configured maximum attempts. A failure classified as terminal SHALL be acknowledged rather than retried or dead-lettered, so the dead-letter queue holds only work that repeated attempts failed to complete.
 
 #### Scenario: Transient storage error during optimization
 
@@ -115,12 +115,12 @@ Optimization jobs SHALL be retried with backoff on transient failure and MUST be
 #### Scenario: Permanently corrupt source
 
 - **WHEN** the worker classifies a failure as non-retriable, such as a corrupt source
-- **THEN** the job is sent to the dead-letter queue immediately without consuming retry attempts, and the asset status becomes `failed` with a reason
+- **THEN** the asset status becomes `failed` with a machine-readable reason and the message is acknowledged, because redelivering it would burn the retry budget to reach the same conclusion and then park an unactionable message in a queue whose alarm has no tolerance
 
 #### Scenario: Dead-letter queue receives a message
 
 - **WHEN** any message arrives in the dead-letter queue
-- **THEN** an alarm fires, because the queue is expected to remain empty
+- **THEN** an alarm fires, because the queue is expected to remain empty: terminal failures never arrive here, so anything that does is retriable work that never succeeded
 
 ### Requirement: Idempotent job processing
 

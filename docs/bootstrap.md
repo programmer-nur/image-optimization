@@ -86,10 +86,20 @@ aws ecr get-login-password --region $CDK_REGION \
   | docker login --username AWS --password-stdin \
       $CDK_ACCOUNT.dkr.ecr.$CDK_REGION.amazonaws.com
 
-docker build -f apps/api/Dockerfile -t <repositoryUri>:v1 .
+# `--platform linux/amd64` is required, not optional. Both Fargate task definitions
+# declare X86_64; an image built on an arm64 machine (any Apple Silicon laptop, and
+# the same machine the sharp layer's arm64 build wants) pushes fine, deploys fine,
+# and then never starts — the error names the manifest, not the architecture.
+docker build --platform linux/amd64 -f apps/api/Dockerfile -t <repositoryUri>:v1 .
 docker push <repositoryUri>:v1
 export API_IMAGE_TAG=v1
 ```
+
+`API_IMAGE_TAG` is required and must name an immutable tag. Synthesis fails without
+it, and refuses `latest`: the tag is the rollback coordinate, and a mutable one makes
+"redeploy the previous version" ambiguous — the same tag can point at different bytes
+on two consecutive days, and the service and the migration task can silently disagree
+about which version they are.
 
 Then everything:
 
@@ -128,7 +138,7 @@ const { generateApiKey } = require('./apps/api/dist/modules/auth/api-key.js');
 const k = generateApiKey();
 console.log('PLAINTEXT (store now):', k.plaintext);
 console.log('INSERT INTO api_keys (id, name, hash, permissions, created_at) VALUES (\'' +
-  k.keyId + \"', 'bootstrap', '\" + k.hash + \"', ARRAY['upload','delete','admin'], now());\");
+  k.keyId + \"', 'bootstrap', '\" + k.hash + \"', ARRAY['read','upload','delete','admin'], now());\");
 "
 ```
 

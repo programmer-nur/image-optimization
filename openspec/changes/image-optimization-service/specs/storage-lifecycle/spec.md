@@ -62,7 +62,7 @@ Derivative objects SHALL remain in a storage class optimized for frequent access
 
 ### Requirement: Superseded version retention
 
-Derivatives belonging to a superseded asset version SHALL be retained for a configurable grace period and then removed.
+Derivatives belonging to a superseded asset version SHALL be retained for a configurable grace period and then removed. The grace period SHALL be measured from the moment the version was superseded, which MUST be recorded when its successor is written — never from the version's own creation, which would make a long-lived source deletable on the first reclamation run after it was replaced. A version whose supersession moment is unknown SHALL NOT be reclaimed.
 
 #### Scenario: Source is replaced and HTML is still cached
 
@@ -71,8 +71,18 @@ Derivatives belonging to a superseded asset version SHALL be retained for a conf
 
 #### Scenario: Grace period elapses
 
-- **WHEN** the retention window for a superseded version expires
+- **WHEN** the retention window for a superseded version expires, measured from when it was superseded
 - **THEN** that version's derivatives and original are removed and its bookkeeping rows are cleared
+
+#### Scenario: A long-lived source is replaced
+
+- **WHEN** a source that has been current for far longer than the retention window is replaced
+- **THEN** its objects survive the full window from the replacement, because that is when consumer pages began referencing the new URLs
+
+#### Scenario: The supersession moment is unknown
+
+- **WHEN** a superseded version carries no recorded supersession time
+- **THEN** reclamation leaves it alone, because an unknown must fail toward keeping and the objects at stake include an original
 
 ### Requirement: Deletion propagates across all layers
 
@@ -109,12 +119,17 @@ A scheduled maintenance job SHALL reconcile stored objects against the registry 
 
 ### Requirement: Storage accounting
 
-The service SHALL track byte totals per asset and in aggregate, distinguishing originals, masters, and derivatives.
+The service SHALL track byte totals per asset and in aggregate, distinguishing originals, masters, and derivatives, and MUST emit the aggregate totals as metrics rather than only logging them.
 
 #### Scenario: Operator reviews storage growth
 
 - **WHEN** an operator inspects storage metrics
 - **THEN** totals are reported separately for originals, masters, and derivatives, so the cost effect of warm-set configuration is directly visible
+
+#### Scenario: A scheduled run completes
+
+- **WHEN** the maintenance run finishes
+- **THEN** it emits the per-tier totals and a heartbeat, so a dashboard can show the trend and an alarm can fire on the _absence_ of a run — reclamation stopping produces no errors of its own, and storage simply grows
 
 ### Requirement: Encryption at rest
 

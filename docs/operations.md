@@ -122,6 +122,10 @@ every message uniformly.
 Usually cache-key fragmentation — a parameter reaching the cache key that should have
 been normalized away.
 
+0. Confirm the metric is real. `CacheHitRate` is an _additional_ CloudFront metric and
+   is published only while the distribution's monitoring subscription exists — without
+   it the alarm sits in INSUFFICIENT_DATA and reads as healthy, so a hit rate that
+   "looks fine" is worth verifying against the graph before trusting it.
 1. Confirm the cache policy still includes **no** query strings, headers, or cookies.
 2. Confirm the edge function is attached on viewer-request. An unattached function
    passes the query string straight through, and every distinct URL becomes its own
@@ -143,8 +147,12 @@ Check the asset's `status`:
 - **`rejected`** — terminal, with a `failureReason`. Retrying identical bytes cannot
   help.
 - **`failed`** — recoverable; use reprocess.
-- **`stored` but never `ready`** — the optimize job did not complete. See the queue
-  sections above.
+- **`stored` but never `ready`** — the optimize job did not complete, or was never
+  queued at all. A failed enqueue cannot fail an upload (the bytes are already
+  durable), so the job is simply lost. The daily maintenance run re-enqueues anything
+  left in `stored` past `STALLED_OPTIMIZE_HOURS`, capped at `MAX_REENQUEUES_PER_RUN`
+  per run — so the first question is whether that run is happening at all. Check the
+  `maintenance-stalled` alarm before investigating the optimizer.
 
 ## Cost review
 
@@ -213,3 +221,96 @@ curl -X DELETE https://api/v1/keys/<oldKeyId> -H "x-api-key: $ADMIN"
 Revocation takes effect on the next request. It is a soft delete: the row carries the
 quota accounting and is referenced by the assets that key uploaded, and destroying that
 history during an incident is the last thing anyone wants.
+
+## Running SQL, or anything else, against the database
+
+The database lives in isolated subnets: nothing reaches it from outside the VPC, and
+there is no bastion. That is deliberate, and it means "just connect and run a query"
+is not available. The sanctioned path is the migration task definition, which already
+carries the connection parts and the password secret — override its command instead of
+opening a shell:
+
+```bash
+aws ecs run-task \
+  --cluster "$(aws cloudformation describe-stacks --stack-name Imgopt-staging-Compute \
+      --query "Stacks[0].Outputs[?OutputKey=='ClusterName'].OutputValue" --output text)" \
+  --task-definition "$(aws cloudformation describe-stacks --stack-name Imgopt-staging-Compute \
+      --query "Stacks[0].Outputs[?OutputKey=='MigrationTaskDefinition'].OutputValue" --output text)" \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SG],assignPublicIp=DISABLED}" \
+  --overrides '{"containerOverrides":[{"name":"migrate","command":["node","packages/db/scripts/migrate.mjs"]}]}'
+```
+
+`$SUBNETS` and `$SG` are the `MigrationSubnetIds` and `MigrationSecurityGroupId`
+outputs of the same stack — they are emitted precisely because finding them by hand is
+where this procedure stalls.
+
+Swap the `command` for any script the image ships. The image contains no `psql`, so
+this is a Node entry point, not a SQL prompt; write the one-off as a script rather than
+reaching for a shell.
+
+## A malware verdict arrives after promotion
+
+Scanning is asynchronous, so a `THREATS_FOUND` verdict can land after an upload has
+already been promoted — the fail-open path admits exactly this, and it is the reason
+fail-closed is the default.
+
+The quarantine handler covers `staging/` only. Once bytes are under `original/`,
+removing them is an operator action:
+
+```bash
+curl -X DELETE "https://$API/v1/images/$ASSET_ID" -H "x-api-key: $ADMIN"
+# then purge the noncurrent versions, or the bytes remain for the recovery window
+aws s3api list-object-versions --bucket "$BUCKET" --prefix "original/$ASSET_ID/"
+aws s3api delete-object --bucket "$BUCKET" --key "$KEY" --version-id "$VERSION_ID"
+```
+
+**Viewers were never exposed to the file itself.** Delivered bytes are always
+re-encoded pipeline output, so a polyglot or an embedded payload does not survive into
+a derivative — that is a structural property, not a detection result. What is at stake
+is the object at rest and anything that later reads originals directly.
+
+## Restore and disaster recovery
+
+Read this before you need it. The recovery story differs per store, and only one of
+them is a restore in the usual sense.
+
+**S3 is the authority, and it is versioned.** Every derivative can be regenerated from
+its original, so the only irreplaceable bytes are under `original/`. The bucket keeps
+noncurrent versions, so a delete — by a defect, a bad reclamation run, or a mistaken
+`DELETE /v1/images/:id` — leaves a delete marker with the object beneath it:
+
+```bash
+# What versions exist for one key
+aws s3api list-object-versions --bucket "$BUCKET" --prefix "original/$ASSET_ID/"
+
+# Undo a delete: remove the marker, and the previous version becomes current again
+aws s3api delete-object --bucket "$BUCKET" --key "$KEY" --version-id "$DELETE_MARKER_ID"
+```
+
+The recovery window is `noncurrentVersionExpiryDays` (30 by default), and one day for
+`staging/`. Past that the bytes are gone. **A legal takedown therefore needs both
+steps** — delete the object, then delete its noncurrent versions by id — or the bytes
+remain in the bucket for the retention window.
+
+**PostgreSQL restores by point in time.** Automated backups retain 3 days in staging
+and 14 in production (`infra/cdk/lib/config.ts`). RDS restores to a _new instance_, so
+a restore is a cutover:
+
+1. `aws rds restore-db-instance-to-point-in-time --source-db-instance-identifier <id> --target-db-instance-identifier <id>-restored --restore-time <iso8601>`
+2. Point the compute stack at the restored instance and redeploy, or rename the
+   instances during a maintenance window.
+3. Reconcile. This is the part that is unusually forgiving here: the registry is
+   _bookkeeping_, not the authority. Objects the restored registry has never heard of
+   are not orphans to be deleted — the maintenance job's safety window and
+   fail-toward-keeping posture handle exactly this case, and the generator rewrites
+   missing derivative rows on the next miss for each key. Run the maintenance job in
+   dry-run first (`MAINTENANCE_DRY_RUN=true`) and read the report before letting it
+   delete anything after a restore.
+
+**What a database restore cannot recover** is an asset whose row was created after the
+restore point: its objects exist, and nothing references them. They are collected as
+orphans once they age past the safety window, which is the correct outcome.
+
+**Practise it on staging.** None of the above has been executed against a real AWS
+account — see the deployment-verification items in the release checklist.

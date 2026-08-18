@@ -31,6 +31,7 @@ export interface ObservabilityStackProps extends StackProps {
   deadLetterQueueName: string;
   generatorFunctionName: string;
   optimizerFunctionName: string;
+  maintenanceFunctionName: string;
   distributionId: string;
   loadBalancerFullName: string;
   targetGroupFullName: string;
@@ -200,6 +201,121 @@ export class ObservabilityStack extends Stack {
       }),
     );
 
+    // ---- the functions themselves -----------------------------------------
+
+    /*
+     * Everything above watches metrics the handlers emit, which means none of it can
+     * see a function that never reached its handler: an init failure, an out-of-memory
+     * kill, a timeout, or a throttle. Those produce no custom metric at all — and a
+     * missing metric reads as health.
+     */
+    const lambdaMetric = (fn: string, metricName: string, period: Duration): cloudwatch.Metric =>
+      new cloudwatch.Metric({
+        namespace: 'AWS/Lambda',
+        metricName,
+        dimensionsMap: { FunctionName: fn },
+        statistic: 'Sum',
+        period,
+      });
+
+    /*
+     * Generator throttling — the designed fail-fast, and the one failure that makes
+     * every other delivery metric look *better*.
+     *
+     * Reserved concurrency exists to bound spend under a miss storm, so reaching it
+     * is working as intended exactly once; sustained, it means viewers are getting
+     * errors. A throttled invocation never runs, so it emits no custom metric and
+     * on-demand generation *falls* — the graph that would otherwise raise the alarm
+     * moves the reassuring way.
+     *
+     * Threshold zero rather than a tolerance: hitting the ceiling at all is the cue
+     * to raise it or to find the storm.
+     */
+    alarm(
+      new cloudwatch.Alarm(this, 'GeneratorThrottledAlarm', {
+        alarmName: `imgopt-${config.name}-generator-throttled`,
+        alarmDescription:
+          'The generator is being throttled by its reserved concurrency. Viewers are ' +
+          'seeing errors on cache misses; find the miss storm or raise the ceiling.',
+        metric: lambdaMetric(props.generatorFunctionName, 'Throttles', Duration.minutes(5)),
+        threshold: 0,
+        evaluationPeriods: 1,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+        // "Did a throttle happen" — absence really is the healthy answer here.
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+    );
+
+    for (const [id, name, fn] of [
+      ['GeneratorErrorsAlarm', 'generator', props.generatorFunctionName],
+      ['OptimizerErrorsAlarm', 'optimizer', props.optimizerFunctionName],
+    ] as const) {
+      alarm(
+        new cloudwatch.Alarm(this, id, {
+          alarmName: `imgopt-${config.name}-${name}-errors`,
+          alarmDescription: `The ${name} function is failing at the runtime level.`,
+          metric: lambdaMetric(fn, 'Errors', Duration.minutes(5)),
+          threshold: config.observability.lambdaErrorsPer5Min,
+          evaluationPeriods: 2,
+          comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+          treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+        }),
+      );
+    }
+
+    alarm(
+      new cloudwatch.Alarm(this, 'MaintenanceErrorsAlarm', {
+        alarmName: `imgopt-${config.name}-maintenance-errors`,
+        alarmDescription: 'The scheduled maintenance run failed.',
+        // A once-a-day job has no tolerance for a failed run: one failure is a day
+        // with no reclamation at all.
+        metric: lambdaMetric(props.maintenanceFunctionName, 'Errors', Duration.days(1)),
+        threshold: 0,
+        evaluationPeriods: 1,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+    );
+
+    /*
+     * The heartbeat, and the one inverted alarm in this stack.
+     *
+     * `MaintenanceRuns` is emitted only by a run that completed, so *missing data is
+     * the failure* — hence BREACHING, where every other alarm here is NOT_BREACHING.
+     * Getting that backwards would reproduce the cache-hit-rate defect exactly: a
+     * detector that reads healthy forever precisely because nothing is being emitted.
+     *
+     * Not `AWS/Lambda Invocations`, which counts an invocation that died mid-walk
+     * while reclaiming nothing.
+     *
+     * Twelve-hour periods rather than a day, because CloudWatch caps period x
+     * evaluationPeriods at 86,400 seconds and two periods are what tolerate schedule
+     * jitter. A daily run lands in one of the two windows, so 2-of-2 breaching is
+     * impossible while the job runs at all.
+     *
+     * A freshly deployed stack sits in ALARM until the first successful run. That is
+     * intended, and is the cheapest possible proof the whole path works.
+     */
+    alarm(
+      new cloudwatch.Alarm(this, 'MaintenanceStalledAlarm', {
+        alarmName: `imgopt-${config.name}-maintenance-stalled`,
+        alarmDescription:
+          'No maintenance run has completed in a day. Reclamation has stopped, which ' +
+          'produces no errors of its own — storage simply grows.',
+        metric: new cloudwatch.Metric({
+          namespace: NAMESPACE,
+          metricName: METRICS.maintenanceRuns,
+          statistic: 'Sum',
+          period: Duration.hours(12),
+        }),
+        threshold: 1,
+        evaluationPeriods: 2,
+        datapointsToAlarm: 2,
+        comparisonOperator: cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
+        treatMissingData: cloudwatch.TreatMissingData.BREACHING,
+      }),
+    );
+
     // ---- delivery health --------------------------------------------------
 
     const cacheHitRate = new cloudwatch.Metric({
@@ -223,6 +339,35 @@ export class ObservabilityStack extends Stack {
         evaluationPeriods: 4,
         comparisonOperator: cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
         // Missing data here means no traffic, which is not a cache problem.
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+    );
+
+    /*
+     * Server errors at the edge.
+     *
+     * A default CloudFront metric, so unlike `CacheHitRate` it needs no monitoring
+     * subscription and costs nothing — but it carries the same us-east-1 constraint,
+     * because CloudFront publishes only there.
+     */
+    alarm(
+      new cloudwatch.Alarm(this, 'CdnServerErrorAlarm', {
+        alarmName: `imgopt-${config.name}-cdn-5xx`,
+        alarmDescription:
+          'The distribution is returning server errors — the generator failing, or ' +
+          'both origins in an origin group failing.',
+        metric: new cloudwatch.Metric({
+          namespace: 'AWS/CloudFront',
+          metricName: '5xxErrorRate',
+          dimensionsMap: { DistributionId: props.distributionId, Region: 'Global' },
+          statistic: 'Average',
+          period: Duration.minutes(5),
+          region: 'us-east-1',
+        }),
+        threshold: config.observability.cdnServerErrorPercent,
+        evaluationPeriods: 2,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+        // Missing data means no traffic, not no errors.
         treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
       }),
     );
@@ -267,6 +412,39 @@ export class ObservabilityStack extends Stack {
         evaluationPeriods: 3,
         comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
         treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+    );
+
+    /*
+     * Zero healthy targets, which the unhealthy-tasks alarm above cannot see.
+     *
+     * `UnHealthyHostCount` needs registered targets to report on; with none
+     * registered there are no datapoints at all, and NOT_BREACHING reads that as
+     * healthy. So the total-outage case — every task gone — is precisely the case the
+     * existing alarm is blind to.
+     */
+    alarm(
+      new cloudwatch.Alarm(this, 'NoHealthyTasksAlarm', {
+        alarmName: `imgopt-${config.name}-no-healthy-tasks`,
+        alarmDescription: 'No control-plane task is passing its readiness check.',
+        metric: new cloudwatch.Metric({
+          namespace: 'AWS/ApplicationELB',
+          metricName: 'HealthyHostCount',
+          dimensionsMap: {
+            LoadBalancer: props.loadBalancerFullName,
+            TargetGroup: props.targetGroupFullName,
+          },
+          // Maximum, not Minimum: with targets spread across availability zones, a
+          // zone with none of them would drag a Minimum to zero and fire this on a
+          // perfectly healthy service.
+          statistic: 'Maximum',
+          period: Duration.minutes(1),
+        }),
+        threshold: 1,
+        evaluationPeriods: 3,
+        comparisonOperator: cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
+        // No datapoints means nothing is registered, which is the outage.
+        treatMissingData: cloudwatch.TreatMissingData.BREACHING,
       }),
     );
 

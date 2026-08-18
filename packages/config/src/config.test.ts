@@ -47,6 +47,54 @@ describe('loadConfig', () => {
     expect(cfg.storage.forcePathStyle).toBe(true);
   });
 
+  /*
+   * `"false"` must mean false.
+   *
+   * Zod's `coerce.boolean()` is `Boolean(value)`, and every environment variable is a
+   * string — so it read `"false"` as **true**. The CDK writes these values literally,
+   * which made the consequences concrete rather than theoretical: a deployment with
+   * scanning switched off announced `UPLOAD_MALWARE_SCAN_ENABLED=false`, the app read
+   * it as enabled, and fail-closed then held every upload forever waiting on a
+   * scanner that did not exist. `MAINTENANCE_DRY_RUN=false` likewise produced a
+   * reclamation job that never deleted anything.
+   */
+  it('reads a boolean by its spelling, not by truthiness', () => {
+    for (const [value, expected] of [
+      ['false', false],
+      ['FALSE', false],
+      ['0', false],
+      ['no', false],
+      ['off', false],
+      ['true', true],
+      ['1', true],
+      ['yes', true],
+      [' true ', true],
+    ] as const) {
+      const cfg = loadConfig({
+        ...minimal,
+        UPLOAD_MALWARE_SCAN_ENABLED: value,
+        MAINTENANCE_DRY_RUN: value,
+      });
+
+      expect(cfg.upload.malwareScanEnabled, value).toBe(expected);
+      expect(cfg.lifecycle.dryRun, value).toBe(expected);
+    }
+  });
+
+  it('refuses a boolean spelling it does not recognize', () => {
+    // A typo in the flag that decides whether uploads are held should stop the
+    // process, not silently resolve to whichever side happens to be truthy.
+    expect(() => loadConfig({ ...minimal, MAINTENANCE_DRY_RUN: 'ture' })).toThrow(ConfigError);
+  });
+
+  it('refuses to boot with SVG support requested', () => {
+    // The flag does not enable SVG — it enables a 422 that blames the uploader for an
+    // operator's setting. Refusing at startup puts the message where the decision was.
+    expect(() => loadConfig({ ...minimal, UPLOAD_ALLOW_SVG: 'true' })).toThrow(ConfigError);
+    // And an explicit `false` is still a perfectly ordinary thing to write down.
+    expect(loadConfig({ ...minimal, UPLOAD_ALLOW_SVG: 'false' }).upload.allowSvg).toBe(false);
+  });
+
   it('treats an empty string as absent so the default applies', () => {
     expect(loadConfig({ ...minimal, LOG_LEVEL: '' }).logLevel).toBe('info');
   });

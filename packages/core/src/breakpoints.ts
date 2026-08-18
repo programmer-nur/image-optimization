@@ -75,8 +75,13 @@ export function snapUp(width: number): number {
 }
 
 /**
- * Largest ladder value <= `sourceWidth`. Sources narrower than the smallest ladder
- * entry keep their native width — a 12px source has no sensible bucket.
+ * Largest ladder value <= `sourceWidth`, never below the smallest rung.
+ *
+ * A source narrower than the smallest rung — a 12px sprite — has no bucket of its
+ * own, and must not get one. The edge normalizer snaps every requested width up to a
+ * rung, so a key at native width 12 is a key no viewer URL can ever ask for: bytes
+ * written once and read never. It floors at the smallest rung instead, where the
+ * pipeline's `withoutEnlargement` still delivers the source's own 12 pixels.
  */
 export function capToSource(width: number, sourceWidth: number): number {
   if (width <= sourceWidth) return width;
@@ -86,7 +91,12 @@ export function capToSource(width: number, sourceWidth: number): number {
     if (candidate <= sourceWidth) capped = candidate;
     else break;
   }
-  return capped ?? sourceWidth;
+  return capped ?? MIN_LADDER_WIDTH;
+}
+
+/** Whether a width is a ladder rung — the only widths a canonical key may carry. */
+export function isLadderWidth(width: number): boolean {
+  return LADDER.includes(width);
 }
 
 /**
@@ -142,12 +152,51 @@ export function quantizeRatio(ratio: number): number {
 }
 
 /**
+ * Whether a height is one the ratio quantizer can produce for this width.
+ *
+ * The generator's guarantee is that a key it accepts is a key the edge could have
+ * asked for. Widths are checked against the ladder; heights cannot be, because they
+ * are derived from a quantized *ratio* rather than snapped. This is the height half
+ * of that check, and it is deliberately a superset of the reachable set: it accepts
+ * every height `resolveDimensions` can emit — rejecting one would 400 a legitimate
+ * viewer URL permanently — while bounding the axis to at most ~2000 values per
+ * width, which is what closes the unbounded-key-space hole. See design.md D3.
+ *
+ * Arithmetic is kept identical to the producing path, `Math.round(width * ratio)`,
+ * down to the operation order: `width * (k / 100)` and `width * k / 100` differ in
+ * the last bit often enough to reject real keys.
+ */
+export function isQuantizedHeight(width: number, height: number): boolean {
+  for (const ratio of RATIOS) {
+    if (Math.round(width * ratio) === height) return true;
+  }
+
+  // The non-listed branch rounds the ratio to two decimals, so the only candidates
+  // are k/100 for integer k. Rounding is monotonic in k, so the neighbourhood of the
+  // implied k is exhaustive.
+  const approx = (height * 100) / width;
+  const lower = Math.floor(approx) - 1;
+  for (let k = lower; k <= lower + 3; k += 1) {
+    if (k < MIN_RATIO * 100 || k > MAX_RATIO * 100) continue;
+    if (Math.round(width * (k / 100)) === height) return true;
+  }
+
+  return false;
+}
+
+/**
  * Resolves the output box.
  *
  * With only a width, height follows the source's own proportions and contributes
  * nothing to the key. With both, the width snaps to the ladder and the height is
  * derived from the quantized ratio. With only a height, the height snaps to the
  * ladder and the width follows the source.
+ *
+ * Both requested values are floored at one pixel first. Zero is the case that
+ * matters: `?w=0&h=0` would otherwise divide zero by zero, carry NaN through the
+ * ratio, and produce an `hNaN` key — one the edge emits happily and the generator
+ * then refuses forever. Clamping matches how every other out-of-range number here is
+ * treated, so a slightly wrong URL keeps working.
  */
 export function resolveDimensions(input: {
   width?: number | undefined;
@@ -155,7 +204,9 @@ export function resolveDimensions(input: {
   dpr?: number | undefined;
   sourceWidth?: number | undefined;
 }): { width?: number; height?: number } {
-  const { width, height, dpr = 1, sourceWidth } = input;
+  const { dpr = 1, sourceWidth } = input;
+  const width = input.width === undefined ? undefined : Math.max(input.width, 1);
+  const height = input.height === undefined ? undefined : Math.max(input.height, 1);
 
   if (width !== undefined && height !== undefined) {
     const w = snapWidth(width, dpr, sourceWidth);

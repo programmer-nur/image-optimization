@@ -17,6 +17,9 @@ import { Duration } from 'aws-cdk-lib';
 import * as wafv2 from 'aws-cdk-lib/aws-wafv2';
 import type { Construct } from 'constructs';
 
+/** Key for the shared JSON body returned on a rate-limited request. */
+const RATE_LIMITED_BODY = 'RateLimited';
+
 export interface RateLimitConfig {
   /** Requests per five-minute window, per source IP, on mutating paths. */
   mutatingRequestsPer5Min: number;
@@ -46,10 +49,42 @@ export function createControlPlaneWebAcl(
 ): wafv2.CfnWebACL {
   const limits = options.limits ?? DEFAULT_RATE_LIMITS;
 
+  /*
+   * 429, not WAF's default 403.
+   *
+   * The distinction is the whole point of the status code: 403 tells a client it is
+   * not allowed to do this, so a well-behaved one stops and a human starts debugging
+   * credentials. 429 tells it to slow down and try again, which is what is actually
+   * true — and it is what the platform-security spec requires. `Retry-After` names
+   * the window rather than leaving the client to guess it.
+   *
+   * Declared inside the function on purpose: `WAF_BLOCK_WINDOW` is defined below, and
+   * a module-scope const would read it in its temporal dead zone and throw at import.
+   */
+  const rateLimited: wafv2.CfnWebACL.RuleActionProperty = {
+    block: {
+      customResponse: {
+        responseCode: 429,
+        responseHeaders: [{ name: 'retry-after', value: String(WAF_BLOCK_WINDOW.toSeconds()) }],
+        customResponseBodyKey: RATE_LIMITED_BODY,
+      },
+    },
+  };
+
   return new wafv2.CfnWebACL(scope, id, {
     name: `imgopt-${options.environment}-api`,
     scope: 'REGIONAL',
     defaultAction: { allow: {} },
+    // Shares the error envelope the API itself uses, so a client branches on `code`
+    // the same way whether the rejection came from WAF or from the application.
+    customResponseBodies: {
+      [RATE_LIMITED_BODY]: {
+        contentType: 'APPLICATION_JSON',
+        content: JSON.stringify({
+          error: { code: 'rate_limited', message: 'Too many requests. Retry shortly.' },
+        }),
+      },
+    },
     visibilityConfig: {
       cloudWatchMetricsEnabled: true,
       metricName: `imgopt-${options.environment}-api`,
@@ -60,7 +95,7 @@ export function createControlPlaneWebAcl(
         // Mutating paths first, so the tighter budget wins when both would match.
         name: 'RateLimitMutating',
         priority: 0,
-        action: { block: {} },
+        action: rateLimited,
         statement: {
           rateBasedStatement: {
             limit: limits.mutatingRequestsPer5Min,
@@ -88,7 +123,7 @@ export function createControlPlaneWebAcl(
       {
         name: 'RateLimitOverall',
         priority: 1,
-        action: { block: {} },
+        action: rateLimited,
         statement: {
           rateBasedStatement: {
             limit: limits.overallRequestsPer5Min,

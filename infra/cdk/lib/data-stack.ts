@@ -11,6 +11,7 @@
 
 import { CfnOutput, Stack, type StackProps } from 'aws-cdk-lib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
+import * as logs from 'aws-cdk-lib/aws-logs';
 import * as rds from 'aws-cdk-lib/aws-rds';
 import type * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import type { Construct } from 'constructs';
@@ -47,8 +48,23 @@ export class DataStack extends Stack {
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_ISOLATED },
       securityGroups: [databaseSecurityGroup],
       databaseName: this.databaseName,
-      // Generated, rotated in Secrets Manager, and never materialized in a template
-      // parameter or an environment variable in source.
+      /*
+       * Generated into Secrets Manager, and never materialized in a template
+       * parameter or an environment variable in source.
+       *
+       * NOT rotated. The comment here used to claim rotation, and none is configured
+       * — a claim an auditor checks and a reader relies on. Configuring it is not the
+       * one-liner it looks like either: `addRotationSingleUser` provisions a Lambda
+       * that must reach both the database and the Secrets Manager endpoint, and it
+       * calls `allowDefaultPortFrom` on a security group this stack does not own, so
+       * it would synthesize a Network↔Data cycle unless the group, subnets, and
+       * endpoint are all threaded through. It also needs the consumers to tolerate a
+       * password changing under them: the container resolves `DB_PASSWORD` once at
+       * task start and the Lambdas memoize it for the life of the container.
+       *
+       * So rotation is a change with a blast radius, not a flag — recorded here as an
+       * open item rather than implied by a comment.
+       */
       credentials: rds.Credentials.fromGeneratedSecret('imgopt'),
       allocatedStorage: config.database.allocatedStorageGb,
       storageEncrypted: true,
@@ -58,6 +74,14 @@ export class DataStack extends Stack {
       deletionProtection: config.database.multiAz,
       removalPolicy: config.removalPolicy,
       cloudwatchLogsExports: ['postgresql'],
+      /*
+       * The one log path in the deployment that would otherwise never expire.
+       *
+       * RDS creates the exported log group itself, and without this CDK leaves it at
+       * "never expire" — every application log group in the system has a retention,
+       * so this was the single unbounded one, quietly accruing cost forever.
+       */
+      cloudwatchLogsRetention: logs.RetentionDays.THREE_MONTHS,
     });
 
     const secret = this.instance.secret;

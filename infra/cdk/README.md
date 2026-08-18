@@ -67,7 +67,9 @@ before the service can start:
 
 ```bash
 pnpm --filter @imgopt/infra deploy -c env=staging Imgopt-staging-Compute/ApiRepository
-docker build -f apps/api/Dockerfile -t <repositoryUri>:<tag> .
+# --platform is required: the task definitions declare X86_64, and an arm64 image
+# deploys cleanly and then never starts.
+docker build --platform linux/amd64 -f apps/api/Dockerfile -t <repositoryUri>:<tag> .
 docker push <repositoryUri>:<tag>
 ```
 

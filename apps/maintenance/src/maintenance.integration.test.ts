@@ -12,6 +12,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { loadConfig, type AppConfig } from '@imgopt/config';
 import { S3Storage } from '@imgopt/storage';
+import type { QueuePort } from '@imgopt/queue';
 import { AssetRepository, createPrismaClient, newAssetId, type PrismaClient } from '@imgopt/db';
 import { Maintenance, ownerOf } from './maintenance.js';
 
@@ -44,10 +45,26 @@ const createdIds: string[] = [];
 const HOUR = 3_600_000;
 const DAY = 86_400_000;
 
+/**
+ * Collects re-enqueued jobs instead of sending them.
+ *
+ * A real SQS client is not the point here: what the re-enqueue job has to get right
+ * is *which* assets it picks, and sending to ElasticMQ would leave messages behind
+ * for whatever runs next in a suite that shares one queue.
+ */
+const enqueued: Array<{ assetId: string; assetVersion: number }> = [];
+const recordingQueue = {
+  enqueue(job: { assetId: string; assetVersion: number }) {
+    enqueued.push({ assetId: job.assetId, assetVersion: job.assetVersion });
+    return Promise.resolve({ messageId: `test-${enqueued.length}` });
+  },
+} as unknown as QueuePort;
+
 function maintenance(overrides: Partial<AppConfig['lifecycle']> = {}): Maintenance {
   return new Maintenance(
     storage,
     repo,
+    recordingQueue,
     { ...config, lifecycle: { ...config.lifecycle, ...overrides } },
     noopLogger,
   );
@@ -226,6 +243,93 @@ describe('superseded version expiry', () => {
     // The current version survives, which is the whole point of the distinction.
     expect(await storage.exists(`original/${id}/2/source.jpg`)).toBe(true);
   });
+
+  /*
+   * The case the test above cannot see.
+   *
+   * It creates both versions in the same instant, so a window measured from the old
+   * version's creation and one measured from its supersession expire together and the
+   * assertion passes under either. That is precisely how the bug survived: the
+   * retention window was applied to `createdAt`, so a source that had been live for
+   * longer than the window was deletable on the first run after it was replaced —
+   * original, master, derivatives, and rows, one day into a thirty-day promise, with
+   * every consumer page still pointing at the old URLs.
+   *
+   * Here v1 is backdated a year and superseded moments ago. Under the old semantics
+   * the year-old `createdAt` clears a 30-day cutoff and everything is destroyed;
+   * under the correct one nothing is, because the window has barely started.
+   */
+  it('measures the window from supersession, not from the version being old', async () => {
+    const id = await storedAsset();
+
+    const longAgo = new Date(Date.now() - 365 * DAY);
+    await prisma.assetVersion.update({
+      where: { assetId_version: { assetId: id, version: 1 } },
+      data: { createdAt: longAgo },
+    });
+
+    await repo.addVersion({
+      assetId: id,
+      sourceKey: `original/${id}/2/source.jpg`,
+      contentHash: `hash-${id}-2`,
+      metadata: { format: 'jpeg', bytes: 12 },
+    });
+    await storage.put(`original/${id}/2/source.jpg`, Buffer.from('v2'), {
+      contentType: 'image/jpeg',
+    });
+
+    // One day after the replacement, with a 30-day window: 29 days still to run.
+    await maintenance({ supersededRetentionDays: 30, orphanSafetyWindowHours: 100_000 }).run(
+      new Date(Date.now() + DAY),
+    );
+
+    expect(await storage.exists(`original/${id}/1/source.jpg`)).toBe(true);
+    expect(await storage.exists(`derived/${id}/v1-1/w640_q75.avif`)).toBe(true);
+
+    const stamped = await prisma.assetVersion.findUnique({
+      where: { assetId_version: { assetId: id, version: 1 } },
+      select: { supersededAt: true },
+    });
+    expect(stamped?.supersededAt).toBeInstanceOf(Date);
+
+    // And it does expire, once the window has actually run from that moment.
+    await maintenance({ supersededRetentionDays: 30, orphanSafetyWindowHours: 100_000 }).run(
+      new Date(Date.now() + 31 * DAY),
+    );
+    expect(await storage.exists(`original/${id}/1/source.jpg`)).toBe(false);
+  });
+
+  /*
+   * An unknown supersession moment must not be reclaimable.
+   *
+   * NULL means "still current, or we do not know when this stopped being current" —
+   * a row written before the column existed, or one whose successor was lost. Every
+   * other job here fails toward keeping; this is that rule applied to the one job
+   * that deletes originals.
+   */
+  it('never reclaims a version whose supersession moment is unknown', async () => {
+    const id = await storedAsset();
+    await repo.addVersion({
+      assetId: id,
+      sourceKey: `original/${id}/2/source.jpg`,
+      contentHash: `hash-${id}-2`,
+      metadata: { format: 'jpeg', bytes: 12 },
+    });
+    await storage.put(`original/${id}/2/source.jpg`, Buffer.from('v2'), {
+      contentType: 'image/jpeg',
+    });
+
+    await prisma.assetVersion.update({
+      where: { assetId_version: { assetId: id, version: 1 } },
+      data: { supersededAt: null, createdAt: new Date(Date.now() - 365 * DAY) },
+    });
+
+    await maintenance({ supersededRetentionDays: 30, orphanSafetyWindowHours: 100_000 }).run(
+      new Date(Date.now() + 365 * DAY),
+    );
+
+    expect(await storage.exists(`original/${id}/1/source.jpg`)).toBe(true);
+  });
 });
 
 describe('pending upload reaping', () => {
@@ -250,6 +354,54 @@ describe('pending upload reaping', () => {
     await maintenance({ pendingUploadTtlHours: 24 }).run();
 
     expect(await repo.findById(id)).not.toBeNull();
+  });
+});
+
+/*
+ * The job that recovers uploads whose optimization was never queued.
+ *
+ * `storedAsset` deliberately leaves the asset in `stored` — exactly the state a
+ * failed enqueue leaves behind — so these tests exercise the real condition rather
+ * than a simulated one.
+ */
+describe('stalled optimization re-enqueue', () => {
+  it('re-enqueues an asset that has sat in stored past the window', async () => {
+    const id = await storedAsset();
+    enqueued.length = 0;
+
+    const report = await maintenance({
+      stalledOptimizeHours: 6,
+      orphanSafetyWindowHours: 100_000,
+    }).run(new Date(Date.now() + 7 * HOUR));
+
+    expect(report.stalledOptimizations.enqueued).toBeGreaterThan(0);
+    expect(enqueued).toContainEqual({ assetId: id, assetVersion: 1 });
+  });
+
+  it('leaves an asset alone while a redelivery could still be in flight', async () => {
+    // Inside the window the optimizer's own SQS retries may not have finished, and
+    // re-enqueueing here would race them.
+    const id = await storedAsset();
+    enqueued.length = 0;
+
+    await maintenance({ stalledOptimizeHours: 6, orphanSafetyWindowHours: 100_000 }).run();
+
+    expect(enqueued.map((job) => job.assetId)).not.toContain(id);
+  });
+
+  it('queues nothing on a dry run', async () => {
+    await storedAsset();
+    enqueued.length = 0;
+
+    const report = await maintenance({
+      stalledOptimizeHours: 6,
+      orphanSafetyWindowHours: 100_000,
+      dryRun: true,
+    }).run(new Date(Date.now() + 7 * HOUR));
+
+    expect(report.stalledOptimizations.examined).toBeGreaterThan(0);
+    expect(report.stalledOptimizations.enqueued).toBe(0);
+    expect(enqueued).toHaveLength(0);
   });
 });
 

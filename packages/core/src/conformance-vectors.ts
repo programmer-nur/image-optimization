@@ -214,16 +214,83 @@ const elisionVectors: ConformanceVector[] = [
   { query: 'q=85', accept: ACCEPT_AVIF, expected: 'full_q85.avif' },
 ];
 
-/** Fit modes, all requiring a height constraint to appear at all. */
+/**
+ * Fit modes, all requiring a height constraint to appear at all.
+ *
+ * `pad` is an accepted spelling that resolves to `contain`: sharp receives the same
+ * call for both, so two keys would mean two objects holding identical bytes.
+ */
 const fitVectors: ConformanceVector[] = [
   { query: 'w=640&h=360&fit=cover', accept: ACCEPT_AVIF, expected: 'w640_h360_cover_q75.avif' },
   { query: 'w=640&h=360&fit=contain', accept: ACCEPT_AVIF, expected: 'w640_h360_contain_q75.avif' },
   { query: 'w=640&h=360&fit=inside', accept: ACCEPT_AVIF, expected: 'w640_h360_inside_q75.avif' },
   { query: 'w=640&h=360&fit=outside', accept: ACCEPT_AVIF, expected: 'w640_h360_outside_q75.avif' },
   { query: 'w=640&h=360&fit=fill', accept: ACCEPT_AVIF, expected: 'w640_h360_fill_q75.avif' },
-  { query: 'w=640&h=360&fit=pad', accept: ACCEPT_AVIF, expected: 'w640_h360_pad_q75.avif' },
+  { query: 'w=640&h=360&fit=pad', accept: ACCEPT_AVIF, expected: 'w640_h360_contain_q75.avif' },
+  // Enum values are case-insensitive on both sides. Asserted as a vector, not only as
+  // an equivalence group: a group proves each implementation is self-consistent, and
+  // this is the only gate that proves the two agree on *which* key.
+  { query: 'w=640&h=360&fit=PAD', accept: ACCEPT_AVIF, expected: 'w640_h360_contain_q75.avif' },
+  { query: 'w=640&h=360&fit=Contain', accept: ACCEPT_AVIF, expected: 'w640_h360_contain_q75.avif' },
+  {
+    query: 'w=640&h=360&fit=pad&background=ff0000',
+    accept: ACCEPT_AVIF,
+    expected: 'w640_h360_contain_q75_bgff0000.avif',
+  },
   // cover is the default when a height is constrained.
   { query: 'w=640&h=360', accept: ACCEPT_AVIF, expected: 'w640_h360_cover_q75.avif' },
+];
+
+/**
+ * Gravity survives only where a crop actually happens.
+ *
+ * `outside` resizes so the result covers the requested box and hands the whole thing
+ * back — sharp never crops it, so every gravity produces the same pixels. Keeping
+ * gravity in those keys multiplies one variant by the gravity enum, each copy
+ * byte-identical to the others.
+ */
+const gravityElisionVectors: ConformanceVector[] = [
+  {
+    query: 'w=640&h=360&fit=outside&crop=attention',
+    accept: ACCEPT_AVIF,
+    expected: 'w640_h360_outside_q75.avif',
+  },
+  {
+    query: 'w=640&h=360&fit=outside&crop=top',
+    accept: ACCEPT_AVIF,
+    expected: 'w640_h360_outside_q75.avif',
+  },
+  {
+    query: 'w=640&h=360&fit=inside&crop=entropy',
+    accept: ACCEPT_AVIF,
+    expected: 'w640_h360_inside_q75.avif',
+  },
+  {
+    query: 'w=640&h=360&fit=fill&crop=left',
+    accept: ACCEPT_AVIF,
+    expected: 'w640_h360_fill_q75.avif',
+  },
+  // cover is the one fit that discards pixels, so gravity is real there.
+  {
+    query: 'w=640&h=360&fit=cover&crop=top',
+    accept: ACCEPT_AVIF,
+    expected: 'w640_h360_cover_q75_gtop.avif',
+  },
+];
+
+/**
+ * Zero dimensions clamp rather than producing NaN.
+ *
+ * `?w=0&h=0` divided zero by zero, which carried NaN through the ratio and emitted an
+ * `hNaN` key: a path the edge produced happily and the generator then refused
+ * forever — a permanently broken URL from a merely silly one.
+ */
+const zeroDimensionVectors: ConformanceVector[] = [
+  { query: 'w=0', accept: ACCEPT_AVIF, expected: 'w16_q75.avif' },
+  { query: 'h=0', accept: ACCEPT_AVIF, expected: 'h16_q75.avif' },
+  { query: 'w=0&h=0', accept: ACCEPT_AVIF, expected: 'w16_h16_cover_q75.avif' },
+  { query: 'w=0&h=360', accept: ACCEPT_AVIF, expected: 'w16_h320_cover_q75.avif' },
+  { query: 'w=640&h=0', accept: ACCEPT_AVIF, expected: 'w640_h32_cover_q75.avif' },
 ];
 
 /** Rejections. The edge must refuse these before any origin cost is incurred. */
@@ -231,6 +298,11 @@ const errorVectors: ConformanceVector[] = [
   { query: 'w=640&fit=squish', expected: 'ERROR:invalid_enum' },
   { query: 'w=640&format=bmp', expected: 'ERROR:invalid_enum' },
   { query: 'w=640&h=360&crop=nowhere', expected: 'ERROR:invalid_enum' },
+  // `focal` left the grammar: the delivery plane never reads the registry, so a
+  // stored focal point could not reach the render, and the key it minted held bytes
+  // identical to the elided centre key.
+  { query: 'w=640&h=360&crop=focal', expected: 'ERROR:invalid_enum' },
+  { query: 'w=640&h=360&fit=cover&crop=focal', expected: 'ERROR:invalid_enum' },
   // Absolute pixel crops would reintroduce an unbounded key space.
   { query: 'w=640&crop=100,200,300,400', expected: 'ERROR:unsupported_crop' },
   { query: 'w=640&crop=10,20', expected: 'ERROR:unsupported_crop' },
@@ -258,12 +330,40 @@ const effectVectors: ConformanceVector[] = [
   {
     query: 'w=640&h=360&fit=pad&background=ff0000',
     accept: ACCEPT_AVIF,
-    expected: 'w640_h360_pad_q75_bgff0000.avif',
+    expected: 'w640_h360_contain_q75_bgff0000.avif',
   },
   {
     query: 'w=640&h=360&fit=pad&background=fa0',
     accept: ACCEPT_AVIF,
-    expected: 'w640_h360_pad_q75_bgffaa00.avif',
+    expected: 'w640_h360_contain_q75_bgffaa00.avif',
+  },
+  // Channels snap to the 4-bit grid. Left unquantized, a background is 2^24 keys per
+  // box — the width hole again, spelled in hex — and every one of them is a render
+  // and a permanent object reachable from an ordinary URL.
+  {
+    query: 'w=640&h=360&fit=contain&background=ff0001',
+    accept: ACCEPT_AVIF,
+    expected: 'w640_h360_contain_q75_bgff0000.avif',
+  },
+  {
+    query: 'w=640&h=360&fit=contain&background=808080',
+    accept: ACCEPT_AVIF,
+    expected: 'w640_h360_contain_q75_bg888888.avif',
+  },
+  {
+    query: 'w=640&h=360&fit=contain&background=7f7f7f',
+    accept: ACCEPT_AVIF,
+    expected: 'w640_h360_contain_q75_bg777777.avif',
+  },
+  {
+    query: 'w=640&h=360&fit=contain&background=12345678',
+    accept: ACCEPT_AVIF,
+    expected: 'w640_h360_contain_q75_bg11335577.avif',
+  },
+  {
+    query: 'w=640&h=360&fit=contain&background=ff0000',
+    accept: ACCEPT_AVIF,
+    expected: 'w640_h360_contain_q75_bgff0000.avif',
   },
   {
     query: 'w=640&h=360&fit=cover&crop=attention',
@@ -314,6 +414,8 @@ export const CONFORMANCE_VECTORS: readonly ConformanceVector[] = [
   ...ratioVectors,
   ...elisionVectors,
   ...fitVectors,
+  ...gravityElisionVectors,
+  ...zeroDimensionVectors,
   ...errorVectors,
   ...effectVectors,
 ];
@@ -377,5 +479,25 @@ export const EQUIVALENCE_GROUPS: ReadonlyArray<{
     name: 'blur inside one level',
     accept: ACCEPT_AVIF,
     queries: ['w=640&blur=4', 'w=640&blur=5', 'w=640&blur=6'],
+  },
+  {
+    name: 'pad is a spelling of contain',
+    accept: ACCEPT_AVIF,
+    queries: [
+      'w=640&h=360&fit=pad',
+      'w=640&h=360&fit=contain',
+      'w=640&h=360&fit=PAD',
+      'w=640&h=360&fit=pad&crop=attention',
+    ],
+  },
+  {
+    name: 'gravity on fits that never crop',
+    accept: ACCEPT_AVIF,
+    queries: [
+      'w=640&h=360&fit=outside',
+      'w=640&h=360&fit=outside&crop=top',
+      'w=640&h=360&fit=outside&crop=attention',
+      'w=640&h=360&fit=outside&crop=center',
+    ],
   },
 ];

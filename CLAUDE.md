@@ -30,6 +30,10 @@ pnpm --filter @imgopt/edge generate                 # regenerate the CloudFront 
 pnpm dev:up             # postgres + minio + elasticmq
 ```
 
+**The Lambda bundles must be `.mjs`, and must reach sharp through `createRequire`.** They are ESM, and a deployed function has no package.json above it — a bare `.js` is read as CommonJS and throws on its own first `import`. Renaming alone is not enough: sharp ships in a layer that Lambda exposes through `NODE_PATH`, which the ESM resolver ignores entirely, so the bundles resolve it through `scripts/esbuild-sharp-layer.mjs`. Both failures are init-time, on every invocation, with the infrastructure perfectly correct.
+
+**`infra/cloudfront`'s conformance suite reads `packages/core/dist`, not its source.** Rebuild core (`pnpm --filter @imgopt/core build`) before running the edge tests or regenerating the artifact, or you are testing the previous grammar and it will look like it passed.
+
 **Regenerate the edge function after any change to the transform grammar**, and commit the result — the committed artifact is what deploys. CI fails if it is stale, but only after you have pushed.
 
 `pnpm --filter @imgopt/infra test` synthesizes every stack and is the infrastructure gate. `cdk synth` is _not_ usable here: resolving a VPC's availability zones for a concrete account is a context lookup, so the CLI needs credentials even though it deploys nothing.
@@ -94,8 +98,10 @@ packages/db       EXISTS. Prisma schema + migrations + AssetRepository; generate
 apps/api          EXISTS. NestJS control plane → Docker → Fargate
 apps/optimizer    EXISTS. SQS-triggered Lambda: warm set, metadata, conditional master
 apps/maintenance  EXISTS. Daily EventBridge Lambda: orphan reconciliation, superseded-version
-                  expiry, upload reaping, storage accounting. Holds the ONLY role permitted
-                  to delete an original, so every job is written to fail toward keeping
+                  expiry, upload reaping, storage accounting. Holds the only role permitted
+                  to delete an original outside the API's explicit DELETE endpoint (the
+                  Fargate task role also carries original/* delete for that path), so every
+                  job is written to fail toward keeping
 apps/generator    EXISTS. Function URL Lambda: on-miss generation. No SQS. Never *reads*
                   the database; the handler injects a best-effort bookkeeping write that
                   generator.ts treats as optional and whose failure it swallows
@@ -119,25 +125,29 @@ Transform _grammar_ lives in `packages/core` as constants; deployment _settings_
 
 These are not discoverable by reading code, and violating any of them is expensive to undo once assets are cached at the edge.
 
-**Edge and core must agree on normalization.** `packages/core` defines the width ladder and canonical-key construction; the CloudFront Function is _generated_ from it. If they ever diverge, CloudFront computes cache key A while the Lambda writes object B — permanent 100% miss, every request invoking Lambda, and **nothing appears in error rates**. Never hand-edit the generated edge function. The shared conformance vectors must pass against both implementations, and `OnDemandGenerationRate` staying non-zero is the only symptom you will get.
+**Edge and core must agree on normalization.** `packages/core` defines the width ladder and canonical-key construction; the CloudFront Function is _generated_ from it. If they ever diverge, CloudFront computes cache key A while the Lambda writes object B — permanent 100% miss, every request invoking Lambda, and **nothing appears in error rates**. Never hand-edit the generated edge function. The shared conformance vectors must pass against both implementations, and the `OnDemandGenerations` metric staying non-zero is the only symptom you will get.
 
 **The canonical key is simultaneously the CDN cache key and the S3 object key.** They are the same string by construction, not kept in sync by convention.
 
 **The canonical key must stay reversible.** The generator receives only the rewritten path — no query string, no database — so everything needed to reproduce the bytes has to be recoverable from the key alone. Rare parameters (gravity, background, blur, sharpen) are spelled out in a fixed order rather than hashed for exactly this reason; `parseVariantName` re-serializes what it parsed and compares before accepting. A key component that cannot be parsed back makes every request carrying it fail permanently, and only for the rare parameters nobody tests by hand.
 
-**Every output width comes from the ladder.** Snap _up_ (never serve fewer pixels than requested). An unbucketed width anywhere means unbounded S3 objects, a permanently cold cache, and an amplification vector.
+**Every output width comes from the ladder.** Snap _up_ (never serve fewer pixels than requested). An unbucketed width anywhere means unbounded S3 objects, a permanently cold cache, and an amplification vector. Enforced in two places, and it needs both: the edge refuses a raw `/derived/…` path so the normalizer cannot be skipped, and `parseVariantName` refuses a width off the ladder, a height the ratio quantizer cannot produce, and a background off the channel grid — the id, version, and epoch are visible in every public URL, so a derivative path can always be _constructed_. `capToSource` floors at the smallest rung for the same reason: a key at a tiny source's native width is one no viewer URL can ever ask for.
 
 **The source-width cap applies to pixels, not to the key.** The edge normalizer has no asset metadata — no network, and CloudFront KeyValueStore is far too small for millions of assets — so it cannot know a source's intrinsic width. The key is therefore derived from the URL alone, identically at the edge and in the generator, which is what makes drift structurally impossible. `?w=3840` on a 2000px source yields key `w3840_…` holding 2000px-wide bytes. `snapWidth` takes an optional `sourceWidth` for the SDK, which caps its `srcset` candidates so oversized buckets are never requested in practice.
 
 **Height is never snapped to the width ladder** — the aspect ratio is quantized instead. Snapping height directly turns a `640×481` request into `640×640`.
 
-**Inert parameters are elided from the key.** A parameter that is present but cannot affect the output fragments the cache exactly as badly as an unquantized one: `?w=640` and `?w=640&fit=cover` must produce one key. `fit` survives only when _both_ dimensions are constrained, `background` only on padding fits, gravity only when a crop occurs, effects only above level 0.
+**Inert parameters are elided from the key.** A parameter that is present but cannot affect the output fragments the cache exactly as badly as an unquantized one: `?w=640` and `?w=640&fit=cover` must produce one key. `fit` survives only when _both_ dimensions are constrained, `background` only on `contain` (and `pad` is a request-time spelling of `contain`, not a mode of its own), gravity only on `cover` — `outside` resizes past the box and returns it whole, so sharp never crops it — and effects only above level 0.
+
+**Every key axis is quantized, including the ones that look like free-form strings.** Background channels snap to the 4-bit grid (`00, 11, … ff`); unquantized, that one parameter is 2^24 keys per box, each a render and a permanent object. `crop=focal` is absent for a related reason: a focal point lives in the registry, the delivery plane never reads the registry, so it rendered as centre and minted a duplicate key. The stored focal point is advisory metadata only.
 
 **`dpr` folds into width before snapping** and never becomes its own cache dimension.
 
 **Absolute pixel crops are not expressible in a delivery URL.** `crop=x,y,w,h` reintroduces an unbounded key space and undoes bucketing single-handedly. Public `crop` takes named gravity only; arbitrary rectangles mint a new asset through the authenticated API.
 
 **Originals are write-once.** No code path reads an object under `original/`, modifies it, and writes it back. Replacing source bytes mints a new asset version at a new key.
+
+**The bucket is versioned, so a delete is a delete marker.** That is the safety net under originals, which cannot be regenerated and which two roles can delete. It also means every lifecycle rule needs its own noncurrent expiry — without one on `staging/`, the hard expiry and the malware quarantine handler both stop destroying unvalidated bytes and start retaining them. Never grant `s3:DeleteObjectVersion` to a service role: that would defeat the net using the same code path that caused the incident.
 
 **Uploads are validated in `staging/` before promotion to `original/`.** Direct-to-S3 uploads physically cannot be validated pre-storage; the staging prefix is what reconciles "validate first" with "never fail on large files". Nothing under `staging/` is CDN-reachable.
 
@@ -156,6 +166,8 @@ These are not discoverable by reading code, and violating any of them is expensi
 **`limitInputPixels` is always set.** A 30KB PNG can decode to tens of gigabytes.
 
 **Delivered bytes are always re-encoded pipeline output** — source bytes are never passed through to viewers. That, not detection, is what defeats a polyglot.
+
+**Environment booleans are parsed by spelling, never coerced.** `z.coerce.boolean()` is `Boolean(value)` and every environment variable is a string, so `"false"` coerces to _true_ — and the CDK writes exactly that string. That turned `UPLOAD_MALWARE_SCAN_ENABLED=false` into "a scanner exists", which with fail-closed holds every upload forever, and `MAINTENANCE_DRY_RUN=false` into a reclamation job that never deletes. Use the `bool` helper in `packages/config/src/config.ts`; an unrecognized spelling must fail rather than pick a side.
 
 **Malware scanning has two independent switches.** `UPLOAD_MALWARE_SCAN_ENABLED` says a scanner exists; `UPLOAD_FAIL_CLOSED_ON_SCAN_UNAVAILABLE` says what to do when it has not answered. Fail-closed with no scanner provisioned holds _every_ upload forever and looks like a broken uploader. The CDK stack sets the app flag from the same value that provisions GuardDuty, so they cannot drift.
 

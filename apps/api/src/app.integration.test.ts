@@ -65,7 +65,7 @@ beforeAll(async () => {
   const keys = app.get(ApiKeyService);
   const created = await keys.create({
     name: `itest-${Date.now()}`,
-    permissions: ['upload', 'delete'],
+    permissions: ['read', 'upload', 'delete'],
   });
   apiKey = created.plaintext;
 }, 60_000);
@@ -203,7 +203,7 @@ describe('lifecycle', () => {
 
   it('requires the delete permission on a key that lacks it', async () => {
     const keys = app.get(ApiKeyService);
-    const readOnly = await keys.create({ name: 'readonly', permissions: ['upload'] });
+    const readOnly = await keys.create({ name: 'readonly', permissions: ['read', 'upload'] });
 
     const res = await fetch(`${baseUrl}/v1/images/${assetId}`, {
       method: 'DELETE',

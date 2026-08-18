@@ -34,6 +34,7 @@ var DEFAULT_QUALITY = 0;
 var BLUR_LEVELS = [];
 var SHARPEN_LEVELS = [];
 var FIT_MODES = [];
+var FIT_ALIASES = {};
 var DEFAULT_FIT = '';
 var PADDING_FITS = [];
 var CROPPING_FITS = [];
@@ -45,9 +46,10 @@ var MIN_DPR = 1;
 var MAX_DPR = 1;
 var DERIVED_PREFIX = '';
 var FULL_WIDTH_TOKEN = '';
+var VIEWER_PATH_PREFIXES = [];
+var STORAGE_PREFIXES = [];
 // <<< END GENERATED TABLES
 
-var PATH_PREFIX = 'i';
 /** Asset ids are ULIDs; the character class is deliberately narrow. */
 var ASSET_ID = /^[0-9A-Za-z_-]+$/;
 var VERSION_SEGMENT = /^v[0-9]+-[0-9]+$/;
@@ -74,6 +76,9 @@ function snapUp(width) {
  * DPR folds into the width here and never becomes a cache dimension of its own.
  * The source-width cap is deliberately absent: the edge has no asset metadata, so
  * the key is derived from the URL alone and the pipeline caps the pixels instead.
+ *
+ * The one-pixel floor also covers `w=0`, which would otherwise reach the ratio math
+ * as a zero denominator and emit an `hNaN` key the generator refuses forever.
  */
 function snapWidth(requested, dpr) {
   var effective = Math.ceil(Math.max(requested, 1) * dpr);
@@ -120,6 +125,19 @@ function quantizeQuality(requested) {
   return nearest(QUALITY_LEVELS, clamped);
 }
 
+/**
+ * The one quantizer written by hand on both sides rather than generated.
+ *
+ * The tables above come from core, but this arithmetic does not — so this is the
+ * single place in the edge function where a change to `normalizeBackground` in
+ * `packages/core/src/effects.ts` has to be mirrored deliberately. The conformance
+ * vectors are what catch it if it is not.
+ *
+ * Channels snap to the 4-bit grid (steps of 17: 00, 11, … ff) because a background is
+ * otherwise 2^24 keys per box, every one of them a render and a permanent object
+ * reachable from an ordinary URL. Padding bars are flat colour, so the grid is
+ * invisible where the parameter applies at all.
+ */
 function normalizeBackground(raw) {
   // A viewer may send `#ffaa00` percent-encoded. CloudFront decodes query values,
   // but stripping the encoded form too costs one branch and removes any dependence
@@ -127,13 +145,20 @@ function normalizeBackground(raw) {
   var hex = raw.replace(/^%23/, '').replace(/^#/, '');
   if (!HEX.test(hex)) return undefined;
 
+  var expanded = hex;
   if (hex.length === 3 || hex.length === 4) {
-    var expanded = '';
+    expanded = '';
     for (var i = 0; i < hex.length; i++) expanded += hex.charAt(i) + hex.charAt(i);
-    return expanded;
   }
-  if (hex.length === 6 || hex.length === 8) return hex;
-  return undefined;
+  if (expanded.length !== 6 && expanded.length !== 8) return undefined;
+
+  var quantized = '';
+  for (var j = 0; j < expanded.length; j += 2) {
+    var level = Math.round(parseInt(expanded.substr(j, 2), 16) / 17) * 17;
+    var digits = level.toString(16);
+    quantized += digits.length === 1 ? '0' + digits : digits;
+  }
+  return quantized;
 }
 
 /**
@@ -244,8 +269,10 @@ function normalize(query, accept) {
   var width;
   var height;
   if (w !== undefined && h !== undefined) {
+    // Both floored at one pixel before the ratio, matching resolveDimensions: `w=0`
+    // would otherwise divide by zero and carry NaN into the key.
     width = snapWidth(w, dpr);
-    height = Math.round(width * quantizeRatio(h / w));
+    height = Math.round(width * quantizeRatio(Math.max(h, 1) / Math.max(w, 1)));
   } else if (w !== undefined) {
     width = snapWidth(w, dpr);
   } else if (h !== undefined) {
@@ -261,8 +288,12 @@ function normalize(query, accept) {
 
   // Everything below is elided when it cannot affect the output. An inert parameter
   // left in the key fragments the cache exactly as badly as an unquantized one.
+  //
+  // `pad` is an accepted spelling of `contain`, not a mode of its own: both reach
+  // sharp as the same call, so both must reach the same key.
   var boxConstrained = width !== undefined && height !== undefined;
   var fit = fitRaw === undefined ? DEFAULT_FIT : fitRaw;
+  if (FIT_ALIASES[fit] !== undefined) fit = FIT_ALIASES[fit];
 
   if (boxConstrained) {
     spec.fit = fit;
@@ -292,10 +323,24 @@ function normalize(query, accept) {
 function handler(event) {
   var request = event.request;
 
-  // `/i/{assetId}/{version}/{slug}` — the slug is decoration and never affects
-  // which bytes are returned, so it is simply dropped.
+  // `/i/{assetId}/{version}/{slug}` for public delivery, `/p/...` for the
+  // signature-required behavior. Both normalize into the same derived key space: a
+  // private asset is bucketed exactly like a public one, and the signature is
+  // checked by CloudFront against the URL the viewer sent, before this runs.
+  //
+  // The slug is decoration and never affects which bytes are returned, so it is
+  // simply dropped.
   var segments = request.uri.split('/');
-  if (segments.length < 4 || segments.length > 5 || segments[1] !== PATH_PREFIX) {
+
+  // A raw storage path is the one way to reach the generator without passing through
+  // the quantizers above — `/derived/{id}/{v}/w641_q75.avif` names a width no ladder
+  // contains. The default behavior routes every path to the same origin group, so
+  // that has to be refused here rather than left to the origin. See design.md D3.
+  if (has(STORAGE_PREFIXES, segments[1])) {
+    return reject('unsupported_path', 'path');
+  }
+
+  if (segments.length < 4 || segments.length > 5 || !has(VIEWER_PATH_PREFIXES, segments[1])) {
     return request;
   }
 
@@ -311,6 +356,12 @@ function handler(event) {
   request.uri = '/' + DERIVED_PREFIX + '/' + assetId + '/' + version + '/' + result.variant;
   // The rewritten path IS the cache key. Anything left in the query string would
   // either fragment it or be ignored; dropping it makes that explicit.
+  //
+  // That includes a signed URL's Key-Pair-Id, Signature and Expires. Safe only
+  // because CloudFront validates a trusted key group before it invokes a
+  // viewer-request function — if that order were reversed, every correctly signed
+  // `/p/` URL would be refused while carrying a valid signature. Unverified against
+  // a real distribution; task 11.6 is not done until a signed URL returns 200.
   request.querystring = {};
 
   return request;

@@ -14,7 +14,7 @@
  *   a wasted generation. The SDK has the metadata, so it is capped here. See D3.
  */
 
-import { DEVICE_WIDTHS, LADDER } from '@imgopt/core';
+import { DEVICE_WIDTHS, LADDER, MIN_LADDER_WIDTH } from '@imgopt/core';
 import type { ResolvedConfig } from './config.js';
 import { buildUrl, type AssetRef, type TransformOptions } from './url.js';
 
@@ -75,10 +75,15 @@ export function candidateWidths(options: CandidateOptions = {}): number[] {
     if (sourceWidth === undefined) return [...candidates];
 
     const fitting = candidates.filter((width) => width <= sourceWidth);
-    // A source narrower than every rung keeps its own width rather than yielding an
-    // empty set: 12 pixels has no sensible bucket, and emitting nothing would leave
-    // the browser with only `src`.
-    return fitting.length > 0 ? fitting : [sourceWidth];
+    /*
+     * A source narrower than every rung still gets the smallest rung, not its own
+     * width. The edge snaps every requested width up to a rung, so a `12w` candidate
+     * would carry a descriptor the delivered bytes never match and name a key the
+     * generator refuses — and emitting nothing at all would leave the browser with
+     * only `src`. The pipeline's `withoutEnlargement` still returns the source's own
+     * 12 pixels under the `w16` key.
+     */
+    return fitting.length > 0 ? fitting : [MIN_LADDER_WIDTH];
   };
 
   if (widths !== undefined) return cap(widths);
@@ -157,7 +162,9 @@ export function defaultWidth(sourceWidth?: number, preferred = 1080): number {
   if (sourceWidth === undefined) return preferred;
 
   const fitting = LADDER.filter((width) => width <= sourceWidth);
-  if (fitting.length === 0) return sourceWidth;
+  // Same rule as the candidate set: a width off the ladder is a width the edge will
+  // snap anyway, and a key nothing can reach.
+  if (fitting.length === 0) return MIN_LADDER_WIDTH;
 
   const capped = fitting.filter((width) => width <= preferred);
   return capped.length > 0 ? capped[capped.length - 1]! : fitting[0]!;

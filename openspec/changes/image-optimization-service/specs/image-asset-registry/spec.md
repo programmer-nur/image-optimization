@@ -71,8 +71,8 @@ The service SHALL allow updating an asset's alt text, tags, and focal point via 
 
 #### Scenario: Focal point is updated
 
-- **WHEN** a client patches the focal point on an asset that already has derivatives generated with `crop=focal`
-- **THEN** the asset version is incremented so that focal-cropped derivatives are re-derived under new URLs rather than serving stale crops
+- **WHEN** a client patches the focal point on an asset
+- **THEN** the value is stored as advisory metadata, the asset version is unchanged, and no derivative is re-generated — the delivery plane never reads the registry, so a stored point cannot reach a render, which is also why `crop=focal` is not part of the URL grammar
 
 ### Requirement: Derivative inventory
 

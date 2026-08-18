@@ -15,15 +15,17 @@
 
 import type { TransformSpec } from './transform-spec.js';
 import { EXTENSION_FORMATS, FORMAT_EXTENSIONS } from './formats.js';
+import { isLadderWidth, isQuantizedHeight } from './breakpoints.js';
 import {
   BLUR_LEVELS,
+  CANONICAL_FIT_MODES,
   CROP_GRAVITIES,
+  isQuantizedBackground,
   DEFAULT_GRAVITY,
-  FIT_MODES,
   SHARPEN_LEVELS,
   type BlurLevel,
+  type CanonicalFit,
   type CropGravity,
-  type FitMode,
   type SharpenLevel,
   fitCrops,
   fitUsesBackground,
@@ -34,6 +36,34 @@ export const DERIVED_PREFIX = 'derived';
 export const ORIGINAL_PREFIX = 'original';
 export const MASTER_PREFIX = 'master';
 export const STAGING_PREFIX = 'staging';
+
+/**
+ * Viewer-facing path prefixes, defined here so the edge function, the control plane,
+ * and the CDN stack all read one definition instead of three matching strings.
+ *
+ * `/i/` is public delivery. `/p/` is the same delivery through a cache behavior with
+ * a trusted key group attached, so CloudFront refuses it without a valid signature —
+ * a prefix rather than a per-asset flag because behaviors match on path and know
+ * nothing about our metadata.
+ */
+export const DELIVERY_PATH_PREFIX = 'i';
+export const PRIVATE_PATH_PREFIX = 'p';
+export const VIEWER_PATH_PREFIXES: readonly string[] = [DELIVERY_PATH_PREFIX, PRIVATE_PATH_PREFIX];
+
+/**
+ * Prefixes a viewer request may never address directly.
+ *
+ * The distribution's default behavior sends every path to the S3-then-generator
+ * origin group, so without this a client could skip the normalizer entirely and name
+ * a raw storage key — the one way to reach the generator with a width that never
+ * passed the ladder. See design.md D3.
+ */
+export const STORAGE_PREFIXES: readonly string[] = [
+  DERIVED_PREFIX,
+  ORIGINAL_PREFIX,
+  MASTER_PREFIX,
+  STAGING_PREFIX,
+];
 
 /** Width token used when no width was requested — the source's own dimensions. */
 const FULL_WIDTH_TOKEN = 'full';
@@ -178,6 +208,34 @@ function parseDimension(raw: string): number | undefined {
 }
 
 /**
+ * Whether the spec's dimensions are ones the normalizer could have produced.
+ *
+ * This is the check that keeps the variant space bounded, and it belongs here rather
+ * than only at the edge. The asset id, version, and epoch are visible in every public
+ * URL, so a derivative path can be *constructed* by anyone; without this, `w641`,
+ * `w642`, `w643`… each parse cleanly, each render, and each persist a permanent
+ * object under a permanent cache entry. Bucketing would then hold only for viewers
+ * who happen to arrive through the edge — which is to say, not at all.
+ *
+ * Three shapes are legal, mirroring `resolveDimensions` exactly:
+ *
+ * - neither dimension — the source's own size
+ * - width alone, or height alone — a ladder rung
+ * - both — a ladder width, and a height derived from the quantized ratio
+ */
+function hasNormalizedDimensions(spec: TransformSpec): boolean {
+  const { width, height } = spec;
+
+  if (width !== undefined && height !== undefined) {
+    return isLadderWidth(width) && isQuantizedHeight(width, height);
+  }
+  if (width !== undefined) return isLadderWidth(width);
+  if (height !== undefined) return isLadderWidth(height);
+
+  return true;
+}
+
+/**
  * Whether a spec is free of inert parameters, mirroring the elision rules in
  * `parseTransform`.
  *
@@ -210,13 +268,14 @@ function isFreeOfInertParameters(spec: TransformSpec): boolean {
 /**
  * Parses a variant filename back into the spec that produced it.
  *
- * Deliberately strict. Beyond per-token validation the result must clear two gates:
- * it must be free of inert parameters, and re-serializing it must reproduce the
- * input byte for byte. The re-serialization gate subsumes a pile of individual
- * checks — duplicated tokens, tokens out of order, a width with a leading zero — and
- * guarantees the property the generator depends on, which is that the key it writes
- * to is the key it was asked for. A forged path that merely looks plausible is
- * rejected rather than silently materialized as an object.
+ * Deliberately strict. Beyond per-token validation the result must clear three gates:
+ * its dimensions must be ones the normalizer could have produced, it must be free of
+ * inert parameters, and re-serializing it must reproduce the input byte for byte. The
+ * re-serialization gate subsumes a pile of individual checks — duplicated tokens,
+ * tokens out of order, a width with a leading zero — and guarantees the property the
+ * generator depends on, which is that the key it writes to is the key it was asked
+ * for. A forged path that merely looks plausible is rejected rather than silently
+ * materialized as an object.
  */
 export function parseVariantName(name: string): VariantParseResult {
   const reject = { ok: false, reason: 'malformed_variant' } as const;
@@ -232,7 +291,7 @@ export function parseVariantName(name: string): VariantParseResult {
 
   let width: number | undefined;
   let height: number | undefined;
-  let fit: FitMode | undefined;
+  let fit: CanonicalFit | undefined;
   let quality: QualityLevel | undefined;
   let gravity: CropGravity | undefined;
   let background: string | undefined;
@@ -243,8 +302,11 @@ export function parseVariantName(name: string): VariantParseResult {
     if (token === FULL_WIDTH_TOKEN) continue;
 
     if (token.startsWith('bg')) {
+      // Shape *and* grid: an off-grid colour is one the normalizer cannot emit, and
+      // accepting it would leave 2^24 backgrounds per box reachable by hand — the
+      // whole point of quantizing the channel.
       const hex = token.slice(2);
-      if (!HEX_COLOR.test(hex)) return reject;
+      if (!HEX_COLOR.test(hex) || !isQuantizedBackground(hex)) return reject;
       background = hex;
       continue;
     }
@@ -279,7 +341,9 @@ export function parseVariantName(name: string): VariantParseResult {
       gravity = value;
       continue;
     }
-    if (isMember(FIT_MODES, token)) {
+    // The canonical set, not the accepted one: `pad` is a request-time alias for
+    // `contain` and never appears in a key the normalizer built.
+    if (isMember(CANONICAL_FIT_MODES, token)) {
       fit = token;
       continue;
     }
@@ -297,6 +361,7 @@ export function parseVariantName(name: string): VariantParseResult {
   if (blur !== undefined) spec.blur = blur;
   if (sharpen !== undefined) spec.sharpen = sharpen;
 
+  if (!hasNormalizedDimensions(spec)) return reject;
   if (!isFreeOfInertParameters(spec)) return reject;
 
   return toVariantName(spec) === name ? { ok: true, spec } : reject;

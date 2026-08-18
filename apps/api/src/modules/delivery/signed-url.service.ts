@@ -10,16 +10,24 @@
  * Private assets are served from their own path prefix, which is how CloudFront
  * decides that a signature is required at all: behaviors match on path, and know
  * nothing about our metadata. See `infra/cdk/lib/private-delivery.ts`.
+ *
+ * SCOPE OF THE GUARANTEE. The signature gates the `/p/` prefix, not the asset. Both
+ * prefixes normalize into one `derived/` key space — deliberately, so a private asset
+ * is bucketed like any other — which means anyone holding an asset id and version can
+ * still fetch the same bytes through the public `/i/` prefix. Signing therefore buys
+ * expiry and revocation on a *link*, not confidentiality for an *asset*. Real
+ * per-asset privacy needs the delivery plane to know an asset's visibility, and the
+ * delivery plane never reads the registry (design.md D1); the way to get there is a
+ * separate key space chosen at ingest, which is a design change rather than a
+ * configuration one. Until then, do not treat `/p/` as an access-control boundary
+ * for anything whose id might leak.
  */
 
 import { Inject, Injectable } from '@nestjs/common';
 import { getSignedUrl } from '@aws-sdk/cloudfront-signer';
 import type { AppConfig } from '@imgopt/config';
-import { toVersionSegment } from '@imgopt/core';
+import { PRIVATE_PATH_PREFIX, toVersionSegment } from '@imgopt/core';
 import { APP_CONFIG } from '../../tokens.js';
-
-/** Must match `PRIVATE_PATH_PATTERN` in the CDN stack. */
-export const PRIVATE_PATH_PREFIX = 'p';
 
 export interface SignOptions {
   /** Seconds from now. Defaults to the configured TTL. */

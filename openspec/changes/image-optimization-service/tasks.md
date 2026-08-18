@@ -76,7 +76,7 @@
 - [x] 6.10 Implement staging cleanup on any validation failure (delete staged object, mark `rejected` with reason)
 - [x] 6.11 Implement `GET /v1/images/:id` returning metadata, LQIP, intrinsic dimensions, canonical URL, and srcset
 - [x] 6.12 Implement `GET /v1/images/:id/variants` listing materialized derivatives
-- [x] 6.13 Implement `PATCH /v1/images/:id` for alt text and tags without version change, and focal point with reprocess
+- [x] 6.13 Implement `PATCH /v1/images/:id` for alt text, tags, and focal point, none of which changes the version (a focal point is advisory metadata: the delivery plane never reads the registry, so it cannot reach a render)
 - [x] 6.14 Implement `PUT /v1/images/:id/source` minting a new asset version (dedup disabled for replacement)
 - [x] 6.15 Implement `DELETE /v1/images/:id` with soft delete, prefix-scoped object removal, and CDN invalidation (no-op locally until a distribution is configured)
 - [x] 6.16 Implement `POST /v1/images/:id/reprocess` re-enqueueing the warm set

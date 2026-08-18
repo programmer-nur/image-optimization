@@ -2,6 +2,7 @@
   "name": "@imgopt/db",
   "version": "0.0.0",
   "private": true,
+  "//prisma": "A production dependency, not a dev one: the API's runtime image is also the migration image, and the pruned `--prod` install would otherwise leave the ECS migration task with no CLI to run. Nothing imports it, so the Lambda bundles are unaffected — esbuild emits only what is reachable.",
   "description": "Prisma schema, migrations, and the asset registry repository.",
   "type": "module",
   "exports": {
@@ -14,7 +15,9 @@
   "types": "./dist/index.d.ts",
   "files": [
     "dist",
-    "prisma"
+    "prisma",
+    "prisma.config.ts",
+    "scripts"
   ],
   "scripts": {
     "build": "tsc --build tsconfig.build.json",
@@ -30,10 +33,10 @@
     "@aws-sdk/client-secrets-manager": "^3.700.0",
     "@prisma/adapter-pg": "^7.9.1",
     "@prisma/client": "^7.9.1",
+    "prisma": "^7.9.1",
     "ulidx": "^2.4.1"
   },
   "devDependencies": {
-    "prisma": "^7.9.1",
     "vitest": "^2.1.8"
   }
 }

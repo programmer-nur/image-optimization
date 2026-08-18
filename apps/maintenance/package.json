@@ -2,7 +2,7 @@
   "name": "@imgopt/maintenance",
   "version": "0.0.0",
   "private": true,
-  "description": "EventBridge-scheduled Lambda: orphan reconciliation, superseded-version expiry, pending-upload reaping, storage accounting.",
+  "description": "EventBridge-scheduled Lambda: orphan reconciliation, superseded-version expiry, pending-upload reaping, stalled-optimization re-enqueue, storage accounting.",
   "type": "module",
   "main": "./dist/index.js",
   "scripts": {
@@ -17,6 +17,7 @@
     "@imgopt/core": "workspace:*",
     "@imgopt/db": "workspace:*",
     "@imgopt/metrics": "workspace:*",
+    "@imgopt/queue": "workspace:*",
     "@imgopt/storage": "workspace:*",
     "pino": "^9.14.0"
   },

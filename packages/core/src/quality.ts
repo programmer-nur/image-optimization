@@ -29,7 +29,14 @@ export const MAX_QUALITY = QUALITY_LEVELS[QUALITY_LEVELS.length - 1] as number;
  */
 export const DEFAULT_QUALITY: QualityLevel = 75;
 
-/** Snaps to the nearest permitted level, ties resolving upward. */
+/**
+ * Snaps to the nearest permitted level.
+ *
+ * A tie resolves to the *lower* level — the first match wins, and the levels ascend.
+ * The edge normalizer's `nearest` does the same, which is the only property that
+ * actually matters here: an exact midpoint like 57.5 must land on one level in both
+ * implementations, or the two disagree on a key.
+ */
 export function quantizeQuality(requested: number): QualityLevel {
   const clamped = Math.min(Math.max(requested, MIN_QUALITY), MAX_QUALITY);
 

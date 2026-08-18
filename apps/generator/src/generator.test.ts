@@ -38,6 +38,13 @@ describe('paths that are not canonical derivative keys', () => {
     ['/original/abc/1/source.jpg', 'the originals prefix'],
     ['/master/abc/1/master.webp', 'the masters prefix'],
     ['/derived/abc/v4-4/w640_q75.gif', 'an unsupported extension'],
+    // The bound the cost model rests on, tested where the object would be minted:
+    // the id, version, and epoch are visible in every public URL, so a sweep of
+    // `w641, w642, …` is a sweep of Sharp invocations and permanent objects.
+    ['/derived/abc/v4-4/w641_q75.avif', 'a width off the ladder'],
+    ['/derived/abc/v4-4/w12_q75.avif', 'a width below the smallest rung'],
+    ['/derived/abc/v4-4/w640_h361_cover_q75.avif', 'a height the ratio quantizer cannot produce'],
+    ['/derived/abc/v4-4/w640_h360_contain_q75_bg010203.avif', 'a background off the channel grid'],
     ['/derived/abc/v4-4/w640_q70.avif', 'a quality off the level set'],
     ['/derived/abc/v4-4/w640_q75_bl0.avif', 'an inert effect that would fragment the cache'],
     ['/derived/abc/v4-4/q75_w640.avif', 'tokens out of canonical order'],

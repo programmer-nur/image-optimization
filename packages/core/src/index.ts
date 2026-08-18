@@ -11,6 +11,8 @@ export {
   RATIO_TOLERANCE,
   type Dpr,
   capToSource,
+  isLadderWidth,
+  isQuantizedHeight,
   quantizeRatio,
   resolveDimensions,
   snapUp,
@@ -19,19 +21,24 @@ export {
 
 export {
   BLUR_LEVELS,
+  CANONICAL_FIT_MODES,
   CROP_GRAVITIES,
   DEFAULT_FIT,
   DEFAULT_GRAVITY,
   FIT_MODES,
   SHARPEN_LEVELS,
   type BlurLevel,
+  type CanonicalFit,
   type CropGravity,
   type FitMode,
   type SharpenLevel,
+  BACKGROUND_CHANNEL_STEP,
   backgroundToRgba,
   fitCrops,
+  isQuantizedBackground,
   fitUsesBackground,
   normalizeBackground,
+  normalizeFit,
   quantizeBlur,
   quantizeSharpen,
 } from './effects.js';
@@ -69,10 +76,14 @@ export {
 } from './transform-spec.js';
 
 export {
+  DELIVERY_PATH_PREFIX,
   DERIVED_PREFIX,
   MASTER_PREFIX,
   ORIGINAL_PREFIX,
+  PRIVATE_PATH_PREFIX,
   STAGING_PREFIX,
+  STORAGE_PREFIXES,
+  VIEWER_PATH_PREFIXES,
   type KeyParseResult,
   type KeyParts,
   type VariantParseResult,

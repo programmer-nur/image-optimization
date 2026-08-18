@@ -19,9 +19,28 @@ All mutating control-plane endpoints SHALL require a valid API key. Delivery of 
 - **WHEN** a browser requests a public delivery URL with no credentials
 - **THEN** the image is served
 
+### Requirement: The control plane is reachable only over TLS
+
+The control-plane load balancer SHALL terminate TLS with a certificate for its configured hostname, and MUST answer plain HTTP only to redirect to it. Production deployment SHALL fail to synthesize when no certificate is resolvable, rather than falling back to plain HTTP.
+
+#### Scenario: A client presents an API key
+
+- **WHEN** a client sends `x-api-key` to the control plane
+- **THEN** the request travels over TLS 1.2 or later, because the credential and the upload payload are both in the clear otherwise
+
+#### Scenario: A client connects over plain HTTP
+
+- **WHEN** a client connects to port 80
+- **THEN** it is redirected to the HTTPS endpoint and no request is served over the plaintext listener
+
+#### Scenario: Production is deployed without a certificate
+
+- **WHEN** synthesis runs for production and neither an explicit certificate ARN nor a hostname with a usable hosted zone is configured
+- **THEN** synthesis fails naming the missing setting, because the alternative — an optional setting nobody supplies — is how a control plane comes to serve credentials in cleartext without anyone noticing
+
 ### Requirement: API keys are stored hashed
 
-API keys SHALL be persisted only as salted hashes, and the plaintext value MUST be shown exactly once at creation.
+API keys SHALL be persisted only as hashes, and the plaintext value MUST be shown exactly once at creation. The hash is an unsalted SHA-256 of the whole key: the secret half is 32 bytes from a cryptographic RNG, so there is no dictionary for a salt to defeat and no password-stretching to do. A key store holding user-chosen secrets would require both.
 
 #### Scenario: Key is created
 
@@ -125,19 +144,24 @@ The public transform surface SHALL NOT permit an unbounded number of distinct de
 - **WHEN** malformed requests arrive at high volume
 - **THEN** they are rejected at the edge without any origin, storage, or compute cost
 
-### Requirement: Private asset delivery
+### Requirement: Signed delivery links
 
-The service SHALL support restricting delivery of designated assets using time-limited signed CDN URLs, disabled by default.
+The service SHALL support time-limited, revocable signed delivery links under a dedicated path prefix, disabled by default. The signature is a property of the _link_, not of the asset: it buys expiry and revocation on a URL that was handed out, and it is scoped to one prefix rather than to a set of assets.
 
-#### Scenario: Private asset requested without a signature
+#### Scenario: Signed prefix requested without a signature
 
-- **WHEN** an asset marked private is requested without a valid signature
-- **THEN** the request is denied at the edge
+- **WHEN** the signature-required prefix is requested without a valid signature
+- **THEN** CloudFront denies the request at the edge, before any origin, storage, or compute cost
 
-#### Scenario: Private asset requested with a valid signature
+#### Scenario: Signed link is presented before it expires
 
 - **WHEN** a valid unexpired signature is presented
-- **THEN** the image is delivered normally
+- **THEN** the request normalizes into the same derived key space as public delivery and the image is served, so a signed asset is bucketed exactly like any other
+
+#### Scenario: The same asset is requested through the public prefix
+
+- **WHEN** a caller who knows the asset id and version requests it through the public prefix
+- **THEN** it is served, because visibility is a property of the URL and not of the asset — per-asset privacy would require the delivery plane to know an asset's visibility, and the delivery plane never reads the registry (design.md D1). Making it a property of the asset means a separate key space chosen at ingest, which is a design change and not a configuration one.
 
 ### Requirement: Least-privilege service permissions
 

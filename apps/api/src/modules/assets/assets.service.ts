@@ -49,21 +49,27 @@ export class AssetsService {
     return this.repo.listDerivatives(assetId);
   }
 
-  /** Alt text and tags do not change bytes, so they must not bump the version. */
+  /**
+   * Metadata changes no bytes, so none of it bumps the version.
+   *
+   * That includes the focal point, which used to enqueue a reprocess here. The
+   * reprocess did nothing observable and cost a Lambda invocation to discover it:
+   * `crop=focal` rendered as centre, so the focal derivative was byte-identical to
+   * the plain one, and the optimizer skips keys that already exist. `focal` has since
+   * left the URL grammar for the same underlying reason — the delivery plane never
+   * reads the registry, so a stored point cannot reach the render. The value is kept
+   * as advisory metadata for consumers that position images themselves (CSS
+   * `object-position` and the like), and is documented as exactly that.
+   */
   async updateMetadata(
     assetId: string,
     input: { altText?: string | null; tags?: string[]; focalPoint?: FocalPoint | null },
   ): Promise<Asset> {
     bindAssetId(assetId);
-    const before = await this.repo.requireById(assetId);
+    // Existence check first, so an unknown id is a 404 rather than a driver error.
+    await this.repo.requireById(assetId);
 
     await this.repo.updateMetadata(assetId, input);
-
-    // A focal-point change alters focal-cropped output, so those derivatives must be
-    // re-derived under a new version rather than serving stale crops.
-    if (input.focalPoint !== undefined && before.currentVersion > 0) {
-      await this.reprocess(assetId);
-    }
 
     return this.repo.requireById(assetId);
   }

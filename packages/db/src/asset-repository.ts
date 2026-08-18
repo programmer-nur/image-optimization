@@ -35,6 +35,8 @@ export interface VersionMetadata {
   dominantColor?: string;
   lqip?: string;
   masterKey?: string;
+  /** Size of the master rendition. Recorded only where `masterKey` is. */
+  masterBytes?: number;
 }
 
 export interface RecordDerivativeInput {
@@ -157,6 +159,7 @@ export class AssetRepository {
           sourceKey: input.sourceKey,
           contentHash: input.contentHash,
           ...(meta.masterKey !== undefined ? { masterKey: meta.masterKey } : {}),
+          ...(meta.masterBytes !== undefined ? { masterBytes: BigInt(meta.masterBytes) } : {}),
           ...(meta.width !== undefined ? { width: meta.width } : {}),
           ...(meta.height !== undefined ? { height: meta.height } : {}),
           ...(meta.format !== undefined ? { format: meta.format } : {}),
@@ -168,6 +171,28 @@ export class AssetRepository {
           ...(meta.lqip !== undefined ? { lqip: meta.lqip } : {}),
         },
       });
+
+      /*
+       * The predecessor stops being current at exactly this instant.
+       *
+       * Recorded rather than inferred, because the retention window runs from here:
+       * reclamation used to age a superseded version off its own `createdAt`, which
+       * meant a source that had been live longer than the grace period was deletable
+       * the first time maintenance ran after it was replaced — original, master,
+       * derivatives, rows.
+       *
+       * Stamped with the successor's own database timestamp so both rows agree on one
+       * clock; an app-side `new Date()` would differ from `created_at` by the caller's
+       * skew. `updateMany` with a `supersededAt: null` guard, so a predecessor already
+       * removed by an earlier reclamation cannot fail this promotion, and a stamp is
+       * never restarted.
+       */
+      if (asset.currentVersion > 0) {
+        await tx.assetVersion.updateMany({
+          where: { assetId: input.assetId, version: asset.currentVersion, supersededAt: null },
+          data: { supersededAt: created.createdAt },
+        });
+      }
 
       await tx.asset.update({
         where: { id: input.assetId },
@@ -193,6 +218,9 @@ export class AssetRepository {
         ...(metadata.dominantColor !== undefined ? { dominantColor: metadata.dominantColor } : {}),
         ...(metadata.lqip !== undefined ? { lqip: metadata.lqip } : {}),
         ...(metadata.masterKey !== undefined ? { masterKey: metadata.masterKey } : {}),
+        ...(metadata.masterBytes !== undefined
+          ? { masterBytes: BigInt(metadata.masterBytes) }
+          : {}),
       },
     });
   }
@@ -374,19 +402,64 @@ export class AssetRepository {
   }
 
   /**
+   * Assets whose source is stored but whose optimization never happened.
+   *
+   * The upload path deliberately cannot fail on a failed enqueue — the bytes are
+   * already durable, and refusing the upload would throw away work that succeeded —
+   * so the job is lost silently and the asset stays `stored`: servable, but with no
+   * LQIP, no metadata, no warm set, and no route to `ready`. Nothing else in the
+   * system ever looks at it again.
+   *
+   * `updatedAt`, not `createdAt`: the version bump touches the asset row, so this asks
+   * "how long has this been waiting" rather than "how old is the asset". An unrelated
+   * metadata edit also refreshes it, which delays a re-enqueue — the safe direction.
+   *
+   * Bounded by `limit`, because a stalled optimizer behind a bulk import would
+   * otherwise load the whole catalogue into a Lambda that could not act on it anyway.
+   */
+  async awaitingOptimizationOlderThan(cutoff: Date, limit: number) {
+    return this.prisma.asset.findMany({
+      where: {
+        status: AssetStatus.stored,
+        deletedAt: null,
+        updatedAt: { lt: cutoff },
+        currentVersion: { gt: 0 },
+      },
+      select: { id: true, currentVersion: true, updatedAt: true },
+      orderBy: { updatedAt: 'asc' },
+      take: limit,
+    });
+  }
+
+  /**
    * Versions the asset has moved past, old enough to reclaim.
    *
-   * The age filter is on the *superseding* version's creation, not this one's: what
-   * matters is how long ago this version stopped being current, since that is when
-   * consumer pages started referencing the new URLs.
+   * The age filter is on `supersededAt` — the moment this version stopped being
+   * current — and never on its own `createdAt`. What the grace period protects is
+   * consumer HTML that still references the old URLs, so it has to be measured from
+   * when the new URLs appeared, not from when the old source was uploaded. Ageing off
+   * `createdAt` made a source that had been live for longer than the window deletable
+   * on the first run after it was replaced: original, master, every derivative, and
+   * the rows, one day into a thirty-day promise.
+   *
+   * A NULL `supersededAt` never matches, and that is deliberate: it means the moment
+   * is unknown — a row that predates the column, or one whose successor was lost —
+   * and an unknown must not be deletable. Reclamation fails toward keeping.
    */
   async supersededVersionsOlderThan(cutoff: Date) {
     const rows = await this.prisma.assetVersion.findMany({
       where: {
         asset: { deletedAt: null },
-        createdAt: { lt: cutoff },
+        supersededAt: { lt: cutoff },
       },
-      select: { assetId: true, version: true, sourceKey: true, masterKey: true, createdAt: true },
+      select: {
+        assetId: true,
+        version: true,
+        sourceKey: true,
+        masterKey: true,
+        createdAt: true,
+        supersededAt: true,
+      },
       orderBy: [{ assetId: 'asc' }, { version: 'asc' }],
     });
 
@@ -396,6 +469,10 @@ export class AssetRepository {
       ),
     );
 
+    // Kept even though a stamped row is by definition not current: this is the filter
+    // that stands between reclamation and a live asset's only source, and it costs one
+    // comparison. A stamp written in error is survivable; deleting the current
+    // version's original is not.
     return rows.filter((row) => {
       const current = currents.get(row.assetId);
       return current !== undefined && row.version < current;
@@ -430,26 +507,38 @@ export class AssetRepository {
    */
   async aggregateStorage(): Promise<{
     originalBytes: bigint;
+    masterBytes: bigint;
     derivativeBytes: bigint;
     assetCount: number;
     versionCount: number;
     derivativeCount: number;
     masterCount: number;
   }> {
-    const [versionAgg, derivativeAgg, assetCount, masterCount] = await Promise.all([
+    const [versionAgg, derivativeAgg, assetCount, masterAgg] = await Promise.all([
       this.prisma.assetVersion.aggregate({ _sum: { bytes: true }, _count: true }),
       this.prisma.derivative.aggregate({ _sum: { bytes: true }, _count: true }),
       this.prisma.asset.count({ where: { deletedAt: null } }),
-      this.prisma.assetVersion.count({ where: { masterKey: { not: null } } }),
+      // One query for both master numbers: a field-level `_count` counts rows where
+      // `masterKey` is non-null, which is the same set `_sum` totals over. Two
+      // queries could disagree with each other under concurrent writes and leave the
+      // report internally inconsistent for no benefit.
+      this.prisma.assetVersion.aggregate({
+        _sum: { masterBytes: true },
+        _count: { masterKey: true },
+      }),
     ]);
 
     return {
       originalBytes: versionAgg._sum.bytes ?? 0n,
+      // Masters written before `masterBytes` existed contribute 0 rather than an
+      // estimate. An invented number here would be indistinguishable from a measured
+      // one on the graph that decides whether to widen the master threshold.
+      masterBytes: masterAgg._sum.masterBytes ?? 0n,
       derivativeBytes: derivativeAgg._sum.bytes ?? 0n,
       assetCount,
       versionCount: versionAgg._count,
       derivativeCount: derivativeAgg._count,
-      masterCount,
+      masterCount: masterAgg._count.masterKey,
     };
   }
 }

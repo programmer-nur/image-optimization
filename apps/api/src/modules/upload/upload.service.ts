@@ -29,6 +29,37 @@ import { MalwareScanService } from './malware-scan.service.js';
 
 const HEADER_BYTES = 65_535;
 
+/**
+ * API error code to registry rejection reason.
+ *
+ * The two vocabularies are not the same and never were: the HTTP surface calls an
+ * oversize upload `payload_too_large`, the registry calls it `file_too_large`. This
+ * used to be a membership test against the registry's names, so the one code that
+ * differs failed the test and fell through to the catch-all — every oversize
+ * rejection recorded, and metered, as `unsupported_format`. That is the exact
+ * dimension the observability spec designates for telling a consuming application's
+ * bug apart from someone probing the uploader, so a mistranslation there is worse
+ * than no dimension at all.
+ *
+ * An explicit table instead, because the failure was silent: an unmapped code now
+ * lands on `unknown` rather than borrowing a reason that means something else.
+ */
+const REJECTION_REASON_BY_CODE: Record<string, RejectionReason> = {
+  content_type_mismatch: 'content_type_mismatch',
+  unsupported_format: 'unsupported_format',
+  pixel_limit_exceeded: 'pixel_limit_exceeded',
+  payload_too_large: 'file_too_large',
+  file_too_large: 'file_too_large',
+  empty_file: 'empty_file',
+  quota_exceeded: 'quota_exceeded',
+  malware_detected: 'malware_detected',
+};
+
+function rejectionReasonFor(error: unknown): RejectionReason {
+  if (!(error instanceof ApiError)) return 'unknown';
+  return REJECTION_REASON_BY_CODE[error.code] ?? 'unknown';
+}
+
 /** file-type ext for our detected formats, for the original object key. */
 const FORMAT_EXTENSION: Record<DetectedFormat, string> = {
   jpeg: FORMAT_EXTENSIONS.jpeg,
@@ -283,26 +314,12 @@ export class UploadService {
 
   private async reject(assetId: string, stagingKey: string, error: unknown): Promise<void> {
     await this.storage.delete(stagingKey).catch(() => undefined);
-    const reason: RejectionReason =
-      error instanceof ApiError && this.isRejectionReason(error.code)
-        ? (error.code as RejectionReason)
-        : 'unsupported_format';
+    const reason = rejectionReasonFor(error);
 
     // The reason dimension is what separates "a consuming application shipped a bug"
     // from "someone is probing the uploader" — same total, opposite responses.
     recordUploadRejection(reason, { assetId });
     await this.repo.markRejected(assetId, reason).catch(() => undefined);
-  }
-
-  private isRejectionReason(code: string): boolean {
-    return [
-      'content_type_mismatch',
-      'unsupported_format',
-      'pixel_limit_exceeded',
-      'file_too_large',
-      'empty_file',
-      'quota_exceeded',
-    ].includes(code);
   }
 
   private async hashStaged(stagingKey: string): Promise<string> {

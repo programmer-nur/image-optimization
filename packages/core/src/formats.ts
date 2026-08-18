@@ -57,8 +57,24 @@ export function supportsAlpha(format: OutputFormat): boolean {
  * fallback for sources with transparency, since a legacy browser that supports
  * neither modern format cannot receive alpha as JPEG.
  *
+ * ON THE DELIVERY PATH, `sourceHasAlpha` IS ALWAYS FALSE — and structurally must be.
+ * Normalization happens in the CloudFront Function, which has no asset metadata and
+ * no network, and the generator derives its spec from the key the edge already built.
+ * Neither can know whether a source carries transparency, so `auto` on a client that
+ * advertises neither AVIF nor WebP resolves to JPEG and the pipeline flattens the
+ * image onto the configured background. The PNG branch is reachable only from callers
+ * that hold real metadata: the programmatic API and the browser SDK, which can pass
+ * `format=png` explicitly for a transparent asset.
+ *
+ * The alternative — one URL with `Vary: Accept` and an origin that knows the asset —
+ * is the design this system rejected, and for a reason bigger than this edge case:
+ * it fragments the cache by the raw Accept string. Every browser shipping today
+ * supports WebP, so the affected population is legacy clients requesting transparent
+ * images, and they get a correct opaque image rather than a broken one. See design.md
+ * D9 and specs/cdn-delivery.
+ *
  * @param accept      Raw Accept header. Absent or empty is treated as legacy.
- * @param sourceHasAlpha Whether the source carries transparency.
+ * @param sourceHasAlpha Whether the source carries transparency. Unknowable at the edge.
  */
 export function resolveAutoFormat(
   accept: string | undefined,

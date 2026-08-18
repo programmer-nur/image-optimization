@@ -111,7 +111,9 @@ describe('toVariantName', () => {
     expect(keyFor('w=640&blur=5')).toBe('w640_q75_bl5.avif');
     expect(keyFor('w=640&sharpen=1')).toBe('w640_q75_sh1.avif');
     expect(keyFor('w=640&blur=10&sharpen=2')).toBe('w640_q75_bl10_sh2.avif');
-    expect(keyFor('w=640&h=360&fit=pad&background=ff0000')).toBe('w640_h360_pad_q75_bgff0000.avif');
+    expect(keyFor('w=640&h=360&fit=pad&background=ff0000')).toBe(
+      'w640_h360_contain_q75_bgff0000.avif',
+    );
     expect(keyFor('w=640&h=360&fit=cover&crop=attention')).toBe(
       'w640_h360_cover_q75_gattention.avif',
     );
@@ -172,9 +174,53 @@ describe('parseVariantName', () => {
     }
   });
 
-  it('accepts a non-ladder width, because the warm set can cap one at a tiny source', () => {
-    const parsed = parseVariantName('w12_q75.avif');
-    expect(parsed.ok).toBe(true);
+  /*
+   * The bound that the whole cost model rests on.
+   *
+   * `{id, version, epoch}` are visible in every public URL, so a derivative path can
+   * be constructed by anyone. Accepting an arbitrary width here would let a sweep of
+   * `w641, w642, …` mint one Sharp invocation, one permanent object, and one
+   * permanent cache entry apiece — bucketing holding only for viewers who happened to
+   * arrive through the edge.
+   */
+  it('rejects a width that is not a ladder rung', () => {
+    for (const name of ['w12_q75.avif', 'w641_q75.avif', 'w3839_q75.avif', 'w100000_q75.avif']) {
+      expect(parseVariantName(name), name).toEqual({
+        ok: false,
+        reason: 'malformed_variant',
+      });
+    }
+  });
+
+  it('accepts every ladder rung as a width, and as a lone height', () => {
+    for (const rung of LADDER) {
+      expect(parseVariantName(`w${rung}_q75.avif`).ok, `w${rung}`).toBe(true);
+      expect(parseVariantName(`h${rung}_q75.avif`).ok, `h${rung}`).toBe(true);
+    }
+  });
+
+  it('rejects a height the ratio quantizer could not have produced', () => {
+    // 640 x 360 is 16:9 and legal; 361 is not a value `Math.round(640 * ratio)` can
+    // return for any quantized ratio, so it can only have been hand-written.
+    expect(parseVariantName('w640_h360_cover_q75.avif').ok).toBe(true);
+    expect(parseVariantName('w640_h361_cover_q75.avif').ok).toBe(false);
+    expect(parseVariantName('w640_h13000_cover_q75.avif').ok).toBe(false);
+  });
+
+  /*
+   * The other half of that bound, and the half that is easy to get wrong: the check
+   * must accept *everything* the normalizer emits. A height wrongly refused here is a
+   * viewer URL that 400s forever, and only for the aspect ratios nobody tests by hand.
+   */
+  it('accepts every height the normalizer can emit', () => {
+    for (const width of LADDER) {
+      for (let requested = 1; requested <= width * 4; requested += 7) {
+        const spec = specFor(`w=${width}&h=${requested}`);
+        const name = toVariantName(spec);
+
+        expect(parseVariantName(name).ok, `${width}x${requested} -> ${name}`).toBe(true);
+      }
+    }
   });
 
   it.each([

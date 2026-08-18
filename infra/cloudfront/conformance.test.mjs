@@ -18,7 +18,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 import { CONFORMANCE_VECTORS, EQUIVALENCE_GROUPS } from '@imgopt/core/conformance-vectors';
-import { parseTransformFromQuery, toVariantName } from '@imgopt/core';
+import { parseTransformFromQuery, parseVariantName, toVariantName } from '@imgopt/core';
 
 import { OUTPUT_PATH, generate } from './generate.mjs';
 
@@ -92,6 +92,21 @@ describe('edge/core conformance', () => {
     // vectors stay an oracle rather than a mirror of whatever the code does.
     expect(edge).toBe(vector.expected);
     expect(edge).toBe(runCore(vector.query, vector.accept));
+
+    /*
+     * The composition: a key the edge emits must be a key the generator accepts.
+     *
+     * Agreeing on the key is not enough on its own now that `parseVariantName`
+     * enforces the ladder and the ratio grid. If those checks were ever stricter
+     * than the normalizer is, the two would still agree — and the resulting URL
+     * would 400 forever, for exactly the shapes nobody types by hand. Asserted for
+     * every vector at once rather than trusted.
+     */
+    if (!edge.startsWith('ERROR:')) {
+      expect(parseVariantName(edge).ok, `generator rejects an edge-emitted key: ${edge}`).toBe(
+        true,
+      );
+    }
   });
 });
 
@@ -129,6 +144,58 @@ describe('URI rewriting', () => {
   it('passes through a path outside the delivery prefix', () => {
     const event = eventFor('w=640', undefined, { uri: '/healthz' });
     expect(handler(event).uri).toBe('/healthz');
+  });
+
+  /*
+   * Signed delivery, end to end.
+   *
+   * `/p/*` is the same delivery behind a cache behavior with a trusted key group, so
+   * CloudFront has already refused the request if the signature was missing or wrong.
+   * What it must NOT do is skip normalization: an unnormalized `/p/` path 403s at S3,
+   * fails over to the generator, and 400s there — a correctly signed URL that has
+   * never once returned an image.
+   */
+  it('normalizes the signature-required prefix into the same key space', () => {
+    const priv = handler(
+      eventFor('w=602', 'image/avif', { uri: `/p/${ASSET_ID}/${VERSION}/x.jpg` }),
+    );
+    const pub = handler(
+      eventFor('w=602', 'image/avif', { uri: `/i/${ASSET_ID}/${VERSION}/x.jpg` }),
+    );
+
+    expect(priv.uri).toBe(`/derived/${ASSET_ID}/${VERSION}/w640_q75.avif`);
+    expect(priv.uri).toBe(pub.uri);
+    expect(priv.querystring).toEqual({});
+  });
+
+  it('applies the same rejections under the private prefix', () => {
+    const result = handler(
+      eventFor('w=abc', undefined, { uri: `/p/${ASSET_ID}/${VERSION}/x.jpg` }),
+    );
+    expect(result.statusCode).toBe(400);
+  });
+
+  /*
+   * The bypass that made bucketing optional.
+   *
+   * The default behavior routes every path to the S3-then-generator origin group, so
+   * before this check a client could skip the normalizer entirely and name a raw
+   * storage key — `w641`, `w642`, … — each one a Sharp invocation, a permanent
+   * object, and a permanent cache entry. The asset id, version, and epoch are all
+   * visible in ordinary public URLs, so nothing had to be guessed.
+   */
+  it.each([
+    '/derived/abc123/v1-1/w641_q75.avif',
+    '/derived/abc123/v1-1/w640_q75.avif',
+    '/original/abc123/1/source.png',
+    '/master/abc123/1/master.webp',
+    '/staging/some-upload-id',
+  ])('refuses the raw storage path %s', (uri) => {
+    const result = handler(eventFor('', undefined, { uri }));
+
+    expect(result.statusCode).toBe(400);
+    expect(result.headers['x-imgopt-error'].value).toBe('unsupported_path');
+    expect(result.headers['cache-control'].value).toBe('public, max-age=60');
   });
 
   it.each([

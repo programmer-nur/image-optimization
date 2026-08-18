@@ -12,10 +12,11 @@ var DEFAULT_QUALITY = 75;
 var BLUR_LEVELS = [0,2,5,10,20,40];
 var SHARPEN_LEVELS = [0,1,2];
 var FIT_MODES = ["cover","contain","inside","outside","fill","pad"];
+var FIT_ALIASES = {"pad":"contain"};
 var DEFAULT_FIT = "cover";
-var PADDING_FITS = ["contain","pad"];
-var CROPPING_FITS = ["cover","outside"];
-var CROP_GRAVITIES = ["center","top","bottom","left","right","entropy","attention","focal"];
+var PADDING_FITS = ["contain"];
+var CROPPING_FITS = ["cover"];
+var CROP_GRAVITIES = ["center","top","bottom","left","right","entropy","attention"];
 var DEFAULT_GRAVITY = "center";
 var REQUESTED_FORMATS = ["auto","avif","webp","jpeg","png"];
 var FORMAT_EXTENSIONS = {"avif":"avif","webp":"webp","jpeg":"jpg","png":"png"};
@@ -23,7 +24,8 @@ var MIN_DPR = 1;
 var MAX_DPR = 3;
 var DERIVED_PREFIX = "derived";
 var FULL_WIDTH_TOKEN = "full";
-var PATH_PREFIX = 'i';
+var VIEWER_PATH_PREFIXES = ["i","p"];
+var STORAGE_PREFIXES = ["derived","original","master","staging"];
 var ASSET_ID = /^[0-9A-Za-z_-]+$/;
 var VERSION_SEGMENT = /^v[0-9]+-[0-9]+$/;
 var NUMERIC = /^[0-9]+(\.[0-9]+)?$/;
@@ -79,13 +81,19 @@ function quantizeQuality(requested) {
 function normalizeBackground(raw) {
   var hex = raw.replace(/^%23/, '').replace(/^#/, '');
   if (!HEX.test(hex)) return undefined;
+  var expanded = hex;
   if (hex.length === 3 || hex.length === 4) {
-    var expanded = '';
+    expanded = '';
     for (var i = 0; i < hex.length; i++) expanded += hex.charAt(i) + hex.charAt(i);
-    return expanded;
   }
-  if (hex.length === 6 || hex.length === 8) return hex;
-  return undefined;
+  if (expanded.length !== 6 && expanded.length !== 8) return undefined;
+  var quantized = '';
+  for (var j = 0; j < expanded.length; j += 2) {
+    var level = Math.round(parseInt(expanded.substr(j, 2), 16) / 17) * 17;
+    var digits = level.toString(16);
+    quantized += digits.length === 1 ? '0' + digits : digits;
+  }
+  return quantized;
 }
 function resolveAutoFormat(accept) {
   if (accept.indexOf('image/avif') !== -1) return 'avif';
@@ -160,7 +168,7 @@ function normalize(query, accept) {
   var height;
   if (w !== undefined && h !== undefined) {
     width = snapWidth(w, dpr);
-    height = Math.round(width * quantizeRatio(h / w));
+    height = Math.round(width * quantizeRatio(Math.max(h, 1) / Math.max(w, 1)));
   } else if (w !== undefined) {
     width = snapWidth(w, dpr);
   } else if (h !== undefined) {
@@ -174,6 +182,7 @@ function normalize(query, accept) {
   if (height !== undefined) spec.height = height;
   var boxConstrained = width !== undefined && height !== undefined;
   var fit = fitRaw === undefined ? DEFAULT_FIT : fitRaw;
+  if (FIT_ALIASES[fit] !== undefined) fit = FIT_ALIASES[fit];
   if (boxConstrained) {
     spec.fit = fit;
     var gravity = cropRaw === undefined ? DEFAULT_GRAVITY : cropRaw;
@@ -193,7 +202,10 @@ function normalize(query, accept) {
 function handler(event) {
   var request = event.request;
   var segments = request.uri.split('/');
-  if (segments.length < 4 || segments.length > 5 || segments[1] !== PATH_PREFIX) {
+  if (has(STORAGE_PREFIXES, segments[1])) {
+    return reject('unsupported_path', 'path');
+  }
+  if (segments.length < 4 || segments.length > 5 || !has(VIEWER_PATH_PREFIXES, segments[1])) {
     return request;
   }
   var assetId = segments[2];

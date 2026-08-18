@@ -1,11 +1,14 @@
 /**
  * Processing error classification.
  *
- * The retriable/terminal split drives real behaviour: a terminal failure must skip
- * the retry budget and dead-letter immediately, because retrying a corrupt source
- * three times just burns Lambda invocations to reach the same conclusion. It also
- * separates "this image is broken" from "our infrastructure is broken" in the
- * failure metrics, which is the difference between ignoring an alert and paging.
+ * The retriable/terminal split drives real behaviour: a terminal failure is recorded
+ * on the asset and *acknowledged*, never redelivered. Retrying a corrupt source three
+ * times burns Lambda invocations to reach the same conclusion, and then parks an
+ * unactionable message in a dead-letter queue whose alarm has no tolerance — so the
+ * DLQ is reserved for retriable failures that never succeeded, and its depth stays a
+ * signal rather than a backlog of known-bad images. The split also separates "this
+ * image is broken" from "our infrastructure is broken" in the failure metrics, which
+ * is the difference between ignoring an alert and paging.
  */
 
 export type ProcessingErrorCode =

@@ -43,7 +43,11 @@ model Asset {
 
   altText    String?  @map("alt_text")
   tags       String[] @default([])
-  /// Normalised focal point, {x, y} in 0..1. Drives crop=focal.
+  /// Normalised focal point, {x, y} in 0..1.
+  ///
+  /// Advisory metadata for consumers that position images themselves. It does NOT
+  /// drive delivery: the delivery plane never reads this database, so a stored point
+  /// cannot reach the render — which is why `crop=focal` left the URL grammar.
   focalPoint Json?    @map("focal_point")
 
   /// Machine-readable reason for a terminal state. Null unless rejected/failed.
@@ -72,6 +76,9 @@ model AssetVersion {
   sourceKey String  @map("source_key")
   /// Bounded intermediate, only for very large sources. Never served to clients.
   masterKey String? @map("master_key")
+  /// Size of that master. Recorded because the conditional-master threshold is a
+  /// tuning decision, and a count of masters cannot show what widening it costs.
+  masterBytes BigInt? @map("master_bytes")
 
   /// SHA-256 of the original bytes, for upload deduplication.
   contentHash String @map("content_hash")
@@ -93,11 +100,19 @@ model AssetVersion {
 
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
 
+  /// When this version stopped being current — stamped by the transaction that
+  /// creates its successor. The retention window runs from here and never from
+  /// `createdAt`: a source that was live for a year and was replaced yesterday is one
+  /// day into its grace period, not a year past it. NULL means "still current, or the
+  /// moment is unknown", and reclamation never deletes on an unknown.
+  supersededAt DateTime? @map("superseded_at") @db.Timestamptz(3)
+
   asset       Asset        @relation(fields: [assetId], references: [id], onDelete: Cascade)
   derivatives Derivative[]
 
   @@id([assetId, version])
   @@index([contentHash])
+  @@index([supersededAt])
   @@map("asset_versions")
 }
 
@@ -127,7 +142,9 @@ model ApiKey {
   id   String @id
   name String
 
-  /// Salted hash. The plaintext is shown exactly once, at creation.
+  /// SHA-256 of the whole key, unsalted — the secret half is 32 random bytes, so
+  /// there is no dictionary for a salt to defeat. The plaintext is shown exactly
+  /// once, at creation. See apps/api/src/modules/auth/api-key.ts.
   hash String @unique
 
   /// Coarse permissions, e.g. ["upload", "delete"].
