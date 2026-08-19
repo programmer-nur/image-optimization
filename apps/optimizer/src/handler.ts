@@ -14,24 +14,21 @@
 import './sharp-init.js';
 import type { SQSBatchResponse, SQSEvent, SQSRecord } from 'aws-lambda';
 import pino from 'pino';
-import { loadConfig } from '@imgopt/config';
+import { loadConfig, requireWorkerCallbackUrl, requireWorkerSecret } from '@imgopt/config';
 import { S3Storage } from '@imgopt/storage';
-import {
-  UnscopedAssetRepository,
-  createPrismaClient,
-  hydrateDatabaseCredentials,
-} from '@imgopt/db';
 import type { OptimizeJob } from '@imgopt/queue';
 import { CORRELATION_ATTRIBUTE } from '@imgopt/queue';
+import { HttpRegistry } from './http-registry.js';
 import { Optimizer } from './optimizer.js';
 
-// Resolves the database password from Secrets Manager before configuration is read.
-// Runs during init — free time on a managed runtime — and is a no-op locally, where
-// the password is already in the environment. A Lambda environment variable is
-// plaintext in the console and the template, so the function is given the secret's
-// ARN instead of its value.
-await hydrateDatabaseCredentials();
-
+/*
+ * No database connection, and none to resolve.
+ *
+ * This function used to fetch an RDS password from Secrets Manager during init and
+ * open its own Postgres connection, which is the only reason it had to run inside a
+ * VPC — and the VPC is what a NAT gateway and six interface endpoints existed to
+ * serve. It records its results through the control plane instead (design.md L1/L2).
+ */
 const config = loadConfig();
 
 const baseLogger = pino({ level: config.logLevel, base: { component: 'optimizer' } });
@@ -43,11 +40,11 @@ const storage = new S3Storage({
   forcePathStyle: config.storage.forcePathStyle,
 });
 
-const prisma = createPrismaClient({
-  connectionString: config.database.url,
-  context: 'lambda',
+const registry = new HttpRegistry({
+  baseUrl: requireWorkerCallbackUrl(config, 'The optimizer'),
+  secret: requireWorkerSecret(config, 'The optimizer'),
+  timeoutMs: config.worker.callbackTimeoutMs,
 });
-const repo = new UnscopedAssetRepository(prisma);
 
 function parseJob(record: SQSRecord): OptimizeJob {
   const job = JSON.parse(record.body) as OptimizeJob;
@@ -78,7 +75,7 @@ export async function handler(event: SQSEvent): Promise<SQSBatchResponse> {
     try {
       const optimizer = new Optimizer(
         storage,
-        repo,
+        registry,
         config,
         logger.child({ assetId: job.assetId }),
       );

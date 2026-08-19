@@ -1,0 +1,49 @@
+# TLS for the control plane.
+#
+# Caddy rather than nginx + certbot for one reason: renewal is the part of this that
+# fails silently, eleven months later, on a date nobody has in a calendar. Caddy
+# obtains and renews automatically with the hostname as its entire configuration —
+# there is no cron entry to forget and no reload to miss.
+#
+# The hostname is the whole config. Everything below is either a security header or a
+# consequence of the API being a JSON service.
+
+{$API_HOST} {
+	# HTTP→HTTPS is automatic; Caddy redirects port 80 for any host it serves.
+
+	reverse_proxy api:3000 {
+		# The rate limiter identifies clients by this header. Caddy sets it from the
+		# real remote address and appends rather than replaces, so the left-most entry
+		# is the client — which is what the limiter reads.
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+
+		# Long enough for a proxied upload up to the threshold above which clients are
+		# sent to a presigned S3 target instead. Anything larger never arrives here.
+		transport http {
+			read_timeout 300s
+			write_timeout 300s
+		}
+	}
+
+	# Uploads below the proxy threshold still pass through. Above it the API answers
+	# 413 and names the presigned flow, so this bound only has to clear the threshold.
+	request_body {
+		max_size 110MB
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		# The control plane serves JSON, never a document — so there is nothing here for
+		# a browser to frame, and nothing that should be treated as a page.
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

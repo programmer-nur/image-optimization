@@ -59,9 +59,40 @@ export const appConfigSchema = z.object({
     forcePathStyle: bool.default(false),
   }),
 
+  /*
+   * Optional in the schema, and required by whoever actually needs it.
+   *
+   * Since the workers stopped holding their own connection (design.md L2), only the
+   * control plane and the reclamation job have a database at all. Leaving `url`
+   * required would mean the optimizer could not start without a connection string it
+   * never uses — and the obvious workaround, handing it a fake one, is how a worker
+   * ends up connecting to something. `requireDatabaseUrl` is the check, and it names
+   * who was asking.
+   */
   database: z.object({
-    url: z.string().min(1),
+    url: z.string().min(1).optional(),
     maxConnections: z.coerce.number().int().positive().default(10),
+  }),
+
+  /**
+   * The internal channel between the workers and the control plane.
+   *
+   * Workers post their bookkeeping here instead of writing to the registry directly,
+   * which is what keeps the database off the public internet — see design.md L1/L2.
+   */
+  worker: z.object({
+    /** Control-plane base URL. Set on the workers; unused by the control plane. */
+    callbackUrl: z.string().url().optional(),
+    /** Shared secret. Set on both sides; the control plane refuses to start without it. */
+    callbackSecret: z.string().min(1).optional(),
+    /**
+     * Deliberately short.
+     *
+     * The generator calls this on a viewer's critical path, and its bookkeeping is
+     * best-effort — waiting on a wedged control plane would turn a missing row into a
+     * slow image, which is the one thing that must not happen here.
+     */
+    callbackTimeoutMs: z.coerce.number().int().positive().default(2_000),
   }),
 
   queue: z.object({
@@ -197,6 +228,7 @@ export type UploadConfig = AppConfig['upload'];
 export type ProcessingConfig = AppConfig['processing'];
 export type DeliveryConfig = AppConfig['delivery'];
 export type LifecycleConfig = AppConfig['lifecycle'];
+export type WorkerConfig = AppConfig['worker'];
 
 export class ConfigError extends Error {
   constructor(issues: z.ZodIssue[]) {
@@ -218,8 +250,13 @@ function shape(env: NodeJS.ProcessEnv): unknown {
       forcePathStyle: env['S3_FORCE_PATH_STYLE'],
     },
     database: {
-      url: env['DATABASE_URL'] ?? composeDatabaseUrl(env),
+      url: env['DATABASE_URL'],
       maxConnections: env['DATABASE_MAX_CONNECTIONS'],
+    },
+    worker: {
+      callbackUrl: env['WORKER_CALLBACK_URL'],
+      callbackSecret: env['WORKER_CALLBACK_SECRET'],
+      callbackTimeoutMs: env['WORKER_CALLBACK_TIMEOUT_MS'],
     },
     queue: {
       optimizeQueueUrl: env['SQS_OPTIMIZE_QUEUE_URL'],
@@ -264,32 +301,6 @@ function shape(env: NodeJS.ProcessEnv): unknown {
   };
 }
 
-/**
- * Composes a connection URL from discrete parts.
- *
- * Deployed environments cannot supply `DATABASE_URL` directly without putting a
- * password in a task definition or a template. The host, port, user, and database
- * name are not secret and arrive as plain environment variables; only `DB_PASSWORD`
- * comes from the secret store, resolved when the container starts. Locally,
- * `DATABASE_URL` is still the simplest thing and takes precedence.
- *
- * Returns undefined when the set is incomplete, so zod reports the missing key
- * rather than this silently building a URL that cannot connect.
- */
-function composeDatabaseUrl(env: NodeJS.ProcessEnv): string | undefined {
-  const host = env['DB_HOST'];
-  const user = env['DB_USER'];
-  const password = env['DB_PASSWORD'];
-  const name = env['DB_NAME'];
-
-  if (!host || !user || !password || !name) return undefined;
-
-  const port = env['DB_PORT'] ?? '5432';
-  // Encoded: generated passwords routinely contain characters that would otherwise
-  // terminate the URL early and produce a baffling connection error.
-  return `postgresql://${encodeURIComponent(user)}:${encodeURIComponent(password)}@${host}:${port}/${name}`;
-}
-
 /** Strips keys whose value is undefined so zod applies defaults rather than failing. */
 function prune(value: unknown): unknown {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return value;
@@ -310,4 +321,56 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const result = appConfigSchema.safeParse(prune(shape(env)));
   if (!result.success) throw new ConfigError(result.error.issues);
   return result.data;
+}
+
+/**
+ * The database URL, or a named failure.
+ *
+ * Read by the control plane and by reclamation; every other consumer reaches the
+ * registry through the control plane instead (design.md L2). The `who` argument is
+ * the whole point of the helper — "missing DATABASE_URL" is a fine error until three
+ * different processes can produce it, at which point the one thing you want to know
+ * is which of them was starting.
+ */
+export function requireDatabaseUrl(config: AppConfig, who: string): string {
+  const url = config.database.url;
+  if (url === undefined) {
+    throw new Error(
+      `${who} needs a database connection but DATABASE_URL is not set. ` +
+        'Only the control plane and the reclamation job hold one; the optimizer and ' +
+        'generator reach the registry through the control plane.',
+    );
+  }
+  return url;
+}
+
+/**
+ * The shared secret the internal worker routes are authenticated with.
+ *
+ * Required on both sides, and absent means *stop*. Serving the internal prefix with
+ * no secret would expose unscoped registry writes to anyone who could reach the host,
+ * so this is deliberately not defaultable and deliberately not optional-at-runtime.
+ */
+export function requireWorkerSecret(config: AppConfig, who: string): string {
+  const secret = config.worker.callbackSecret;
+  if (secret === undefined) {
+    throw new Error(
+      `${who} needs WORKER_CALLBACK_SECRET. It authenticates the internal worker ` +
+        'routes, which write to the registry unscoped — an unset secret is refused ' +
+        'rather than treated as "no authentication required".',
+    );
+  }
+  return secret;
+}
+
+/** Base URL of the control plane, for a worker posting its bookkeeping. */
+export function requireWorkerCallbackUrl(config: AppConfig, who: string): string {
+  const url = config.worker.callbackUrl;
+  if (url === undefined) {
+    throw new Error(
+      `${who} needs WORKER_CALLBACK_URL — the control plane it records its results ` +
+        'against. It holds no database connection of its own.',
+    );
+  }
+  return url.replace(/\/+$/, '');
 }

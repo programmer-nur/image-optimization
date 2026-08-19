@@ -27,6 +27,9 @@ process.env['SQS_ENDPOINT'] ??= 'http://localhost:9324';
 process.env['CDN_HOST'] ??= 'cdn.example.com';
 process.env['UPLOAD_PROXY_THRESHOLD_BYTES'] ??= String(5 * 1024 * 1024);
 process.env['LOG_LEVEL'] ??= 'error';
+// The control plane refuses to start without this — serving the internal worker
+// routes unauthenticated is worse than not starting at all.
+process.env['WORKER_CALLBACK_SECRET'] ??= 'itest-worker-secret';
 
 const { createApp } = await import('./app.factory.js');
 const { ApiKeyService } = await import('./modules/auth/api-key.service.js');

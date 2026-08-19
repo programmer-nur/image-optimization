@@ -12,8 +12,8 @@ This page is the shape of the thing.
 ```mermaid
 flowchart LR
     subgraph Control["Control plane — rare, stateful"]
-        A[Client backend] -->|"POST /v1/images"| B[NestJS on ECS Fargate]
-        B --> C[(PostgreSQL)]
+        A[Client backend] -->|"POST /v1/images"| B["NestJS on Lightsail<br/>(Caddy → Docker)"]
+        B --> C[("PostgreSQL<br/>Lightsail, private-only")]
         B --> D[SQS optimize queue]
     end
     subgraph Delivery["Delivery plane — massive, stateless"]
@@ -27,8 +27,15 @@ flowchart LR
     B --> G
     D --> I[Optimizer Lambda]
     I --> G
-    I --> C
+    I -.->|"HTTPS bookkeeping"| B
+    H -.->|"HTTPS bookkeeping"| B
 ```
+
+**The Lambdas hold no database connection.** They record what they did by calling the
+control plane, which is what keeps PostgreSQL reachable only from one host and what
+lets both functions run outside a VPC — no NAT gateway, no interface endpoints. The
+dotted arrows are the only path from the workers to the registry. See design.md L1 and
+L2.
 
 The separation is the load-bearing decision. The control plane is **never** in the
 image read path, and the delivery path **never** queries PostgreSQL. That means an
@@ -165,10 +172,10 @@ Worked numbers are in design.md D16.
 
 | Component          | Runs on         | Purpose                                                    |
 | ------------------ | --------------- | ---------------------------------------------------------- |
-| `apps/api`         | ECS Fargate     | Uploads, validation, metadata, lifecycle                   |
+| `apps/api`         | Lightsail       | Uploads, validation, metadata, lifecycle, worker callbacks |
 | `apps/optimizer`   | Lambda (SQS)    | Metadata, LQIP, conditional master, eager warm set         |
 | `apps/generator`   | Lambda (Fn URL) | On-miss generation                                         |
-| `apps/maintenance` | Lambda (daily)  | Orphan reconciliation, expiry, reaping, storage accounting |
+| `apps/maintenance` | Lightsail cron  | Orphan reconciliation, expiry, reaping, storage accounting |
 | `infra/cloudfront` | CloudFront      | Edge normalizer, **generated** from `packages/core`        |
 | `infra/cloudflare` | your laptop, CI | DNS records and ACM issuance — outside the CDK, see D18    |
 | `packages/core`    | everywhere      | Transform grammar, ladder, canonical key. Zero AWS imports |
@@ -176,9 +183,9 @@ Worked numbers are in design.md D16.
 
 ## DNS sits in front, and only resolves
 
-Names are managed in Cloudflare; AWS holds no hosted zone. Both hostnames are plain
-`CNAME` records onto the CloudFront distribution and the load balancer, with
-Cloudflare's **proxy switched off**.
+Names are managed in Cloudflare; AWS holds no hosted zone. The delivery hostname is a
+`CNAME` onto the CloudFront distribution and the control-plane hostname is an `A` record
+onto the instance's static IP, both with Cloudflare's **proxy switched off**.
 
 That last part is load-bearing rather than a preference. Format negotiation happens at
 the CloudFront edge: one URL returns AVIF, WebP or JPEG depending on the viewer's

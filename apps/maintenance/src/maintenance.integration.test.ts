@@ -10,7 +10,7 @@
  */
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { loadConfig, type AppConfig } from '@imgopt/config';
+import { loadConfig, requireDatabaseUrl, type AppConfig } from '@imgopt/config';
 import { S3Storage } from '@imgopt/storage';
 import type { QueuePort } from '@imgopt/queue';
 import {
@@ -43,7 +43,9 @@ const storage = new S3Storage({
   credentials: { accessKeyId: 'minioadmin', secretAccessKey: 'minioadmin' },
 });
 
-const prisma: PrismaClient = createPrismaClient({ connectionString: config.database.url });
+const prisma: PrismaClient = createPrismaClient({
+  connectionString: requireDatabaseUrl(config, 'The maintenance integration suite'),
+});
 const repo = new UnscopedAssetRepository(prisma);
 const noopLogger = { info() {}, warn() {}, error() {} };
 

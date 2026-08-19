@@ -4,7 +4,7 @@ import { desiredRecords, formatPlan, reconcile, type ExistingRecord } from './re
 const hosts = { cdnHost: 'images.example.com', apiHost: 'api.example.com' };
 const outputs = {
   cdnTarget: 'd111.cloudfront.net',
-  apiTarget: 'alb-123.us-east-1.elb.amazonaws.com',
+  apiTarget: '203.0.113.42',
 };
 
 describe('desired records', () => {
@@ -13,7 +13,14 @@ describe('desired records', () => {
 
     expect(records).toEqual([
       expect.objectContaining({ name: 'images.example.com', content: 'd111.cloudfront.net' }),
-      expect.objectContaining({ name: 'api.example.com', content: outputs.apiTarget }),
+      expect.objectContaining({
+        name: 'api.example.com',
+        content: outputs.apiTarget,
+        // A, not CNAME: the control plane is an instance with a static IP, not a load
+        // balancer with a hostname. Asserted because the two are silently
+        // interchangeable in this shape and only one of them resolves.
+        type: 'A',
+      }),
     ]);
   });
 

@@ -12,7 +12,7 @@
 
 import { Global, Module, type OnApplicationShutdown } from '@nestjs/common';
 import { Inject, Injectable } from '@nestjs/common';
-import { loadConfig, type AppConfig } from '@imgopt/config';
+import { loadConfig, requireDatabaseUrl, type AppConfig } from '@imgopt/config';
 import { S3Storage, type StoragePort } from '@imgopt/storage';
 import { SqsQueue, type QueuePort } from '@imgopt/queue';
 import { TenantScopedRepository, createPrismaClient, type PrismaClient } from '@imgopt/db';
@@ -69,7 +69,7 @@ class ResourceCleanup implements OnApplicationShutdown {
       provide: PRISMA,
       useFactory: (config: AppConfig): PrismaClient =>
         createPrismaClient({
-          connectionString: config.database.url,
+          connectionString: requireDatabaseUrl(config, 'The control plane'),
           context: 'container',
           maxConnections: config.database.maxConnections,
         }),

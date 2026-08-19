@@ -8,17 +8,14 @@
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import sharp from 'sharp';
-import { loadConfig, type AppConfig } from '@imgopt/config';
+import { loadConfig, requireDatabaseUrl, type AppConfig } from '@imgopt/config';
 import { S3Storage } from '@imgopt/storage';
-import {
-  DEFAULT_TENANT_ID,
-  UnscopedAssetRepository,
-  createPrismaClient,
-  newAssetId,
-} from '@imgopt/db';
+import { createPrismaClient, newAssetId } from '@imgopt/db';
 import type { PrismaClient } from '@imgopt/db';
 import { toCanonicalKey, type TransformSpec } from '@imgopt/core';
 import { Optimizer } from './optimizer.js';
+import { PrismaRegistry } from './test-support/prisma-registry.js';
+import { RegistryFixtures } from './test-support/fixtures.js';
 
 process.env['AWS_REGION'] ??= 'us-east-1';
 process.env['S3_BUCKET'] ??= 'imgopt-dev';
@@ -43,10 +40,13 @@ const storage = new S3Storage({
   forcePathStyle: true,
   credentials: { accessKeyId: 'minioadmin', secretAccessKey: 'minioadmin' },
 });
-const prisma: PrismaClient = createPrismaClient({ connectionString: config.database.url });
-const repo = new UnscopedAssetRepository(prisma);
+const prisma: PrismaClient = createPrismaClient({
+  connectionString: requireDatabaseUrl(config, 'The optimizer integration suite'),
+});
+const fixtures = new RegistryFixtures(prisma);
+const registry = new PrismaRegistry(prisma);
 const noopLogger = { info() {}, warn() {}, error() {} };
-const optimizer = new Optimizer(storage, repo, config, noopLogger);
+const optimizer = new Optimizer(storage, registry, config, noopLogger);
 
 const createdIds: string[] = [];
 
@@ -54,10 +54,10 @@ const createdIds: string[] = [];
 async function storeAsset(bytes: Buffer, ext = 'jpg'): Promise<string> {
   const id = newAssetId();
   createdIds.push(id);
-  await repo.create({ tenantId: DEFAULT_TENANT_ID, id });
+  await fixtures.createAsset(id);
   const sourceKey = `original/${id}/1/source.${ext}`;
   await storage.put(sourceKey, bytes, { contentType: 'image/jpeg' });
-  await repo.addVersion({
+  await fixtures.addVersion({
     assetId: id,
     sourceKey,
     contentHash: `hash-${id}`,
@@ -104,7 +104,7 @@ describe('warm set', () => {
     const outcome = await optimizer.process(job(id));
     expect(outcome.status).toBe('processed');
 
-    const version = await repo.currentVersion(id);
+    const version = await fixtures.readCurrentVersion(id);
     expect(version?.width).toBe(1600);
     expect(version?.height).toBe(900);
     expect(version?.hasAlpha).toBe(false);
@@ -112,7 +112,7 @@ describe('warm set', () => {
     expect(version?.dominantColor).toMatch(/^[0-9a-f]{6}$/);
 
     // 2 widths x 2 formats = 4 derivatives at the canonical keys.
-    const asset = await repo.requireById(id);
+    const asset = await fixtures.readAsset(id);
     expect(asset.status).toBe('ready');
     for (const width of [640, 1080]) {
       for (const format of ['avif', 'webp'] as const) {
@@ -127,7 +127,7 @@ describe('warm set', () => {
     const id = await storeAsset(await photo(1200, 800));
     await optimizer.process(job(id));
 
-    const rows = await repo.listDerivatives(id);
+    const rows = await fixtures.readDerivatives(id);
     expect(rows.length).toBe(4);
     expect(rows.every((r) => r.generatedBy === 'warm')).toBe(true);
   });
@@ -138,7 +138,7 @@ describe('warm set', () => {
     const outcome = await optimizer.process(job(id));
     expect(outcome.status).toBe('processed');
 
-    const rows = await repo.listDerivatives(id);
+    const rows = await fixtures.readDerivatives(id);
     const widths = new Set(rows.map((r) => r.width));
     expect(widths.has(480)).toBe(true);
     expect([...widths].every((w) => (w ?? 0) <= 500)).toBe(true);
@@ -152,7 +152,7 @@ describe('conditional master', () => {
     const id = await storeAsset(await photo(3000, 2000));
     await optimizer.process(job(id));
 
-    const version = await repo.currentVersion(id);
+    const version = await fixtures.readCurrentVersion(id);
     expect(version?.masterKey).toBeDefined();
     expect(await storage.exists(version!.masterKey!)).toBe(true);
 
@@ -165,7 +165,7 @@ describe('conditional master', () => {
     const id = await storeAsset(await photo(1200, 800));
     await optimizer.process(job(id));
 
-    const version = await repo.currentVersion(id);
+    const version = await fixtures.readCurrentVersion(id);
     expect(version?.masterKey).toBeNull();
   });
 });
@@ -181,7 +181,7 @@ describe('idempotency', () => {
     expect(second.status).toBe('processed');
 
     // Reprocessing must not duplicate derivatives.
-    const rows = await repo.listDerivatives(id);
+    const rows = await fixtures.readDerivatives(id);
     expect(rows.length).toBe(4);
   });
 });
@@ -190,7 +190,7 @@ describe('skips', () => {
   it('skips a job for a superseded version', async () => {
     const id = await storeAsset(await photo(800, 600));
     // Advance to version 2 so the version-1 job is stale.
-    await repo.addVersion({
+    await fixtures.addVersion({
       assetId: id,
       sourceKey: `original/${id}/2/source.jpg`,
       contentHash: `h2-${id}`,
@@ -202,7 +202,7 @@ describe('skips', () => {
 
   it('skips a deleted asset', async () => {
     const id = await storeAsset(await photo(800, 600));
-    await repo.softDelete(id);
+    await fixtures.softDelete(id);
 
     const outcome = await optimizer.process(job(id));
     expect(outcome).toEqual({ status: 'skipped', reason: 'asset_deleted' });
@@ -218,18 +218,18 @@ describe('terminal failure', () => {
   it('marks the asset failed for a corrupt source without asking for a retry', async () => {
     const id = newAssetId();
     createdIds.push(id);
-    await repo.create({ tenantId: DEFAULT_TENANT_ID, id });
+    await fixtures.createAsset(id);
     const sourceKey = `original/${id}/1/source.jpg`;
     // Truncated JPEG: a real decode error, classified terminal.
     const truncated = (await photo(800, 600)).subarray(0, 200);
     await storage.put(sourceKey, truncated);
-    await repo.addVersion({ assetId: id, sourceKey, contentHash: `h-${id}` });
+    await fixtures.addVersion({ assetId: id, sourceKey, contentHash: `h-${id}` });
 
     const outcome = await optimizer.process(job(id));
     expect(outcome.status).toBe('failed');
     expect(outcome).toMatchObject({ retriable: false });
 
-    const asset = await repo.requireById(id);
+    const asset = await fixtures.readAsset(id);
     expect(asset.status).toBe('failed');
     expect(asset.failureReason).toBe('corrupt_source');
   });

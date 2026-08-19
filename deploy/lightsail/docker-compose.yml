@@ -1,0 +1,88 @@
+# The control plane, on one Lightsail instance.
+#
+# Three services and no orchestrator, which is the whole point: the image is the same
+# one Fargate ran, so the artifact and the rollback story are unchanged (design.md L3).
+# Moving to ECS later is a different scheduler for these same containers.
+#
+# Started by `deploy.sh`, which pins IMAGE_TAG to an immutable tag. Do not run
+# `docker compose up` by hand without one — the default below is deliberately absent so
+# the failure is "IMAGE_TAG is not set" rather than a silent `:latest`.
+
+services:
+  # Runs to completion before the API starts. Migrations are never a container
+  # entrypoint: two API containers starting at once would race to apply the same
+  # migration, and the result of that is a half-migrated schema rather than an error.
+  migrate:
+    image: ${IMAGE_REPO:?set IMAGE_REPO}:${IMAGE_TAG:?set IMAGE_TAG to an immutable tag}
+    command: ['node', 'packages/db/scripts/migrate.mjs']
+    env_file: [.env]
+    restart: 'no'
+
+  api:
+    image: ${IMAGE_REPO:?set IMAGE_REPO}:${IMAGE_TAG:?set IMAGE_TAG to an immutable tag}
+    env_file: [.env]
+    # Published to the loopback interface only. Caddy is the sole way in, which is
+    # what makes the rate limiter's trust of `x-forwarded-for` sound: no client can
+    # set that header on a connection the proxy did not make.
+    ports: ['127.0.0.1:3000:3000']
+    restart: unless-stopped
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      # `/healthz` and not `/readyz`: liveness must not depend on Postgres. A database
+      # blip would otherwise restart a perfectly healthy process, and restarting is the
+      # one thing that cannot help.
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging:
+      # Bounded on purpose. An unrotated JSON log is the most common way a small
+      # instance fills its disk, and a full disk takes Postgres' client down with it.
+      driver: json-file
+      options: { max-size: '20m', max-file: '5' }
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports: ['80:80', '443:443']
+    environment:
+      API_HOST: ${API_HOST:?set API_HOST}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Certificates and the ACME account key. **This volume is the thing to preserve.**
+      # Losing it is not fatal — Caddy re-issues — but it burns Let's Encrypt rate
+      # limit against the domain, and hitting that limit means no certificate for a
+      # week.
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [api]
+    logging:
+      driver: json-file
+      options: { max-size: '20m', max-file: '5' }
+
+  # Not started with the stack. Invoked by cron as `docker compose run --rm maintenance`.
+  maintenance:
+    image: ${IMAGE_REPO:?set IMAGE_REPO}:${IMAGE_TAG:?set IMAGE_TAG to an immutable tag}
+    command: ['node', 'maintenance.mjs']
+    env_file: [.env]
+    restart: 'no'
+    profiles: ['scheduled']
+    volumes:
+      # The run lock lives here rather than in the container's own /tmp, which would be
+      # a fresh empty directory every run and would make the overlap guard a no-op.
+      - maintenance_state:/var/lib/imgopt
+    environment:
+      MAINTENANCE_LOCK_PATH: /var/lib/imgopt/maintenance.lock
+
+volumes:
+  caddy_data:
+  caddy_config:
+  maintenance_state:

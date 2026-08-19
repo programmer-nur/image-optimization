@@ -13,23 +13,26 @@
 import './sharp-init.js';
 import type { LambdaFunctionURLEvent, LambdaFunctionURLResult } from 'aws-lambda';
 import pino from 'pino';
-import { loadConfig } from '@imgopt/config';
+import { loadConfig, requireWorkerCallbackUrl, requireWorkerSecret } from '@imgopt/config';
 import { S3Storage } from '@imgopt/storage';
-import {
-  UnscopedAssetRepository,
-  DerivativeOrigin,
-  createPrismaClient,
-  hydrateDatabaseCredentials,
-} from '@imgopt/db';
+/*
+ * Not imported from `@imgopt/db`.
+ *
+ * A value import from that package pulls `PrismaClient` into this bundle, and this
+ * function holds no database connection (design.md L2). The literal is what the
+ * control plane validates against its own enum on arrival.
+ */
+const ONDEMAND = 'ondemand';
 import { Generator, type RecordDerivative } from './generator.js';
 
-// Resolves the database password from Secrets Manager before configuration is read.
-// Runs during init — free time on a managed runtime — and is a no-op locally, where
-// the password is already in the environment. A Lambda environment variable is
-// plaintext in the console and the template, so the function is given the secret's
-// ARN instead of its value.
-await hydrateDatabaseCredentials();
-
+/*
+ * No database connection, and none to resolve.
+ *
+ * This function is on the viewer's critical path and its bookkeeping has always been
+ * best-effort — `generator.ts` swallows a failure here by design. Moving it from a
+ * Postgres write to an HTTP POST changes nothing about that, and it is what lets the
+ * function run outside a VPC (design.md L1/L2).
+ */
 const config = loadConfig();
 
 const baseLogger = pino({ level: config.logLevel, base: { component: 'generator' } });
@@ -41,17 +44,34 @@ const storage = new S3Storage({
   forcePathStyle: config.storage.forcePathStyle,
 });
 
-// Bookkeeping only — for cost attribution, orphan GC, and answering "what did we
-// actually generate". Never read by the delivery path, and constructed lazily so a
-// database that is slow or down costs nothing until the first miss.
-let repo: UnscopedAssetRepository | undefined;
+/*
+ * Bookkeeping only — cost attribution, orphan GC, and answering "what did we actually
+ * generate". Never read by the delivery path.
+ *
+ * The timeout is short and deliberate. A control plane that accepts the connection and
+ * then stalls would otherwise hold a viewer's request open for as long as it takes to
+ * hit the function's own timeout, turning a missing database row into a slow image.
+ * The row is optional; the image is not.
+ */
+const callbackUrl = requireWorkerCallbackUrl(config, 'The generator');
+const workerSecret = requireWorkerSecret(config, 'The generator');
 
 const recordDerivative: RecordDerivative = async (record) => {
-  repo ??= new UnscopedAssetRepository(
-    createPrismaClient({ connectionString: config.database.url, context: 'lambda' }),
-  );
+  const response = await fetch(`${callbackUrl}/internal/v1/derivatives`, {
+    method: 'POST',
+    signal: AbortSignal.timeout(config.worker.callbackTimeoutMs),
+    headers: {
+      'content-type': 'application/json',
+      'x-imgopt-worker-secret': workerSecret,
+    },
+    body: JSON.stringify({ ...record, generatedBy: ONDEMAND }),
+  });
 
-  return repo.recordDerivative({ ...record, generatedBy: DerivativeOrigin.ondemand });
+  // Thrown, not returned: `generator.ts` owns the decision to swallow it, and it logs
+  // the reason. Returning quietly here would move that decision somewhere invisible.
+  if (!response.ok) {
+    throw new Error(`derivative bookkeeping returned ${response.status}`);
+  }
 };
 
 const generator = new Generator(storage, config, baseLogger, recordDerivative);

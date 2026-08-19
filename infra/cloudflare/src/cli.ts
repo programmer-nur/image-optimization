@@ -70,7 +70,6 @@ async function dns(apply: boolean): Promise<void> {
 }
 
 async function certs(): Promise<void> {
-  const region = process.env['CDK_REGION'] ?? 'us-east-1';
   const cloudflare = client();
 
   const targets: Array<{ label: string; domainName: string; region: string; envVar: string }> = [
@@ -84,15 +83,18 @@ async function certs(): Promise<void> {
     },
   ];
 
-  if (process.env['API_HOST'] !== undefined && process.env['API_HOST'] !== '') {
-    targets.push({
-      label: 'load balancer',
-      domainName: process.env['API_HOST'],
-      // An ALB accepts one only from its own region. Two certificates, always.
-      region,
-      envVar: 'API_CERTIFICATE_ARN',
-    });
-  }
+  /*
+   * One certificate, where there used to be two.
+   *
+   * The second was for the load balancer, in the deployment's own region, because an
+   * ALB accepts a certificate only from there. There is no load balancer: the control
+   * plane runs on a Lightsail instance and terminates its own TLS with a certificate
+   * it obtains and renews itself, and an ACM certificate cannot be attached to a
+   * Lightsail instance in any case. See design.md L3.
+   *
+   * Nothing to do here for `API_HOST` — its certificate appears the first time the
+   * host answers on port 443.
+   */
 
   for (const target of targets) {
     console.log(

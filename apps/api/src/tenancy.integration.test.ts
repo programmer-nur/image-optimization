@@ -29,6 +29,9 @@ process.env['SQS_OPTIMIZE_QUEUE_URL'] ??= 'http://localhost:9324/000000000000/im
 process.env['SQS_ENDPOINT'] ??= 'http://localhost:9324';
 process.env['CDN_HOST'] ??= 'cdn.example.com';
 process.env['LOG_LEVEL'] ??= 'error';
+// The control plane refuses to start without this — serving the internal worker
+// routes unauthenticated is worse than not starting at all.
+process.env['WORKER_CALLBACK_SECRET'] ??= 'itest-worker-secret';
 
 const { createApp } = await import('./app.factory.js');
 const { ApiKeyService } = await import('./modules/auth/api-key.service.js');

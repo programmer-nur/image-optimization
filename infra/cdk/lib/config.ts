@@ -28,7 +28,6 @@
 
 import { Duration, RemovalPolicy } from 'aws-cdk-lib';
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
-import * as ec2 from 'aws-cdk-lib/aws-ec2';
 
 export interface EnvironmentConfig {
   /** Short name; every resource is prefixed with it. */
@@ -56,16 +55,32 @@ export interface EnvironmentConfig {
   cdnCertificateArn?: string;
 
   /**
-   * Pre-issued certificate for the load balancer, in the deployment's own region.
+   * Where the workers post their bookkeeping — the control plane's public base URL.
    *
-   * The regional counterpart to `cdnCertificateArn`, and genuinely a second
-   * certificate: CloudFront accepts a viewer certificate only from us-east-1, and an
-   * ALB accepts one only from its own region. Substituting one for the other fails
-   * when CloudFormation tries to attach it, not at synth.
-   *
-   * Production refuses to synthesize without one — see ComputeStack.
+   * The workers hold no database connection (design.md L2), so this is how anything
+   * they do reaches the registry. Required: a worker deployed without it fails at
+   * init rather than silently dropping every record it was supposed to write.
    */
-  apiCertificateArn?: string;
+  workerCallbackUrl: string;
+
+  /**
+   * Shared secret authenticating those calls.
+   *
+   * Supplied as an environment value on both sides. It grants bookkeeping writes and
+   * nothing else — no tenant scope, no delivery access, no ability to read an asset —
+   * which is what makes a plain environment variable an acceptable home for it. It
+   * rotates by redeploying both halves.
+   */
+  workerCallbackSecret: string;
+
+  /**
+   * The Lightsail instance the control plane runs on, for its status-check alarm.
+   *
+   * Optional because the instance is provisioned outside CloudFormation and may not
+   * exist on a first deploy. Absent means no instance alarm — which is a real gap, so
+   * the observability stack says so rather than quietly skipping it.
+   */
+  controlPlaneInstanceName?: string;
 
   /**
    * This environment's distribution id, pinning the bucket's read grant to it.
@@ -80,27 +95,6 @@ export interface EnvironmentConfig {
    * CDN stack's outputs, set `CDN_DISTRIBUTION_ID`, and redeploy storage.
    */
   cdnDistributionId?: string;
-
-  network: {
-    maxAzs: number;
-    /**
-     * NAT gateways.
-     *
-     * S3 and SQS reach the private subnets through VPC endpoints, so the NAT exists
-     * only for AWS APIs that have no endpoint configured. Zero is viable and cheaper
-     * once every dependency is endpoint-backed, but it fails closed and obscurely —
-     * a missing endpoint looks like a hang, not an error — so the default is one.
-     *
-     * The residual, stated so it is priced deliberately rather than discovered: one
-     * NAT gateway lives in one availability zone, and everything not endpoint-backed
-     * goes through it — including ECR image pulls for task launches, X-Ray, and STS.
-     * Losing that zone costs egress and new task launches for the survivors, not just
-     * the tasks in it. Two NATs in production is one line and roughly one extra
-     * hourly charge; it is deliberately not taken by default because the endpoints
-     * already keep the hot paths off it.
-     */
-    natGateways: number;
-  };
 
   storage: {
     /** Age at which originals move to infrequent access. Derivatives never move. */
@@ -140,26 +134,17 @@ export interface EnvironmentConfig {
     accessLogRetentionDays: number;
   };
 
-  database: {
-    instanceType: ec2.InstanceType;
-    allocatedStorageGb: number;
-    multiAz: boolean;
-    backupRetention: Duration;
-  };
-
   api: {
-    cpu: number;
-    memoryMb: number;
-    desiredCount: number;
-    minCapacity: number;
-    maxCapacity: number;
     /**
-     * The image the service and the migration task both run.
+     * The image the control plane and the migration step both run.
      *
-     * Required, and never `latest`. The tag is the rollback coordinate: with a
-     * mutable one, "redeploy the previous version" is ambiguous — the same tag can
-     * point at different bytes on two consecutive days — and the service and the
-     * migration task can silently disagree about which version they are.
+     * Required, and never `latest`. The tag is the rollback coordinate: with a mutable
+     * one, "redeploy the previous version" is ambiguous — the same tag can point at
+     * different bytes on two consecutive days — and the running container and the
+     * migration can silently disagree about which version they are.
+     *
+     * Still here after the move off Fargate, because it is the same image and the same
+     * rollback: `docker compose pull` a tag, or go back to the previous one.
      */
     imageTag: string;
   };
@@ -177,12 +162,13 @@ export interface EnvironmentConfig {
     /**
      * Ceiling on how many optimizer invocations SQS may run at once.
      *
-     * This is a database-connection budget, not a throughput dial. Each optimizer
-     * invocation opens its own Postgres connection (the Lambda client is pinned to a
-     * pool of one), and it shares one small instance with the control plane — so an
-     * unbounded consumer means a bulk import can cure its own backlog by exhausting
-     * the connections the API needs to accept uploads. The backlog drains slightly
-     * slower and the control plane stays up.
+     * A control-plane budget, not a throughput dial. Each invocation now posts its
+     * results to the single instance that also accepts uploads, so an unbounded
+     * consumer means a bulk import cures its own backlog by overwhelming the API. The
+     * backlog drains slightly slower and the control plane stays up.
+     *
+     * It used to be a database-connection budget and the number is unchanged, because
+     * the constraint is the same one wearing a different hat: one small host, shared.
      *
      * Event-source concurrency rather than reserved concurrency on the function:
      * reserved concurrency permanently carves capacity out of the account pool, which
@@ -276,7 +262,6 @@ export interface EnvironmentConfig {
 }
 
 const BASE = {
-  network: { maxAzs: 2, natGateways: 1 },
   storage: {
     originalsInfrequentAccessDays: 30,
     originalsArchiveDays: 180,
@@ -361,13 +346,14 @@ const LAMBDA = {
    * Sized against the database, with the arithmetic written down because the number
    * looks arbitrary otherwise.
    *
-   * One connection per concurrent invocation. Production budget: the API can hold up
-   * to 10 connections per task across 10 tasks (100), the generator's own bookkeeping
-   * writes can add up to its reserved concurrency (50), and a `t4g.small`'s default
-   * `max_connections` is around 225. 100 + 50 + 10 fits with room to spare. Staging
-   * overrides this to 5 against a `t4g.micro` (~112).
+   * Ten concurrent optimize jobs, each making two short HTTP calls to the control
+   * plane, against one instance that is also serving uploads. The generator adds up to
+   * its own reserved concurrency (50) in fire-and-forget POSTs that it does not wait
+   * on beyond a 2s timeout.
    *
-   * Revisit after 13.7 with observed numbers, not before.
+   * The old arithmetic here was about Postgres connections and is gone with them; the
+   * bound is now request concurrency on a single host. Revisit with observed numbers
+   * from a real deployment, not before.
    */
   optimizerMaxConcurrency: 10,
 };
@@ -384,9 +370,12 @@ function perDeployment(name: string, prefix: string) {
     account: requireEnv(prefix, 'CDK_ACCOUNT'),
     region: readEnv(prefix, 'CDK_REGION') ?? 'us-east-1',
     cdnHost: requireEnv(prefix, 'CDN_HOST'),
+    workerCallbackUrl: requireEnv(prefix, 'WORKER_CALLBACK_URL'),
+    workerCallbackSecret: requireEnv(prefix, 'WORKER_CALLBACK_SECRET'),
+    ...optional('controlPlaneInstanceName', readEnv(prefix, 'CONTROL_PLANE_INSTANCE_NAME')),
     ...optional('apiHost', readEnv(prefix, 'API_HOST')),
     ...optional('cdnCertificateArn', readEnv(prefix, 'CDN_CERTIFICATE_ARN')),
-    ...optional('apiCertificateArn', readEnv(prefix, 'API_CERTIFICATE_ARN')),
+
     ...optional('cdnDistributionId', readEnv(prefix, 'CDN_DISTRIBUTION_ID')),
     ...optional('privateDeliveryPublicKey', readEnv(prefix, 'PRIVATE_DELIVERY_PUBLIC_KEY')),
   };
@@ -403,22 +392,10 @@ const TIERS = {
   staging: (name: string, prefix: string): EnvironmentConfig => ({
     ...perDeployment(name, prefix),
     ...BASE,
-    database: {
-      instanceType: ec2.InstanceType.of(ec2.InstanceClass.T4G, ec2.InstanceSize.MICRO),
-      allocatedStorageGb: 20,
-      multiAz: false,
-      backupRetention: Duration.days(3),
-    },
-    api: {
-      cpu: 512,
-      memoryMb: 1024,
-      desiredCount: 1,
-      minCapacity: 1,
-      maxCapacity: 3,
-      imageTag: requireImageTag(prefix),
-    },
-    // A t4g.micro allows roughly half the connections of a small, and this tier's API
-    // holds fewer — so the consumer's share shrinks with it.
+    api: { imageTag: requireImageTag(prefix) },
+    // A smaller instance absorbs less, so the optimizer's fan-out onto it shrinks
+    // with it. The number is a control-plane budget now rather than a connection
+    // budget, but it is bounded by the same thing: one host.
     lambda: { ...LAMBDA, generatorReservedConcurrency: 10, optimizerMaxConcurrency: 5 },
     delivery: { priceClass: cloudfront.PriceClass.PRICE_CLASS_100, encoderEpoch: 1 },
     // Charged per gigabyte scanned; off by default on this tier unless a change to
@@ -433,20 +410,7 @@ const TIERS = {
   production: (name: string, prefix: string): EnvironmentConfig => ({
     ...perDeployment(name, prefix),
     ...BASE,
-    database: {
-      instanceType: ec2.InstanceType.of(ec2.InstanceClass.T4G, ec2.InstanceSize.SMALL),
-      allocatedStorageGb: 100,
-      multiAz: true,
-      backupRetention: Duration.days(14),
-    },
-    api: {
-      cpu: 1024,
-      memoryMb: 2048,
-      desiredCount: 2,
-      minCapacity: 2,
-      maxCapacity: 10,
-      imageTag: requireImageTag(prefix),
-    },
+    api: { imageTag: requireImageTag(prefix) },
     lambda: LAMBDA,
     delivery: { priceClass: cloudfront.PriceClass.PRICE_CLASS_ALL, encoderEpoch: 1 },
     malwareScanning: readEnv(prefix, 'MALWARE_SCANNING') !== 'false',

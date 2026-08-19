@@ -86,11 +86,27 @@ export default tseslint.config(
     },
   },
   {
+    /*
+     * The allowlist.
+     *
+     * `apps/maintenance` walks the whole registry by nature. `packages/db` defines the
+     * class. `apps/api/src/modules/internal` is the narrow exception: the workers no
+     * longer hold a database connection, so the control plane records their results on
+     * their behalf — and that work has no tenant to be scoped to, because a worker acts
+     * on an asset a queue message named rather than on behalf of a caller.
+     *
+     * Note the path, not the app. Everything else under `apps/api` is still denied, so
+     * an unscoped read cannot drift into a request-serving route.
+     */
     files: [
       'apps/maintenance/**/*.ts',
-      'apps/optimizer/**/*.ts',
-      'apps/generator/**/*.ts',
+      'apps/api/src/modules/internal/**/*.ts',
       'packages/db/**/*.ts',
+      // Stands in for the control plane so the optimizer's integration suite can run
+      // its real logic against a real database. Excluded from the build, and never
+      // bundled — the deployed worker's lack of a database driver is asserted against
+      // the artifact rather than inferred from this directory's name.
+      'apps/optimizer/src/test-support/**/*.ts',
     ],
     rules: { 'no-restricted-imports': 'off' },
   },

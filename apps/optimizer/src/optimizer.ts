@@ -12,8 +12,8 @@
 
 import type { StoragePort } from '@imgopt/storage';
 import type { OptimizeJob } from '@imgopt/queue';
-import type { UnscopedAssetRepository } from '@imgopt/db';
-import { DerivativeOrigin } from '@imgopt/db';
+import type { RegistryPort } from './registry-port.js';
+import { DERIVATIVE_ORIGIN } from './derivative-origin.js';
 import type { AppConfig } from '@imgopt/config';
 import {
   DEFAULT_QUALITY,
@@ -54,25 +54,32 @@ export type ProcessOutcome =
 export class Optimizer {
   constructor(
     private readonly storage: StoragePort,
-    private readonly repo: UnscopedAssetRepository,
+    private readonly registry: RegistryPort,
     private readonly config: AppConfig,
     private readonly logger: Logger,
   ) {}
 
   async process(job: OptimizeJob): Promise<ProcessOutcome> {
     const startedAt = Date.now();
-    const asset = await this.repo.findById(job.assetId, { includeDeleted: true });
-    if (asset === null) return { status: 'skipped', reason: 'asset_not_found' };
-    if (asset.deletedAt !== null) return { status: 'skipped', reason: 'asset_deleted' };
+    /*
+     * One call, where there used to be two queries against a database this function
+     * no longer connects to (design.md L2). The reason is carried in the response
+     * rather than inferred from a null, so `asset_not_found` and `no_version` stay
+     * distinguishable in the skip metric — one is a routine race with a delete, the
+     * other means an upload half-completed.
+     */
+    const { context, reason } = await this.registry.optimizeContext(job.assetId);
+    if (context === null) return { status: 'skipped', reason };
+
+    if (context.deletedAt !== null) return { status: 'skipped', reason: 'asset_deleted' };
 
     // A job for a version the asset has since moved past is stale — the source was
     // replaced. Ignore it rather than regenerating superseded derivatives.
-    if (job.assetVersion !== asset.currentVersion) {
+    if (job.assetVersion !== context.currentVersion) {
       return { status: 'skipped', reason: 'stale_version' };
     }
 
-    const version = await this.repo.currentVersion(job.assetId);
-    if (version === null) return { status: 'skipped', reason: 'no_version' };
+    const version = { version: context.version, sourceKey: context.sourceKey };
 
     try {
       const original = await this.storage.get(version.sourceKey);
@@ -129,7 +136,23 @@ export class Optimizer {
         ),
       ]);
 
-      await this.repo.updateVersionMetadata(job.assetId, version.version, {
+      const derivatives = await this.generateWarmSet(
+        job,
+        version.version,
+        meta.width,
+        decodeSource,
+      );
+
+      /*
+       * Last, and in one call.
+       *
+       * The metadata is known well before this point, but `ready` must keep meaning
+       * "the warm set exists" rather than "the dimensions were recorded". Sending both
+       * together also makes them one transaction on the control plane — as two calls,
+       * a crash between them left an asset with its dimensions and its status still
+       * `stored`, which nothing retries and nothing reports.
+       */
+      await this.registry.completeOptimize(job.assetId, version.version, {
         width: meta.width,
         height: meta.height,
         format: meta.format,
@@ -142,14 +165,6 @@ export class Optimizer {
         ...(master !== undefined ? { masterKey: master.key, masterBytes: master.bytes } : {}),
       });
 
-      const derivatives = await this.generateWarmSet(
-        job,
-        version.version,
-        meta.width,
-        decodeSource,
-      );
-
-      await this.repo.markReady(job.assetId);
       recordOptimizeJob({ durationMs: Date.now() - startedAt, derivatives });
       this.logger.info(
         {
@@ -173,7 +188,7 @@ export class Optimizer {
 
       if (!classified.retriable) {
         // Terminal: retrying cannot help. Record it and let the message be acked.
-        await this.repo
+        await this.registry
           .markFailed(job.assetId, this.mapReason(classified.code))
           .catch(() => undefined);
         this.logger.error(
@@ -256,7 +271,7 @@ export class Optimizer {
 
         // Bookkeeping is best-effort: the delivery path never reads it, so a failed
         // write here must not fail the job.
-        await this.repo
+        await this.registry
           .recordDerivative({
             canonicalKey: key,
             assetId: job.assetId,
@@ -265,7 +280,7 @@ export class Optimizer {
             width: result.width,
             height: result.height,
             bytes: result.bytes,
-            generatedBy: DerivativeOrigin.warm,
+            generatedBy: DERIVATIVE_ORIGIN.warm,
           })
           .catch((error: unknown) => {
             this.logger.warn({ err: error, key }, 'derivative bookkeeping failed');

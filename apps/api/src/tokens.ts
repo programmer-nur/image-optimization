@@ -16,3 +16,11 @@ export const QUEUE = Symbol('QUEUE');
 export const PRISMA = Symbol('PRISMA');
 export const ASSET_REPOSITORY = Symbol('ASSET_REPOSITORY');
 export const LOGGER = Symbol('LOGGER');
+
+/**
+ * The shared secret authenticating the internal worker routes.
+ *
+ * A token rather than a config read at the guard, so the control plane resolves it at
+ * boot and refuses to start without one — see `InternalModule`.
+ */
+export const WORKER_SECRET = Symbol('WORKER_SECRET');

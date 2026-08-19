@@ -1,4 +1,4 @@
-export { handler } from './handler.js';
+export { runMaintenance, shutdown } from './handler.js';
 export {
   Maintenance,
   ownerOf,

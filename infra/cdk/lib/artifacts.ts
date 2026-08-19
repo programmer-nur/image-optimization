@@ -97,14 +97,6 @@ export function sharpLayer(): string {
   );
 }
 
-/** esbuild output for the scheduled maintenance worker. No native code at all. */
-export function maintenanceBundle(): string {
-  return requireBundle(
-    join(repoRoot, 'apps', 'maintenance', 'dist-bundle'),
-    'pnpm --filter @imgopt/infra build:bundles',
-  );
-}
-
 /** The generated CloudFront Function. Never hand-edited; see infra/cloudfront. */
 export function edgeFunctionPath(): string {
   // Always the committed artifact, never a stub: it is checked into the repository

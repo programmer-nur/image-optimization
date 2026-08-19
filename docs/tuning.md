@@ -155,56 +155,74 @@ Every deployment is fully isolated (see
 [bootstrap.md](bootstrap.md#onboarding-another-application)), so this is what a
 deployment costs **with zero traffic and zero stored bytes** — before a single image is
 served. It matters because it is the number that scales with deployment _count_ rather
-than with usage, and it is the whole argument for the fourth or fifth application
-eventually sharing one deployment instead.
+than with usage.
 
-Figures are us-east-1 on-demand list prices at 730 hours, computed from the values in
-`infra/cdk/lib/config.ts`. **They are arithmetic, not observed** — nothing here has been
-deployed, so treat them as the shape of the bill rather than the bill.
+Figures are us-east-1 list prices at 730 hours, computed from the values in
+`infra/cdk/lib/config.ts` and `deploy/lightsail/`. **They are arithmetic, not
+observed** — nothing has been deployed — so treat them as the shape of the bill rather
+than the bill.
 
-| Resource                           | `staging` tier                | `production` tier            |
-| ---------------------------------- | ----------------------------- | ---------------------------- |
-| NAT gateway (`natGateways: 1`)     | $32.85                        | $32.85                       |
-| Interface VPC endpoints (3 × 2 AZ) | $43.80                        | $43.80                       |
-| RDS instance                       | $11.68 (t4g.micro, single-AZ) | $46.72 (t4g.small, Multi-AZ) |
-| RDS storage (gp3)                  | $2.30 (20 GB)                 | $23.00 (100 GB, mirrored)    |
-| Fargate tasks                      | $18.02 (1 × 0.5 vCPU/1 GB)    | $72.08 (2 × 1 vCPU/2 GB)     |
-| Application Load Balancer          | $16.43                        | $16.43                       |
-| Secrets Manager (1 secret)         | $0.40                         | $0.40                        |
-| CloudWatch alarms (14)             | $1.40                         | $1.40                        |
-| **Floor**                          | **≈ $127/month**              | **≈ $237/month**             |
+| Resource                            | Cost       | Note                                       |
+| ----------------------------------- | ---------- | ------------------------------------------ |
+| Lightsail instance (2 GB, 2 vCPU)   | $12.00     | control plane, Caddy, reclamation          |
+| Lightsail managed PostgreSQL (1 GB) | $15.00     | private-only, automatic snapshots included |
+| Lightsail static IP                 | $0.00      | free while attached to a running instance  |
+| CloudWatch alarms (13)              | $1.30      |                                            |
+| S3, SQS, CloudFront, both Lambdas   | $0.00      | nothing at rest; these scale with usage    |
+| **Floor**                           | **$28.30** |                                            |
 
-CloudFront, S3, SQS, and both Lambdas add nothing at zero traffic — they are the parts
-that scale with usage, which is the intended shape.
+Add roughly $3.50/month for the smallest useful data transfer allowance overage and
+CloudWatch logs, and call it **≈$32/month**.
 
-Two entries stand out because they are larger than they look:
+### What this replaced
 
-**The interface endpoints cost more than the NAT gateway they exist to avoid.** Three
-services (SQS, Secrets Manager, CloudWatch Logs) × two availability zones × $0.01/hour.
-They are not there to save money — they are there so the hot paths do not depend on a
-NAT in one AZ. Dropping to `maxAzs: 1` halves them and gives up the redundancy; dropping
-the endpoints and keeping the NAT saves about $30 and puts queue traffic through it.
+The previous architecture's floor, for the same capability:
 
-**`natGateways: 1` is not a saving to be found, it is a risk already taken.** One NAT
-lives in one AZ, and everything not endpoint-backed — ECR image pulls for task launches,
-X-Ray, STS — goes through it. A second is one line and roughly one more $32.85; see the
-comment on `network.natGateways` for why the default is one anyway.
+| Resource                             | Was      | Now                        |
+| ------------------------------------ | -------- | -------------------------- |
+| RDS PostgreSQL (t4g.small, Multi-AZ) | $46.72   | $15.00 Lightsail managed   |
+| RDS storage (100 GB, mirrored)       | $23.00   | included                   |
+| Fargate (2 × 1 vCPU / 2 GB)          | $72.08   | $12.00 one instance        |
+| Application Load Balancer            | $16.43   | $0 — Caddy on the instance |
+| WAF (base + rules)                   | $8.00    | $0 — in the application    |
+| NAT gateway                          | $32.85   | $0 — no VPC                |
+| Interface VPC endpoints (3 × 2 AZ)   | $43.80   | $0 — no VPC                |
+| Secrets Manager                      | $0.40    | $0 — one env file          |
+| **Total**                            | **$243** | **≈$32**                   |
 
-The floor is also why `demo` sits on the `staging` tier in the manifest: an internal or
-low-volume deployment costs $127 rather than $237 for the same code, and the difference
-is entirely Multi-AZ and task count.
+A **7.6× reduction**, and none of it comes out of the delivery plane. The single
+largest line was never the database or the compute — it was **$76.65/month of VPC
+plumbing whose only purpose was letting three Lambdas reach Postgres.** Cutting that
+connection (design.md L1/L2) removed the NAT gateway, all six interface endpoints, and
+every security group at once, and shrank the worker bundles from 6.2 MB to 728 KB as a
+side effect.
 
-### When to stop adding deployments
+### What the saving costs
 
-At three deployments the fixed cost is roughly $400–700/month before traffic. That is
-cheap next to the isolation it buys — no shared bucket, no shared database, no route
-that can read the wrong tenant — and it stays cheap while bandwidth dominates the bill
-(D16: roughly 75% of the running cost at any real volume).
+Stated plainly, because a cost table that lists only savings is a sales document:
 
-Revisit when the fixed floor is a visible fraction of the total, or at the CloudFront
-account quotas, whichever comes first: cache policies and response-headers policies cap
-around twenty deployments, key groups around ten. Both are per-account, both surface as
-a `LimitExceeded` naming a resource nobody associates with deployment count.
+- **The control plane is a single instance.** Uploads and the admin API go down with
+  it. **Image delivery does not** — the delivery plane reads no database, so viewers
+  keep being served, and a first request for an unrendered variant still renders and
+  still persists. That asymmetry is the entire reason this is affordable.
+- **No Multi-AZ database.** Recovery is a restore from a snapshot, measured in
+  minutes-to-an-hour, not an automatic failover.
+- **No WAF.** Rate limiting is in the application, so a flood costs a connection and a
+  parse before it is refused. See design.md L4.
+- **A static AWS credential on the instance**, because Lightsail cannot assume an IAM
+  role. It is scoped to the same prefixes the Fargate task role had, and deleting it is
+  one of the reasons to migrate later.
+
+### When to leave
+
+The triggers are in design.md L7, and they are about load rather than cost: needing a
+second replica, needing zero-downtime deploys, needing Multi-AZ, or outgrowing the
+largest Lightsail plan. The migrations are documented at
+[operations.md](operations.md#migrating-off-lightsail) and neither touches domain logic.
+
+At three deployments the fixed cost is roughly $96/month before traffic, against $729
+under the previous architecture — which is what makes running a deployment per
+application viable at all.
 
 ## Lifecycle windows
 

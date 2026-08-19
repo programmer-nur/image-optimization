@@ -74,6 +74,8 @@ flowchart LR
     I --> C
 ```
 
+**Superseded in part by D19.** The two-plane separation above is unchanged and is what makes the cheaper hosting safe. The _hosting_ — Fargate for the control plane, RDS for its database — was replaced by a single Lightsail instance and a Lightsail managed database once it was clear that 32% of the fixed cost was VPC plumbing serving only the Lambdas' database connection.
+
 ### D2 — Two ingest modes, one storage guarantee
 
 **Decision:** Support both a proxied upload and a presigned direct-to-S3 upload. Both converge on the same invariant: _bytes land in a private staging prefix, are validated, and only then are promoted to `original/` and registered as a usable asset._
@@ -716,3 +718,59 @@ Greenfield — no data migration. Rollout is phased so each phase is independent
 4. **`assetVersion` retention window** — how long do superseded versions' derivatives survive before lifecycle expiry? Too short breaks in-flight cached HTML; too long wastes storage. Starting proposal: 30 days.
 5. **Does the deployment need a VPC with NAT?** RDS and Fargate want private subnets; NAT Gateway is ~$32/month plus data processing, which is significant against a ~$60 baseline. VPC endpoints for S3/SQS avoid most NAT traffic — needs costing during Phase 4.
 6. **Per-key quota enforcement mechanism** — Postgres counters are simplest but race under concurrency. If exact quotas turn out to matter, this is the one requirement that could justify revisiting the no-Redis decision (D11).
+
+### D19 — The control plane and its database run on Lightsail, not Fargate and RDS
+
+**Status:** supersedes the hosting half of D1. The two-plane separation D1 establishes
+is unchanged and is what makes this affordable.
+
+**Decision:** the NestJS control plane runs as a container on a single Lightsail
+instance behind Caddy, against Lightsail managed PostgreSQL. ECS, Fargate, the
+Application Load Balancer, the regional WAF, the ECR-referencing compute stack, RDS, the
+VPC, its NAT gateway, and its six interface endpoints are all removed. The delivery
+pipeline — S3 → SQS → Lambda + sharp → S3 → CloudFront — is untouched.
+
+**Why now.** Nothing has been deployed, and the first production install serves one
+application at low volume. The floor was ≈$243/month before a single image was served,
+and roughly none of it bought anything at that volume.
+
+**The load-bearing observation** is not "Lightsail is cheaper than Fargate". It is that
+**$76.65/month — 32% of the entire floor — was VPC plumbing whose only purpose was
+letting three Lambdas reach RDS.** Everything else those functions touch is a public AWS
+endpoint. Cut the database connection and the VPC, the NAT gateway, every interface
+endpoint, and every security group become unnecessary at once. The worker bundles fell
+from 6.2 MB to 728 KB as a side effect, because a value import of the registry package
+was pulling the Postgres driver into a function on the viewer's critical path.
+
+**What replaced it:** the optimizer and generator post their bookkeeping to an
+authenticated internal route on the control plane. Reclamation, which walks the whole
+registry and decodes no images, moved out of Lambda entirely and runs beside the database
+as a scheduled container.
+
+**What it costs**, stated so it is priced rather than discovered:
+
+- The control plane is a single instance. Uploads and the admin API go down with it.
+  **Delivery does not** — which is exactly the property D1 exists to provide, and it is
+  the whole reason this trade is acceptable.
+- No Multi-AZ database; recovery is a snapshot restore.
+- No WAF. Rate limiting moved into the application, so a flood costs a connection and a
+  parse before it is refused. The delivery plane never had a WAF and is unaffected.
+- A long-lived AWS access key on the instance, because Lightsail cannot assume an IAM
+  role. It is scoped to the same prefixes the Fargate task role held.
+
+**Rejected — Lightsail PostgreSQL in public mode**, which would have kept the Lambdas'
+direct database access and needed almost no code change. Lightsail managed databases have
+**no IP allowlist**: public means reachable from every address on the internet, with a
+password as the only control, for a database holding every asset record and every API key
+hash.
+
+**Rejected — App Runner**, which supports task roles and would delete the static
+credential. It has no equivalent of a co-located database, so PostgreSQL would have gone
+back to RDS and taken the VPC with it — the saving is in the networking, not the compute.
+
+**The exits are pre-decided, not deferred:** Lightsail PostgreSQL → RDS is a `pg_dump`,
+a restore, and a `DATABASE_URL` change, because the application reads exactly one
+database variable. Lightsail → ECS/EC2/App Runner is the same image under a different
+scheduler, because the API holds no local state. Both runbooks, with their triggers, are
+in `docs/operations.md`. The full reasoning is
+`openspec/changes/lightsail-cost-baseline/design.md`.

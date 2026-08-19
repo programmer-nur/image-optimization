@@ -134,6 +134,7 @@ jobs:
             -e SQS_OPTIMIZE_QUEUE_URL=http://localhost:9324/queue/imgopt-optimize \
             -e DATABASE_URL=postgres://imgopt:imgopt@127.0.0.1:5434/imgopt \
             -e CDN_HOST=cdn.example.test \
+            -e WORKER_CALLBACK_SECRET=ci-worker-secret \
             imgopt-api:ci
 
       - name: Probe /healthz
@@ -171,16 +172,73 @@ jobs:
             -e DB_USER=imgopt -e DB_PASSWORD=imgopt -e DB_NAME=imgopt \
             imgopt-api:ci node packages/db/scripts/migrate.mjs
 
-      # esbuild output for all three Lambdas. The assertion that matters is the
+      # Reclamation ships inside this image and is invoked by cron on the host, so a
+      # missing bundle or a broken entrypoint is a job that silently never runs. Dry
+      # run: this exercises the wiring, not the deletion.
+      - name: Reclamation runs from inside the image
+        run: |
+          docker run --rm --network host \
+            -e AWS_REGION=us-east-1 -e S3_BUCKET=imgopt-ci \
+            -e AWS_ACCESS_KEY_ID=ci -e AWS_SECRET_ACCESS_KEY=ci \
+            -e SQS_OPTIMIZE_QUEUE_URL=http://127.0.0.1:9324/queue/imgopt-optimize \
+            -e CDN_HOST=cdn.example.test \
+            -e DATABASE_URL=postgres://imgopt:imgopt@127.0.0.1:5434/imgopt \
+            -e MAINTENANCE_DRY_RUN=true \
+            imgopt-api:ci node maintenance.mjs
+
+      # The lock must distinguish "another run holds it" from "I cannot write here".
+      # Conflating them makes an unwritable path — a root-owned volume under an
+      # unprivileged container — report "already in progress" and exit 0, forever,
+      # with a calm log and nothing ever reclaimed.
+      - name: An unwritable reclamation lock fails loudly
+        run: |
+          if docker run --rm --network host \
+            -e AWS_REGION=us-east-1 -e S3_BUCKET=imgopt-ci \
+            -e AWS_ACCESS_KEY_ID=ci -e AWS_SECRET_ACCESS_KEY=ci \
+            -e SQS_OPTIMIZE_QUEUE_URL=http://127.0.0.1:9324/queue/imgopt-optimize \
+            -e CDN_HOST=cdn.example.test \
+            -e DATABASE_URL=postgres://imgopt:imgopt@127.0.0.1:5434/imgopt \
+            -e MAINTENANCE_LOCK_PATH=/proc/nope/maintenance.lock \
+            imgopt-api:ci node maintenance.mjs; then
+            echo "::error::reclamation exited 0 with an unwritable lock path"
+            exit 1
+          fi
+
+      # esbuild output for both Lambdas. The assertion that matters is the
       # entrypoint's name: the bundles are ESM, and a deployed function has no
       # package.json above it, so an `index.js` is read as CommonJS and throws
       # "Cannot use import statement outside a module" during init.
       - name: Build the Lambda bundles
         run: pnpm --filter @imgopt/infra build:bundles
 
+      # The saving in design.md L1 rests on these functions not needing a database, and
+      # a value import from @imgopt/db silently drags PrismaClient back in — 6.2MB of
+      # driver in the init path of the function on the viewer's critical path, plus a
+      # credential-shaped dependency in a function that must not have one. Asserted
+      # against the artifact, because the import that causes it looks harmless.
+      - name: Worker bundles carry no database driver
+        run: |
+          for app in optimizer generator; do
+            path="apps/$app/dist-bundle/index.mjs"
+            for forbidden in PrismaClient SecretsManagerClient; do
+              if grep -q "$forbidden" "$path"; then
+                echo "::error::$path contains $forbidden — a value import from @imgopt/db pulls in the whole client"
+                exit 1
+              fi
+            done
+            size=$(stat -c%s "$path")
+            if [ "$size" -gt 2000000 ]; then
+              echo "::error::$path is ${size} bytes; it should be well under 2MB without the driver"
+              exit 1
+            fi
+          done
+
       - name: Bundles carry an ESM entrypoint
         run: |
-          for app in optimizer generator maintenance; do
+          # Two Lambda bundles. Reclamation is not one — it ships inside the API
+          # image and runs on the control-plane host, so it is checked below with
+          # the image rather than here.
+          for app in optimizer generator; do
             path="apps/$app/dist-bundle/index.mjs"
             if [ ! -f "$path" ]; then
               echo "::error::missing $path"

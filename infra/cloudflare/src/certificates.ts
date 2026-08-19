@@ -26,7 +26,15 @@ import type { CloudflareClient } from './api.js';
 
 export interface IssueOptions {
   domainName: string;
-  /** us-east-1 for the distribution; the deployment's own region for the ALB. */
+  /**
+   * Always `us-east-1` in practice.
+   *
+   * CloudFront accepts a viewer certificate only from us-east-1, and it is now the
+   * only ACM certificate this deployment needs — the control plane terminates its own
+   * TLS on its instance with an automatically renewed certificate, and ACM cannot be
+   * attached to a Lightsail instance at all (design.md L3). The parameter stays
+   * because the constraint belongs to CloudFront, not to this function.
+   */
   region: string;
   cloudflare: CloudflareClient;
   /** How long to wait for ACM to observe the record before giving up. */

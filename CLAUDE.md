@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository state
 
-Feature-complete against the build plan, and never deployed. Task groups 1–14 of `openspec/changes/image-optimization-service/tasks.md` are done except the four that need an AWS account (9.15, 12.9, 13.7, 14.7) and 14.8, which needs a registry decision. The `multi-tenancy` change is implemented through group 3; its group 4 is explicitly deferred until a third deployment exists.
+Feature-complete against the build plan, and never deployed. Task groups 1–14 of `openspec/changes/image-optimization-service/tasks.md` are done except the four that need an AWS account (9.15, 12.9, 13.7, 14.7) and 14.8, which needs a registry decision. The `multi-tenancy` change is implemented through group 3; its group 4 is explicitly deferred until a third deployment exists. The `lightsail-cost-baseline` change is implemented through group 6 — the control plane and its database moved off Fargate and RDS onto Lightsail, taking the VPC with them (D19).
 
-What exists: the pnpm workspace and tooling, `packages/core` (transform grammar, breakpoint bucketing, canonical keys, Sharp pipeline), `packages/config`, `packages/storage`, `packages/queue`, `packages/db` (Prisma schema, migrations, scoped and unscoped registries), `apps/api` (NestJS + Fastify control plane), `apps/optimizer` (SQS Lambda — warm set, metadata, LQIP, conditional master), `infra/cloudfront` (the generated edge normalizer and its conformance runner), `apps/generator` (Function URL Lambda — on-miss generation), `infra/cdk` (six stacks split by lifecycle), `infra/cloudflare` (DNS reconciliation and ACM issuance), `packages/client` (browser SDK), group 11's security hardening, `packages/metrics` with the observability stack, and `apps/maintenance` for scheduled reclamation. 990 unit tests, 175 integration.
+What exists: the pnpm workspace and tooling, `packages/core` (transform grammar, breakpoint bucketing, canonical keys, Sharp pipeline), `packages/config`, `packages/storage`, `packages/queue`, `packages/db` (Prisma schema, migrations, scoped and unscoped registries), `apps/api` (NestJS + Fastify control plane), `apps/optimizer` (SQS Lambda — warm set, metadata, LQIP, conditional master), `infra/cloudfront` (the generated edge normalizer and its conformance runner), `apps/generator` (Function URL Lambda — on-miss generation), `infra/cdk` (five stacks split by lifecycle), `infra/cloudflare` (DNS reconciliation and ACM issuance), `packages/client` (browser SDK), group 11's security hardening, `packages/metrics` with the observability stack, and `apps/maintenance` for scheduled reclamation. 929 unit tests, 192 integration.
 
 Both planes run end to end locally: a URL normalizes at the edge to a canonical key, the generator renders and persists exactly that key, and the next request is a storage hit.
 
@@ -24,13 +24,15 @@ pnpm typecheck          # tsc --build across project references
 pnpm lint               # eslint, type-checked rules
 pnpm format:check       # prettier
 pnpm test               # unit only; no Docker needed
-pnpm test:integration   # needs `pnpm dev:up` first
+pnpm test:integration   # needs `pnpm dev:up` first; the API suites also need WORKER_CALLBACK_SECRET
 pnpm test:core          # @imgopt/core only
 pnpm --filter @imgopt/core test -- breakpoints      # one test file
 pnpm --filter @imgopt/core test:coverage            # thresholds: 90% lines, 85% branches
 pnpm --filter @imgopt/edge generate                 # regenerate the CloudFront Function
 pnpm dev:up             # postgres + minio + elasticmq
 ```
+
+**The API image carries the reclamation bundle too**, as a single `maintenance.mjs`. It is bundled precisely so it adds nothing to the hand-maintained COPY list — a bundle cannot have a missing workspace dependency. `docker compose run --rm maintenance` on the host is what cron invokes.
 
 **The Lambda bundles must be `.mjs`, and must reach sharp through `createRequire`.** They are ESM, and a deployed function has no package.json above it — a bare `.js` is read as CommonJS and throws on its own first `import`. Renaming alone is not enough: sharp ships in a layer that Lambda exposes through `NODE_PATH`, which the ESM resolver ignores entirely, so the bundles resolve it through `scripts/esbuild-sharp-layer.mjs`. Both failures are init-time, on every invocation, with the infrastructure perfectly correct.
 
@@ -80,7 +82,7 @@ A self-hosted image optimization service on AWS — the Cloudinary/Imgix model, 
 
 Two planes that never touch:
 
-- **Control plane** — NestJS on ECS Fargate. Uploads, validation, metadata, lifecycle. Stateful, rare, database-backed.
+- **Control plane** — NestJS in Docker on one Lightsail instance, behind Caddy. Uploads, validation, metadata, lifecycle, and the workers' bookkeeping. Stateful, rare, database-backed.
 - **Delivery plane** — CloudFront Function normalizes the request and rewrites the URI → S3 serves the derivative if it exists → on 403/404 CloudFront fails over to a Sharp Lambda, which generates it, writes it to that exact S3 key, and returns it. Every later request is a cache or S3 hit.
 
 The control plane is **never** in the image read path, and the delivery path **never** queries PostgreSQL. S3 object existence is the sole authority for whether a derivative can be served.
@@ -100,12 +102,15 @@ packages/db       EXISTS. Prisma schema + migrations; generated client in src/ge
                   Two faces on the registry: TenantScopedRepository, whose every method takes a
                   branded TenantScope, and UnscopedAssetRepository, which spans the deployment
                   and is lint-restricted to the three workers
-apps/api          EXISTS. NestJS control plane → Docker → Fargate
+apps/api          EXISTS. NestJS control plane → Docker → Lightsail, behind Caddy.
+                  modules/internal is the workers' callback surface: the only place in
+                  apps/api allowed to import UnscopedAssetRepository, and the reason the
+                  Lambdas hold no database connection
 apps/optimizer    EXISTS. SQS-triggered Lambda: warm set, metadata, conditional master
-apps/maintenance  EXISTS. Daily EventBridge Lambda: orphan reconciliation, superseded-version
+apps/maintenance  EXISTS. Daily cron on the control-plane host — NOT a Lambda: orphan reconciliation, superseded-version
                   expiry, upload reaping, storage accounting. Holds the only role permitted
                   to delete an original outside the API's explicit DELETE endpoint (the
-                  Fargate task role also carries original/* delete for that path), so every
+                  control plane's IAM user also carries original/* delete for that path), so every
                   job is written to fail toward keeping
 apps/generator    EXISTS. Function URL Lambda: on-miss generation. No SQS. Never *reads*
                   the database; the handler injects a best-effort bookkeeping write that
@@ -113,8 +118,11 @@ apps/generator    EXISTS. Function URL Lambda: on-miss generation. No SQS. Never
 infra/cloudfront  EXISTS. @imgopt/edge — normalize.template.js is hand-written,
                   normalize.generated.js is emitted by generate.mjs and never hand-edited,
                   conformance.test.mjs replays the shared vectors against both
-infra/cdk         EXISTS. @imgopt/infra — Network / Storage / Data / Queue / Compute / Cdn.
-                  DEPLOYMENTS in lib/config.ts is the manifest; a tier is only a sizing profile.
+infra/cdk         EXISTS. @imgopt/infra — Storage / Queue / Compute / Cdn / Observability.
+                  No Network or Data stack: no VPC and no RDS. DEPLOYMENTS in lib/config.ts
+                  is the manifest; a tier is only a sizing profile.
+deploy/lightsail  EXISTS. compose file, Caddyfile, provision.sh, deploy.sh — the control
+                  plane's deployment, which CloudFormation cannot express
                   All security groups live in the network stack, and the CDN stack imports
                   the bucket by name; both avoid cross-stack cycles that CloudFormation
                   reports as walls of unrelated resources. Creates NO DNS records and
@@ -192,6 +200,30 @@ These are not discoverable by reading code, and violating any of them is expensi
 
 **URLs are immutable; do not invalidate CloudFront for content changes.** The version segment is `{assetVersion}-{encoderEpoch}`. Replacing bytes bumps `assetVersion`; changing encoder policy globally bumps `encoderEpoch`, minting a fresh URL space with no per-asset writes. Invalidation is for deletions and takedowns only.
 
+**The Lambdas hold no database connection, and putting one back is expensive.** They were
+VPC-attached solely to reach RDS, and the VPC is what a NAT gateway and six interface
+endpoints existed to serve — $76.65/month, 32% of the old fixed floor. The optimizer and
+generator post to `/internal/v1` on the control plane instead; reclamation keeps its
+connection and runs beside the database as a cron job. A value import from `@imgopt/db` in
+either worker also drags `PrismaClient` into the bundle (6.2MB → 728KB when it went), so
+`DERIVATIVE_ORIGIN` is declared locally rather than imported. `infra/cdk/test/stacks.test.ts`
+asserts no function has a `VpcConfig`, because the regression is silent: everything works
+and the bill arrives a month later.
+
+**`DATABASE_URL` is the only database configuration the application reads.** No composed
+`DB_*` parts, no Secrets Manager hydration — both existed for ECS and Lambda and are gone.
+That is also the whole of the Lightsail → RDS migration on the application side.
+
+**The internal worker routes are `@Public()`, which means "not API-key-authenticated", not
+"unauthenticated".** `ApiKeyGuard` is registered globally and runs before any
+controller-scoped guard, so without it every internal route 401s before `WorkerGuard` is
+consulted — which presents as a guard rejecting a correct secret.
+
+**Reclamation's run lock must distinguish "held" from "cannot write".** An unwritable lock
+path — a root-owned Docker volume under an unprivileged container — read as "already
+running" would make every run exit 0 having done nothing, forever, with a calm log. The
+Dockerfile creates `/var/lib/imgopt` owned by `node` so the named volume inherits it.
+
 **Tenancy is the deployment, and it stops at the control plane.** It appears in no URL, no
 object key, and no edge computation — the delivery plane never reads the database, and the URL
 space is free exactly once. A second application is a second entry in `DEPLOYMENTS`. The
@@ -224,7 +256,7 @@ allowance on every rejected upload.
 
 ## Decisions already settled — do not relitigate
 
-Fargate for the control plane (not Lambda). Single-tenant, one deployment per project — no `tenant_id` anywhere. CloudFront Function + S3 origin + Lambda failover (not Lambda@Edge, not S3 Object Lambda). AWS CDK in TypeScript. Prisma ORM (chosen by the user; D11 records why Prisma 7 removing the Rust query engine makes the original Lambda-footprint objection moot). Hybrid generation: a small eager warm set, everything else lazy and persisted. `master/` renditions conditional on source size, not always. **No Redis** — SQS queues, CloudFront caches, WAF rate-limits, S3 conditional writes suppress duplicate work; D11 records the specific condition that would reverse this.
+Lightsail for the control plane and its database (D19, superseding D1's Fargate/RDS hosting) — a single instance running the same image, with the delivery plane untouched. Multi-tenant through a deployment manifest, with a `tenant_id` column at one tenant per deployment. CloudFront Function + S3 origin + Lambda failover (not Lambda@Edge, not S3 Object Lambda). AWS CDK in TypeScript. Prisma ORM (chosen by the user; D11 records why Prisma 7 removing the Rust query engine makes the original Lambda-footprint objection moot). Hybrid generation: a small eager warm set, everything else lazy and persisted. `master/` renditions conditional on source size, not always. **No Redis** — SQS queues, CloudFront caches, in-process rate limiting, S3 conditional writes suppress duplicate work; D11 records the specific condition that would reverse this.
 
 Rationale and alternatives for each are in `design.md`. Open questions are listed there too — those are genuinely unresolved and worth raising.
 

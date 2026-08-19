@@ -137,6 +137,16 @@ function methodNames(): string[] {
   );
 }
 
+/** Looks a method up off the instance, failing loudly rather than as `undefined`. */
+function methodOf(
+  repo: TenantScopedRepository,
+  name: string,
+): (this: TenantScopedRepository, ...args: unknown[]) => Promise<unknown> {
+  const method = (repo as unknown as Record<string, unknown>)[name];
+  if (typeof method !== 'function') throw new Error(`${name} is not a method`);
+  return method as (this: TenantScopedRepository, ...args: unknown[]) => Promise<unknown>;
+}
+
 /** True if the tenant id appears anywhere in a recorded clause, however nested. */
 function mentionsTenant(clause: unknown): boolean {
   if (clause === null || typeof clause !== 'object') return clause === SCOPE;
@@ -153,8 +163,7 @@ describe('tenant scoping coverage', () => {
     const recorder: Recorder = { wheres: [] };
     const repo = new TenantScopedRepository(fakePrisma(recorder));
 
-    const method = (repo as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>)[name];
-    await method.call(repo, SCOPE, ...(ARGS[name] ?? []));
+    await methodOf(repo, name).call(repo, SCOPE, ...(ARGS[name] ?? []));
 
     expect(recorder.wheres.length, `${name} issued no query`).toBeGreaterThan(0);
     expect(recorder.wheres.some(mentionsTenant), `${name} never mentioned the tenant`).toBe(true);
@@ -166,10 +175,7 @@ describe('tenant scoping coverage', () => {
     for (const name of methodNames()) {
       const recorder: Recorder = { wheres: [] };
       const repo = new TenantScopedRepository(fakePrisma(recorder));
-      const method = (repo as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>)[
-        name
-      ];
-      await method.call(repo, SCOPE, ...(ARGS[name] ?? []));
+      await methodOf(repo, name).call(repo, SCOPE, ...(ARGS[name] ?? []));
 
       expect(
         mentionsTenant(recorder.wheres[0]),

@@ -1,9 +1,22 @@
 /**
- * Compute stack — both Lambdas, the Fargate control plane, and the migration task.
+ * Compute stack — the two Lambdas, and the identity the control-plane host uses.
  *
  * This is the stack that changes on every release, which is exactly why storage and
- * data are not in it. Deploying application code must never present CloudFormation
- * with the option of replacing a bucket or a database.
+ * the queue are not in it. Deploying application code must never present
+ * CloudFormation with the option of replacing the bucket holding every original.
+ *
+ * **What is not here any more.** There is no ECS cluster, no Fargate service, no load
+ * balancer, no ECR repository, no regional WAF, no RDS instance, and no VPC. The
+ * control plane runs on a Lightsail instance provisioned outside CloudFormation
+ * (design.md L3), and reclamation runs beside its database rather than in Lambda
+ * (L2). What remains is what genuinely wants to be serverless: two functions that do
+ * image work, sized against bursts nobody schedules.
+ *
+ * **Neither Lambda is VPC-attached, and that is the point.** They held a database
+ * connection, which is the only thing that ever required a VPC, and a VPC is what a
+ * NAT gateway and six interface endpoints existed to serve — $76.65/month, 32% of the
+ * old fixed floor, spent on reaching Postgres. They post their bookkeeping to the
+ * control plane instead. Putting either back in a VPC brings all of that back with it.
  *
  * IAM here is scoped by *prefix*, not by bucket. The four prefixes have four trust
  * levels, and a role that can write `original/` is a role that can rewrite history.
@@ -11,45 +24,25 @@
 
 import {
   CfnOutput,
-  Duration,
   RemovalPolicy,
   Stack,
   aws_lambda_event_sources as eventsources,
   type StackProps,
 } from 'aws-cdk-lib';
-import * as ec2 from 'aws-cdk-lib/aws-ec2';
-import * as ecr from 'aws-cdk-lib/aws-ecr';
-import * as ecs from 'aws-cdk-lib/aws-ecs';
-import * as events from 'aws-cdk-lib/aws-events';
-import * as eventTargets from 'aws-cdk-lib/aws-events-targets';
-import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
-import { ApplicationProtocol } from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as logs from 'aws-cdk-lib/aws-logs';
-import * as wafv2 from 'aws-cdk-lib/aws-wafv2';
-import type * as rds from 'aws-cdk-lib/aws-rds';
-import * as s3 from 'aws-cdk-lib/aws-s3';
-import type * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
+import type * as s3 from 'aws-cdk-lib/aws-s3';
 import type * as sqs from 'aws-cdk-lib/aws-sqs';
-import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import type { Construct } from 'constructs';
-import { bucketNameFor, type EnvironmentConfig } from './config.js';
-import { generatorBundle, maintenanceBundle, optimizerBundle, sharpLayer } from './artifacts.js';
-import { NetworkStack } from './network-stack.js';
-import { createControlPlaneWebAcl } from './waf.js';
+import type { EnvironmentConfig } from './config.js';
+import { generatorBundle, optimizerBundle, sharpLayer } from './artifacts.js';
 import { DERIVED_PREFIX, MASTER_PREFIX, ORIGINAL_PREFIX, STAGING_PREFIX } from './storage-stack.js';
 
 export interface ComputeStackProps extends StackProps {
   config: EnvironmentConfig;
-  vpc: ec2.IVpc;
-  appSecurityGroup: ec2.ISecurityGroup;
-  albSecurityGroup: ec2.ISecurityGroup;
   bucket: s3.IBucket;
   optimizeQueue: sqs.IQueue;
-  database: rds.IDatabaseInstance;
-  databaseSecret: secretsmanager.ISecret;
-  databaseName: string;
 }
 
 export class ComputeStack extends Stack {
@@ -57,38 +50,24 @@ export class ComputeStack extends Stack {
   readonly generator: lambda.Function;
   /** Exposed for alarms, which take names rather than constructs. */
   readonly optimizer: lambda.Function;
-  readonly maintenance: lambda.Function;
-  readonly service: ecs.FargateService;
-  readonly loadBalancer: elbv2.ApplicationLoadBalancer;
-  /** Dimension value the ALB target-group metrics are published under. */
-  readonly targetGroupFullName: string;
-  readonly repository: ecr.Repository;
+  /** The identity the Lightsail host authenticates as. */
+  readonly controlPlaneUser: iam.User;
 
   constructor(scope: Construct, id: string, props: ComputeStackProps) {
     super(scope, id, props);
 
-    const {
-      config,
-      vpc,
-      appSecurityGroup,
-      albSecurityGroup,
-      bucket,
-      optimizeQueue,
-      database,
-      databaseSecret,
-      databaseName,
-    } = props;
+    const { config, bucket, optimizeQueue } = props;
 
-    // Connection parts, not a URL. The host, port, user, and database name are not
-    // secret; only the password is, and it is delivered from the secret store at
-    // runtime rather than baked into a task definition or a template.
-    const databaseEnv = {
-      DB_HOST: database.dbInstanceEndpointAddress,
-      DB_PORT: database.dbInstanceEndpointPort,
-      DB_USER: 'imgopt',
-      DB_NAME: databaseName,
-    };
-
+    /*
+     * No database configuration reaches either function.
+     *
+     * `WORKER_CALLBACK_URL` is the control plane, and `WORKER_CALLBACK_SECRET` is how
+     * it recognises them. The secret is supplied as a plain environment value rather
+     * than from Secrets Manager, which is a deliberate downgrade from what RDS had:
+     * fetching it would put a Secrets Manager client back in the init path of the
+     * function on the viewer's critical path, to protect a credential that grants
+     * bookkeeping writes and nothing else. It rotates by redeploying both sides.
+     */
     const sharedEnv = {
       NODE_ENV: 'production',
       S3_BUCKET: bucket.bucketName,
@@ -97,11 +76,9 @@ export class ComputeStack extends Stack {
       ENCODER_EPOCH: String(config.delivery.encoderEpoch),
       WARM_WIDTHS: config.processing.warmWidths,
       WARM_FORMATS: config.processing.warmFormats,
-      // Must match whether the storage stack provisioned a scanner. The app fails
-      // closed on a missing verdict, so claiming scanning where none exists holds
-      // every upload forever.
       UPLOAD_MALWARE_SCAN_ENABLED: String(config.malwareScanning),
-      ...databaseEnv,
+      WORKER_CALLBACK_URL: config.workerCallbackUrl,
+      WORKER_CALLBACK_SECRET: config.workerCallbackSecret,
     };
 
     /*
@@ -128,13 +105,10 @@ export class ComputeStack extends Stack {
       layers: [sharp],
       memorySize: config.lambda.optimizerMemoryMb,
       timeout: config.lambda.optimizerTimeout,
-      vpc,
-      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
-      securityGroups: [appSecurityGroup],
       logGroup: logGroupFor(this, 'OptimizerLogs', `imgopt-${config.name}-optimizer`),
       // Control path: the optimizer runs once per upload, behind a queue.
       tracing: lambda.Tracing.ACTIVE,
-      environment: { ...sharedEnv, DB_SECRET_ARN: databaseSecret.secretArn },
+      environment: sharedEnv,
     }));
 
     optimizer.addEventSource(
@@ -144,13 +118,13 @@ export class ComputeStack extends Stack {
         // is recorded and acknowledged instead of cycling to the DLQ the slow way.
         reportBatchItemFailures: true,
         /*
-         * A ceiling on the poller's fan-out, sized as a database-connection budget.
+         * A ceiling on the poller's fan-out.
          *
-         * Without it, a bulk import scales this consumer into hundreds of concurrent
-         * invocations, each opening its own connection to a small Postgres instance
-         * that the control plane shares — so the backlog cures itself by taking down
-         * the API that accepts uploads. See `optimizerMaxConcurrency` in config.ts
-         * for the arithmetic.
+         * It used to be a database-connection budget. It is now a *control plane*
+         * budget, and the number means the same thing for the same reason: this
+         * consumer must not be able to cure its own backlog by overwhelming the
+         * single instance that also accepts uploads. A bulk import drains slightly
+         * slower and the API stays up. See `optimizerMaxConcurrency` in config.ts.
          */
         maxConcurrency: config.lambda.optimizerMaxConcurrency,
       }),
@@ -161,7 +135,6 @@ export class ComputeStack extends Stack {
     grantRead(optimizer, bucket, [ORIGINAL_PREFIX, MASTER_PREFIX]);
     grantWrite(optimizer, bucket, [MASTER_PREFIX, DERIVED_PREFIX]);
     grantList(optimizer, bucket, [ORIGINAL_PREFIX, DERIVED_PREFIX]);
-    databaseSecret.grantRead(optimizer);
 
     // ---- generator: on-miss generation, on the viewer's critical path -----
 
@@ -178,15 +151,12 @@ export class ComputeStack extends Stack {
       // a launch, a crawler, or a crafted URL sweep. Excess requests fail fast with
       // a short-lived error rather than fanning out without limit.
       reservedConcurrentExecutions: config.lambda.generatorReservedConcurrency,
-      vpc,
-      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
-      securityGroups: [appSecurityGroup],
       logGroup: logGroupFor(this, 'GeneratorLogs', `imgopt-${config.name}-generator`),
       // Deliberately untraced. This is the delivery path: per-request tracing at
       // CDN volume costs more than the traffic it observes, and the question worth
       // asking here — how often does this run at all — is a metric, not a trace.
       tracing: lambda.Tracing.DISABLED,
-      environment: { ...sharedEnv, DB_SECRET_ARN: databaseSecret.secretArn },
+      environment: sharedEnv,
     });
 
     // Reads originals and masters, writes derivatives, and nothing else. It cannot
@@ -196,7 +166,6 @@ export class ComputeStack extends Stack {
     // Listing is confined to originals, which is the one lookup it genuinely needs:
     // the source extension is not recoverable from a delivery path.
     grantList(this.generator, bucket, [ORIGINAL_PREFIX]);
-    databaseSecret.grantRead(this.generator);
 
     this.generatorFunctionUrl = this.generator.addFunctionUrl({
       // Signed by CloudFront through OAC. A public Function URL would be an
@@ -204,439 +173,61 @@ export class ComputeStack extends Stack {
       authType: lambda.FunctionUrlAuthType.AWS_IAM,
     });
 
-    // ---- maintenance: scheduled reclamation --------------------------------
+    // ---- the control plane's identity -------------------------------------
 
     /*
-     * No sharp layer, and deliberately so: this function moves and deletes objects
-     * and never decodes one, so it needs no native binary. That also keeps it out of
-     * the encoder-epoch coupling — a libvips upgrade cannot affect it.
+     * An IAM *user*, which is a real downgrade from the Fargate task role, and not a
+     * choice — Lightsail instances cannot assume a role. There is no instance profile
+     * and no metadata endpoint handing out rotating credentials, so the host
+     * authenticates with a long-lived access key.
+     *
+     * What that costs: a static credential exists, on disk, on one machine. What is
+     * done about it: the policy below is the same prefix-scoped set the task role had
+     * and nothing more, the key is created out of band rather than by this stack (a
+     * CloudFormation-created key is readable in the template's outputs forever), and
+     * rotation is a documented procedure rather than an intention. See
+     * docs/operations.md.
+     *
+     * This is also the single strongest argument for the ECS migration in L7: moving
+     * the control plane to a service that supports task roles deletes this user.
      */
-    const maintenance = (this.maintenance = new lambda.Function(this, 'Maintenance', {
-      functionName: `imgopt-${config.name}-maintenance`,
-      runtime: lambda.Runtime.NODEJS_22_X,
-      architecture: lambda.Architecture.ARM_64,
-      handler: 'index.handler',
-      code: lambda.Code.fromAsset(maintenanceBundle()),
-      memorySize: 1024,
-      // Long, because a run walks the whole bucket. The per-run deletion cap, not
-      // the clock, is what bounds it — a timeout mid-run simply defers work.
-      timeout: Duration.minutes(15),
-      vpc,
-      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
-      securityGroups: [appSecurityGroup],
-      logGroup: logGroupFor(this, 'MaintenanceLogs', `imgopt-${config.name}-maintenance`),
-      // Control path: scheduled, low volume, and worth tracing when a run misbehaves.
-      tracing: lambda.Tracing.ACTIVE,
-      environment: {
-        ...sharedEnv,
-        DB_SECRET_ARN: databaseSecret.secretArn,
-        ORPHAN_SAFETY_WINDOW_HOURS: String(config.lifecycle.orphanSafetyWindowHours),
-        SUPERSEDED_RETENTION_DAYS: String(config.lifecycle.supersededRetentionDays),
-        PENDING_UPLOAD_TTL_HOURS: String(config.lifecycle.pendingUploadTtlHours),
-        MAX_DELETIONS_PER_RUN: String(config.lifecycle.maxDeletionsPerRun),
-        STALLED_OPTIMIZE_HOURS: String(config.lifecycle.stalledOptimizeHours),
-        MAX_REENQUEUES_PER_RUN: String(config.lifecycle.maxReenqueuesPerRun),
-        MAINTENANCE_DRY_RUN: String(config.lifecycle.dryRun),
-      },
+    const user = (this.controlPlaneUser = new iam.User(this, 'ControlPlaneUser', {
+      userName: `imgopt-${config.name}-control-plane`,
     }));
 
-    /*
-     * One of the two roles that can delete an original — the other is the Fargate
-     * task role, which backs the API's explicit `DELETE /v1/images/:id`.
-     *
-     * Granted knowingly: reclaiming a superseded version means deleting its source.
-     * Staging is included so an abandoned upload's bytes can be removed; the
-     * derivative prefix so orphans can.
-     *
-     * Neither role gets `s3:DeleteObjectVersion`, and that omission is the point.
-     * The bucket is versioned, so these deletes write a delete marker and leave the
-     * previous copy recoverable — a defect here costs a delete marker rather than an
-     * irreplaceable source. A role holding DeleteObjectVersion would defeat that
-     * safety net using the very code path that caused the incident, so do not widen
-     * these grants to "fix" a delete that appears not to have worked.
-     */
-    grantRead(maintenance, bucket, [
-      STAGING_PREFIX,
-      ORIGINAL_PREFIX,
-      MASTER_PREFIX,
-      DERIVED_PREFIX,
-    ]);
-    grantDelete(maintenance, bucket, [
-      STAGING_PREFIX,
-      ORIGINAL_PREFIX,
-      MASTER_PREFIX,
-      DERIVED_PREFIX,
-    ]);
-    grantList(maintenance, bucket, [
-      STAGING_PREFIX,
-      ORIGINAL_PREFIX,
-      MASTER_PREFIX,
-      DERIVED_PREFIX,
-    ]);
-    databaseSecret.grantRead(maintenance);
+    // Owns ingest: stages, promotes, and reaps. It does not render, so it writes no
+    // derivative — but it deletes across every prefix, because `DELETE /v1/images/:id`
+    // removes an asset's objects wherever they live.
+    grantRead(user, bucket, [STAGING_PREFIX, ORIGINAL_PREFIX, MASTER_PREFIX, DERIVED_PREFIX]);
+    grantWrite(user, bucket, [STAGING_PREFIX, ORIGINAL_PREFIX]);
+    grantDelete(user, bucket, [STAGING_PREFIX, ORIGINAL_PREFIX, MASTER_PREFIX, DERIVED_PREFIX]);
+    grantList(user, bucket, [STAGING_PREFIX, ORIGINAL_PREFIX, MASTER_PREFIX, DERIVED_PREFIX]);
+    optimizeQueue.grantSendMessages(user);
 
     /*
-     * Send only, for the one job here that creates work rather than reclaiming it.
+     * Metrics, and only metrics.
      *
-     * An enqueue that fails after an upload has already stored its bytes leaves the
-     * asset servable but unprocessed forever — no LQIP, no metadata, no warm set —
-     * because a failed enqueue deliberately cannot fail the upload. This is the job
-     * that notices. `grantSendMessages` gives SendMessage and the queue-attribute
-     * reads it needs and nothing else: this function is not a consumer, and must
-     * never be able to receive or delete a message another consumer is working on.
+     * `cloudwatch:PutMetricData` cannot be scoped to a namespace by resource — the
+     * action takes no resource ARN — so the namespace condition is the only thing
+     * between "publish our metrics" and "publish anything, including values that
+     * would silence an alarm".
      */
-    optimizeQueue.grantSendMessages(maintenance);
-
-    new events.Rule(this, 'MaintenanceSchedule', {
-      ruleName: `imgopt-${config.name}-maintenance`,
-      description:
-        'Orphan reconciliation, superseded-version expiry, upload reaping, and ' +
-        're-enqueue of optimizations that were never queued',
-      // Daily. The windows this job enforces are measured in hours and days, so a
-      // tighter schedule would only re-examine objects it already decided to keep.
-      schedule: events.Schedule.rate(Duration.days(1)),
-      targets: [new eventTargets.LambdaFunction(maintenance)],
-    });
-
-    // ---- control plane: Fargate behind an ALB -----------------------------
-
-    this.repository = new ecr.Repository(this, 'ApiRepository', {
-      repositoryName: `imgopt-${config.name}-api`,
-      imageScanOnPush: true,
-      lifecycleRules: [{ maxImageCount: 20, description: 'Keep the last 20 images' }],
-    });
-
-    const cluster = new ecs.Cluster(this, 'Cluster', {
-      vpc,
-      clusterName: `imgopt-${config.name}`,
-      containerInsightsV2: ecs.ContainerInsights.ENABLED,
-    });
-
-    // Required and validated in config: never `latest`, because the tag is what a
-    // rollback names and a mutable one makes "the previous version" ambiguous.
-    const image = ecs.ContainerImage.fromEcrRepository(this.repository, config.api.imageTag);
-
-    const logging = new ecs.AwsLogDriver({
-      streamPrefix: 'api',
-      logGroup: new logs.LogGroup(this, 'ApiLogs', {
-        retention: logs.RetentionDays.ONE_MONTH,
-        removalPolicy: RemovalPolicy.DESTROY,
+    user.addToPrincipalPolicy(
+      new iam.PolicyStatement({
+        actions: ['cloudwatch:PutMetricData'],
+        resources: ['*'],
+        conditions: { StringEquals: { 'cloudwatch:namespace': 'Imgopt' } },
       }),
-    });
-
-    const taskDefinition = new ecs.FargateTaskDefinition(this, 'ApiTask', {
-      cpu: config.api.cpu,
-      memoryLimitMiB: config.api.memoryMb,
-    });
-
-    taskDefinition.addContainer('api', {
-      image,
-      portMappings: [{ containerPort: NetworkStack.APP_PORT }],
-      environment: { ...sharedEnv, PORT: String(NetworkStack.APP_PORT) },
-      // Resolved from the secret store when the container starts. The task
-      // definition carries the secret's ARN, never its value.
-      secrets: { DB_PASSWORD: ecs.Secret.fromSecretsManager(databaseSecret, 'password') },
-      logging,
-    });
-
-    /*
-     * Tracing, on the control path only.
-     *
-     * The API, the queue, and the optimizer are low-volume and stateful, which is
-     * exactly where a trace earns its cost: a slow upload is a question about time
-     * spent across validation, storage, the database, and the enqueue.
-     *
-     * The generator is deliberately excluded. It sits behind the CDN at delivery
-     * volume, and per-request tracing there would cost more than the traffic it
-     * observes while telling us nothing a metric does not — the interesting question
-     * about delivery is "how often does this run at all", not "where did this one
-     * invocation spend its time". See design.md D17.
-     */
-    taskDefinition.addContainer('xray', {
-      // `3.x`, not `latest`: a rolling minor still picks up fixes, but a redeploy of
-      // an unchanged task definition cannot silently cross a major version of a
-      // sidecar that sits in the same task as the API.
-      image: ecs.ContainerImage.fromRegistry('public.ecr.aws/xray/aws-xray-daemon:3.x'),
-      essential: false,
-      cpu: 32,
-      memoryReservationMiB: 256,
-      portMappings: [{ containerPort: 2000, protocol: ecs.Protocol.UDP }],
-      logging: new ecs.AwsLogDriver({
-        streamPrefix: 'xray',
-        logGroup: new logs.LogGroup(this, 'XRayLogs', {
-          retention: logs.RetentionDays.ONE_WEEK,
-          removalPolicy: RemovalPolicy.DESTROY,
-        }),
-      }),
-    });
-
-    taskDefinition.taskRole.addManagedPolicy(
-      iam.ManagedPolicy.fromAwsManagedPolicyName('AWSXRayDaemonWriteAccess'),
     );
 
-    this.service = new ecs.FargateService(this, 'ApiService', {
-      cluster,
-      taskDefinition,
-      desiredCount: config.api.desiredCount,
-      securityGroups: [appSecurityGroup],
-      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
-      // Rolls back automatically when a new task definition fails to stabilize,
-      // rather than leaving the service stuck part-deployed.
-      circuitBreaker: { rollback: true },
-      // Keeps the full desired count serving during a deployment. The default of 50%
-      // halves capacity mid-deploy, which on a two-task service means one task
-      // absorbing all ingest traffic.
-      minHealthyPercent: 100,
-    });
-
-    /*
-     * The load balancer is built explicitly rather than through
-     * `ApplicationLoadBalancedFargateService`.
-     *
-     * The pattern creates its own security group and then wires it to the task
-     * group, which writes an ingress rule into whichever stack owns the task group.
-     * With the task group in the network stack, that rule references a compute
-     * resource from the network stack while compute already depends on network for
-     * the VPC — a cycle CloudFormation refuses, reported as a wall of route-table
-     * associations rather than the one line responsible.
-     *
-     * Both groups and the rule between them are declared in the network stack, and
-     * `openListener: false` below keeps this from adding another.
-     */
-    this.loadBalancer = new elbv2.ApplicationLoadBalancer(this, 'ApiLoadBalancer', {
-      vpc,
-      internetFacing: true,
-      securityGroup: albSecurityGroup,
-      vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
-    });
-
-    // Request-level logs for the control plane, which is where credentials are
-    // presented — a WAF metric says a limit was hit, and only these say by whom.
-    this.loadBalancer.logAccessLogs(
-      s3.Bucket.fromBucketName(this, 'LogBucket', `${bucketNameFor(config)}-logs`),
-      'alb',
-    );
-
-    /*
-     * TLS, or a synth failure in production.
-     *
-     * This listener was always written to terminate TLS when handed a certificate —
-     * and nothing ever handed it one, so every environment served the control plane
-     * over plain HTTP: `x-api-key` credentials and upload payloads crossing the
-     * internet in cleartext, with a comment in the network stack claiming port 80
-     * existed only to redirect.
-     *
-     * The guard lives here rather than in `bin/app.ts` because that is what the tests
-     * construct. Staging is deliberately still allowed to run without a certificate,
-     * so a first deploy is possible before DNS exists.
-     */
-    const certificate = this.resolveApiCertificate(config);
-
-    if (certificate === undefined && config.name === 'production') {
-      throw new Error(
-        'Production must terminate TLS at the load balancer. Issue a regional ' +
-          'certificate for API_HOST and pass its ARN as API_CERTIFICATE_ARN — ' +
-          '`pnpm --filter @imgopt/cloudflare certs` requests it and writes the ' +
-          'validation record into Cloudflare for you.',
-      );
-    }
-
-    const listener = this.loadBalancer.addListener('Listener', {
-      port: certificate !== undefined ? 443 : 80,
-      protocol: certificate !== undefined ? ApplicationProtocol.HTTPS : ApplicationProtocol.HTTP,
-      ...(certificate !== undefined
-        ? {
-            certificates: [certificate],
-            // CDK's default policy still negotiates TLS 1.0 and 1.1. This one is
-            // TLS 1.2+, which is the whole point of terminating TLS here.
-            sslPolicy: elbv2.SslPolicy.RECOMMENDED_TLS,
-          }
-        : {}),
-      open: false,
-    });
-
-    if (certificate !== undefined) {
-      // Plain HTTP is answered only to send the client to HTTPS.
-      this.loadBalancer.addRedirect({
-        sourceProtocol: ApplicationProtocol.HTTP,
-        sourcePort: 80,
-        targetProtocol: ApplicationProtocol.HTTPS,
-        targetPort: 443,
-        open: false,
-      });
-    }
-
-    const targetGroup = listener.addTargets('ApiTargets', {
-      port: NetworkStack.APP_PORT,
-      protocol: ApplicationProtocol.HTTP,
-      targets: [this.service],
-      healthCheck: {
-        // Dependency-aware: reports unhealthy when storage or the database is
-        // unreachable, so a task that cannot serve is pulled from the target group.
-        path: '/readyz',
-        interval: Duration.seconds(30),
-        timeout: Duration.seconds(5),
-        healthyThresholdCount: 2,
-        unhealthyThresholdCount: 3,
-      },
-      deregistrationDelay: Duration.seconds(30),
-    });
-
-    this.targetGroupFullName = targetGroup.targetGroupFullName;
-
-    /*
-     * Rate limiting sits on the load balancer, not in the application.
-     *
-     * A per-instance limiter would give an attacker a budget that scales with the
-     * service — the limit times however many tasks are running — and it would widen
-     * exactly when the service is already struggling. This counts once, and rejects
-     * before a request reaches a task at all.
-     */
-    const webAcl = createControlPlaneWebAcl(this, 'ApiWebAcl', { environment: config.name });
-
-    new wafv2.CfnWebACLAssociation(this, 'ApiWebAclAssociation', {
-      resourceArn: this.loadBalancer.loadBalancerArn,
-      webAclArn: webAcl.attrArn,
-    });
-
-    const scaling = this.service.autoScaleTaskCount({
-      minCapacity: config.api.minCapacity,
-      maxCapacity: config.api.maxCapacity,
-    });
-    scaling.scaleOnCpuUtilization('CpuScaling', {
-      targetUtilizationPercent: 65,
-      scaleInCooldown: Duration.minutes(3),
-      scaleOutCooldown: Duration.minutes(1),
-    });
-
-    const taskRole = taskDefinition.taskRole;
-    // The control plane owns ingest: it stages, promotes, and reaps. It does not
-    // render, so it needs no write access to derivatives beyond cleanup.
-    grantRead(taskRole, bucket, [STAGING_PREFIX, ORIGINAL_PREFIX, MASTER_PREFIX, DERIVED_PREFIX]);
-    grantWrite(taskRole, bucket, [STAGING_PREFIX, ORIGINAL_PREFIX]);
-    grantDelete(taskRole, bucket, [STAGING_PREFIX, ORIGINAL_PREFIX, MASTER_PREFIX, DERIVED_PREFIX]);
-    grantList(taskRole, bucket, [STAGING_PREFIX, ORIGINAL_PREFIX, MASTER_PREFIX, DERIVED_PREFIX]);
-    optimizeQueue.grantSendMessages(taskRole);
-    databaseSecret.grantRead(taskRole);
-
-    // ---- migrations: a task definition, not a container entrypoint --------
-
-    /*
-     * Migrations run as an explicit one-off task before the new version takes
-     * traffic — never on container start. Several tasks starting at once would
-     * otherwise race to apply the same migration, and the failure mode of that is a
-     * half-migrated schema rather than a clean error.
-     */
-    const migrationTask = new ecs.FargateTaskDefinition(this, 'MigrationTask', {
-      cpu: 512,
-      memoryLimitMiB: 1024,
-      runtimePlatform: {
-        cpuArchitecture: ecs.CpuArchitecture.X86_64,
-        operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
-      },
-    });
-
-    migrationTask.addContainer('migrate', {
-      image,
-      /*
-       * A script in the image, not the CLI directly.
-       *
-       * The CLI needs `DATABASE_URL`, and this container is given the parts instead
-       * so the password stays out of the task definition — the script composes the
-       * URL in-process and points the CLI at `prisma.config.ts`, whose schema and
-       * migration paths are relative to itself. It also propagates the child's exit
-       * code, which is the only thing ECS reads to decide the task succeeded.
-       *
-       * See packages/db/scripts/migrate.mjs, which fails loudly and by name if the
-       * image is missing the CLI or the schema.
-       */
-      command: ['node', 'packages/db/scripts/migrate.mjs'],
-      environment: databaseEnv,
-      secrets: { DB_PASSWORD: ecs.Secret.fromSecretsManager(databaseSecret, 'password') },
-      logging: new ecs.AwsLogDriver({
-        streamPrefix: 'migrate',
-        // Kept longer than the application's: a migration log is the record of what
-        // was applied to the schema and when.
-        logGroup: new logs.LogGroup(this, 'MigrationLogs', {
-          retention: logs.RetentionDays.THREE_MONTHS,
-          removalPolicy: RemovalPolicy.RETAIN,
-        }),
-      }),
-    });
-    databaseSecret.grantRead(migrationTask.taskRole);
-
-    this.publishApiDnsTarget(config, certificate !== undefined);
-
-    new CfnOutput(this, 'MaintenanceFunctionName', { value: maintenance.functionName });
     new CfnOutput(this, 'GeneratorFunctionUrl', { value: this.generatorFunctionUrl.url });
     new CfnOutput(this, 'GeneratorFunctionName', { value: this.generator.functionName });
-    new CfnOutput(this, 'ApiEndpoint', {
-      // Scheme-qualified, so what is pasted into a client is a URL rather than a
-      // hostname someone has to guess the scheme for — and guessing wrong here means
-      // sending an API key over plain HTTP.
-      value:
-        certificate !== undefined && config.apiHost !== undefined
-          ? `https://${config.apiHost}`
-          : `http://${this.loadBalancer.loadBalancerDnsName}`,
+    new CfnOutput(this, 'OptimizerFunctionName', { value: optimizer.functionName });
+    new CfnOutput(this, 'ControlPlaneUserName', {
+      value: user.userName,
       description:
-        certificate !== undefined
-          ? 'Control-plane base URL; set this as the client base URL'
-          : 'Control-plane base URL. PLAIN HTTP — staging only, until a certificate is configured',
-    });
-    new CfnOutput(this, 'ApiRepositoryUri', { value: this.repository.repositoryUri });
-    new CfnOutput(this, 'MigrationTaskDefinition', {
-      value: migrationTask.taskDefinitionArn,
-      description: 'Run with: aws ecs run-task --task-definition <this> --launch-type FARGATE',
-    });
-    new CfnOutput(this, 'ClusterName', { value: cluster.clusterName });
-
-    // The inputs an operator needs to run the migration task, emitted rather than
-    // looked up: the task runs in private subnets with the application security
-    // group, and finding those ids by hand is the step where a bootstrap stalls.
-    new CfnOutput(this, 'MigrationSubnetIds', {
-      value: vpc
-        .selectSubnets({ subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS })
-        .subnetIds.join(','),
-      description: 'Pass as --network-configuration subnets when running the migration task',
-    });
-    new CfnOutput(this, 'MigrationSecurityGroupId', {
-      value: appSecurityGroup.securityGroupId,
-      description: 'Pass as --network-configuration securityGroups when running the migration task',
-    });
-  }
-
-  /**
-   * The regional certificate for the load balancer, always supplied as an ARN.
-   *
-   * A different certificate from the distribution's, and necessarily so: CloudFront
-   * accepts a viewer certificate only from us-east-1, an ALB only from its own
-   * region. Substituting one for the other fails when CloudFormation attaches it.
-   *
-   * This stack issues nothing — DNS lives in Cloudflare, so validation cannot happen
-   * inside a deployment. See design.md D18 and `infra/cloudflare`.
-   */
-  private resolveApiCertificate(config: EnvironmentConfig): acm.ICertificate | undefined {
-    if (config.apiCertificateArn === undefined) return undefined;
-    return acm.Certificate.fromCertificateArn(this, 'ApiCertificate', config.apiCertificateArn);
-  }
-
-  /**
-   * Publishes what the load balancer answers to, for the Cloudflare reconciler.
-   *
-   * No DNS record is created here: DNS lives in Cloudflare (design.md D18), and no
-   * zone in this account holds the name. `infra/cloudflare` reads this output and
-   * makes `apiHost` a **DNS-only** CNAME onto it — a subdomain CNAME rather than an
-   * alias, because ALIAS is a Route 53 concept and does not exist elsewhere.
-   */
-  private publishApiDnsTarget(config: EnvironmentConfig, secure: boolean): void {
-    if (config.apiHost === undefined) return;
-
-    new CfnOutput(this, 'ApiDnsTarget', {
-      value: this.loadBalancer.loadBalancerDnsName,
-      description: secure
-        ? `Cloudflare: CNAME ${config.apiHost} -> this value, proxy DISABLED`
-        : `Cloudflare: CNAME ${config.apiHost} -> this value, proxy DISABLED. ` +
-          'NOTE: no certificate is configured, so this listener is plain HTTP.',
+        'Create an access key for this user out of band; the stack does not, because a ' +
+        'CloudFormation-created key stays readable in the template.',
     });
   }
 }

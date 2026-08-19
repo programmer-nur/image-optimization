@@ -1,37 +1,54 @@
 # Infrastructure
 
-CDK app for the deployable stack. Six stacks, split by how often they change and how
+CDK app for the deployable stack. Five stacks, split by how often they change and how
 much damage a mistake does.
 
-| Stack     | Changes       | Holds                                         |
-| --------- | ------------- | --------------------------------------------- |
-| `Network` | rarely        | VPC, subnets, every security group and rule   |
-| `Storage` | never         | the asset bucket, retained                    |
-| `Data`    | never         | PostgreSQL, retained                          |
-| `Queue`   | rarely        | optimize queue + dead-letter queue            |
-| `Compute` | every release | both Lambdas, Fargate service, migration task |
-| `Cdn`     | occasionally  | distribution, edge function, DNS              |
+| Stack           | Changes          | Holds                                          |
+| --------------- | ---------------- | ---------------------------------------------- |
+| `Storage`       | never            | the asset bucket, retained                     |
+| `Queue`         | rarely           | optimize queue + dead-letter queue             |
+| `Compute`       | every release    | both Lambdas, the control plane's IAM identity |
+| `Cdn`           | occasionally     | distribution, edge function                    |
+| `Observability` | during incidents | alarms and the dashboard                       |
 
-The split is the point: shipping application code touches `Compute` only, and can
-never present CloudFormation with a plan that replaces the bucket holding every
-original.
+The split is the point: shipping application code touches `Compute` only, and can never
+present CloudFormation with a plan that replaces the bucket holding every original.
+
+### What this app does _not_ create
+
+**No VPC, and therefore no NAT gateway, interface endpoints, or security groups.**
+Neither Lambda is VPC-attached, because neither holds a database connection — they post
+their bookkeeping to the control plane instead (design.md L1/L2). That was $76.65/month
+of networking whose only purpose was reaching Postgres, and the synthesis suite asserts
+its absence rather than trusting it: a VPC-attached function brings all of it back, and
+the deployment would work perfectly while the bill arrived a month later.
+
+**No database, no ECS, no load balancer, no WAF.** The control plane and PostgreSQL are
+Lightsail resources, which CloudFormation cannot create. They are provisioned with the
+AWS CLI in [docs/bootstrap.md](../../docs/bootstrap.md) and deployed by
+[`deploy/lightsail/`](../../deploy/lightsail/). This stack creates the IAM _user_ the
+instance authenticates as — a user rather than a role because Lightsail cannot assume
+one — and deliberately does not create its access key, since a CloudFormation-created
+key stays readable in the template's outputs forever.
 
 ## Configuration
 
 Everything comes from the environment, so no account id or hostname is committed.
 
-| Variable                      | Required            | Meaning                                                           |
-| ----------------------------- | ------------------- | ----------------------------------------------------------------- |
-| `CDK_ACCOUNT`                 | yes                 | target AWS account id                                             |
-| `CDK_REGION`                  | no                  | defaults to `us-east-1`                                           |
-| `CDN_HOST`                    | yes                 | public delivery hostname                                          |
-| `API_HOST`                    | production          | public control-plane hostname                                     |
-| `CDN_CERTIFICATE_ARN`         | for a custom domain | pre-issued **us-east-1** certificate; see DNS below               |
-| `API_CERTIFICATE_ARN`         | production          | pre-issued certificate in **this region**; synth fails without it |
-| `API_IMAGE_TAG`               | yes                 | control-plane image tag; `latest` is refused                      |
-| `CDN_DISTRIBUTION_ID`         | no                  | pins the bucket read grant to one distribution; set on redeploy   |
-| `MALWARE_SCANNING`            | no                  | GuardDuty on `staging/`; on in production                         |
-| `PRIVATE_DELIVERY_PUBLIC_KEY` | no                  | PEM public key enabling signed-URL delivery                       |
+| Variable                      | Required            | Meaning                                                         |
+| ----------------------------- | ------------------- | --------------------------------------------------------------- |
+| `CDK_ACCOUNT`                 | yes                 | target AWS account id                                           |
+| `CDK_REGION`                  | no                  | defaults to `us-east-1`                                         |
+| `CDN_HOST`                    | yes                 | public delivery hostname                                        |
+| `API_HOST`                    | production          | public control-plane hostname                                   |
+| `WORKER_CALLBACK_URL`         | yes                 | control-plane base URL the Lambdas record their results against |
+| `WORKER_CALLBACK_SECRET`      | yes                 | shared secret for the internal routes; must match the instance  |
+| `CONTROL_PLANE_INSTANCE_NAME` | no                  | Lightsail instance name, for its status-check alarm             |
+| `CDN_CERTIFICATE_ARN`         | for a custom domain | pre-issued **us-east-1** certificate; see DNS below             |
+| `API_IMAGE_TAG`               | yes                 | control-plane image tag; `latest` is refused                    |
+| `CDN_DISTRIBUTION_ID`         | no                  | pins the bucket read grant to one distribution; set on redeploy |
+| `MALWARE_SCANNING`            | no                  | GuardDuty on `staging/`; on in production                       |
+| `PRIVATE_DELIVERY_PUBLIC_KEY` | no                  | PEM public key enabling signed-URL delivery                     |
 
 Every variable can be prefixed with the deployment's own name, upper-cased:
 `DEMO_CDN_HOST` wins over `CDN_HOST` when deploying `demo`. The bare name is the

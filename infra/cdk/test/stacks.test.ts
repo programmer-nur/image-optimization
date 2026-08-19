@@ -33,9 +33,7 @@ import {
   resolveEnvironment,
   type EnvironmentConfig,
 } from '../lib/config.js';
-import { NetworkStack } from '../lib/network-stack.js';
 import { StorageStack } from '../lib/storage-stack.js';
-import { DataStack } from '../lib/data-stack.js';
 import { QueueStack } from '../lib/queue-stack.js';
 import { ComputeStack } from '../lib/compute-stack.js';
 import { CdnStack } from '../lib/cdn-stack.js';
@@ -66,7 +64,9 @@ function stubArtifacts(): void {
   const root = mkdtempSync(join(tmpdir(), 'imgopt-synth-'));
   process.env['IMGOPT_ARTIFACT_ROOT'] = root;
 
-  for (const app of ['optimizer', 'generator', 'maintenance']) {
+  // Two, not three. Reclamation is no longer a Lambda — it ships inside the API image
+  // and runs on the control-plane host (design.md L2).
+  for (const app of ['optimizer', 'generator']) {
     const dir = join(root, 'apps', app, 'dist-bundle');
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, 'index.mjs'), '// synthesis stub\n');
@@ -79,9 +79,7 @@ function stubArtifacts(): void {
 
 interface Synthesized {
   config: EnvironmentConfig;
-  network: Template;
   storage: Template;
-  data: Template;
   queue: Template;
   compute: Template;
   cdn: Template;
@@ -109,14 +107,17 @@ function synthesize(
     // ARNs, because nothing issues certificates any more: DNS is in Cloudflare, so
     // validation cannot happen inside a deployment. Production refuses to synthesize
     // without the API one.
-    API_CERTIFICATE_ARN:
-      'arn:aws:acm:us-east-1:123456789012:certificate/11111111-2222-3333-4444-555555555555',
     CDN_CERTIFICATE_ARN:
       'arn:aws:acm:us-east-1:123456789012:certificate/22222222-3333-4444-5555-666666666666',
     // The third manifest entry's own hostname. Deployments cannot share one, so
     // `demo` needs a prefixed value; everything else it needs falls back to the
     // shared defaults above, which is exactly the intended onboarding shape.
     DEMO_CDN_HOST: 'images.demo.example.com',
+    // Where the workers post their bookkeeping. Required on every deployment: a
+    // worker without it holds no route to the registry at all.
+    WORKER_CALLBACK_URL: 'https://api.example.com',
+    WORKER_CALLBACK_SECRET: 'test-worker-secret',
+    CONTROL_PLANE_INSTANCE_NAME: 'imgopt-test-control-plane',
   });
 
   for (const [key, value] of Object.entries(overrides)) {
@@ -131,26 +132,13 @@ function synthesize(
   const app = new App();
   const env = { account: config.account, region: config.region };
 
-  const network = new NetworkStack(app, 'Network', { env, config });
   const storage = new StorageStack(app, 'Storage', { env, config });
   const queue = new QueueStack(app, 'Queue', { env, config });
-  const data = new DataStack(app, 'Data', {
-    env,
-    config,
-    vpc: network.vpc,
-    databaseSecurityGroup: network.databaseSecurityGroup,
-  });
   const compute = new ComputeStack(app, 'Compute', {
     env,
     config,
-    vpc: network.vpc,
-    appSecurityGroup: network.appSecurityGroup,
-    albSecurityGroup: network.albSecurityGroup,
     bucket: storage.bucket,
     optimizeQueue: queue.optimizeQueue,
-    database: data.instance,
-    databaseSecret: data.secret,
-    databaseName: data.databaseName,
   });
   const cdn = new CdnStack(app, 'Cdn', {
     env,
@@ -165,18 +153,13 @@ function synthesize(
     deadLetterQueueName: queue.deadLetterQueue.queueName,
     generatorFunctionName: compute.generator.functionName,
     optimizerFunctionName: compute.optimizer.functionName,
-    maintenanceFunctionName: compute.maintenance.functionName,
     distributionId: cdn.distribution.distributionId,
-    loadBalancerFullName: compute.loadBalancer.loadBalancerFullName,
-    targetGroupFullName: compute.targetGroupFullName,
   });
 
   return {
     config,
     observability: Template.fromStack(observability),
-    network: Template.fromStack(network),
     storage: Template.fromStack(storage),
-    data: Template.fromStack(data),
     queue: Template.fromStack(queue),
     compute: Template.fromStack(compute),
     cdn: Template.fromStack(cdn),
@@ -242,15 +225,7 @@ beforeAll(() => {
 
 describe('the app synthesizes', () => {
   it('produces every stack', () => {
-    for (const template of [
-      app.network,
-      app.storage,
-      app.data,
-      app.queue,
-      app.compute,
-      app.cdn,
-      app.observability,
-    ]) {
+    for (const template of [app.storage, app.queue, app.compute, app.cdn, app.observability]) {
       const json = template.toJSON() as { Resources: Record<string, unknown> };
       expect(Object.keys(json.Resources).length).toBeGreaterThan(0);
     }
@@ -335,7 +310,9 @@ describe('deployment manifest', () => {
     const demo = resolveEnvironment('demo');
     const staging = resolveEnvironment('staging');
 
-    expect(demo.database.instanceType).toEqual(staging.database.instanceType);
+    // Same tier, so the same sizing profile — and still different resource names.
+    expect(demo.lambda.optimizerMaxConcurrency).toEqual(staging.lambda.optimizerMaxConcurrency);
+    expect(demo.delivery.priceClass).toEqual(staging.delivery.priceClass);
     expect(bucketNameFor(demo)).not.toBe(bucketNameFor(staging));
     expect(bucketNameFor(demo)).toContain('demo');
   });
@@ -424,33 +401,21 @@ describe('delivery plane', () => {
       API_HOST: 'api.example.com',
       API_IMAGE_TAG: 'v-test',
       CDN_CERTIFICATE_ARN: 'arn:aws:acm:us-east-1:123456789012:certificate/aaaa-bbbb',
-      API_CERTIFICATE_ARN: 'arn:aws:acm:eu-west-1:123456789012:certificate/cccc-dddd',
+      WORKER_CALLBACK_URL: 'https://api.example.com',
+      WORKER_CALLBACK_SECRET: 'test-worker-secret',
     });
 
     const config = resolveEnvironment('production');
     const scoped = new App();
     const env = { account: config.account, region: config.region };
 
-    const network = new NetworkStack(scoped, 'N', { env, config });
     const storage = new StorageStack(scoped, 'S', { env, config });
     const queue = new QueueStack(scoped, 'Q', { env, config });
-    const data = new DataStack(scoped, 'D', {
-      env,
-      config,
-      vpc: network.vpc,
-      databaseSecurityGroup: network.databaseSecurityGroup,
-    });
     const compute = new ComputeStack(scoped, 'C', {
       env,
       config,
-      vpc: network.vpc,
-      appSecurityGroup: network.appSecurityGroup,
-      albSecurityGroup: network.albSecurityGroup,
       bucket: storage.bucket,
       optimizeQueue: queue.optimizeQueue,
-      database: data.instance,
-      databaseSecret: data.secret,
-      databaseName: data.databaseName,
     });
     const cdn = Template.fromStack(
       new CdnStack(scoped, 'CDN', {
@@ -469,15 +434,16 @@ describe('delivery plane', () => {
     process.env['CDK_REGION'] = 'us-east-1';
   });
 
-  it('publishes the DNS targets an external provider needs', () => {
-    // The reconciler in infra/cloudflare reads these; a renamed output silently
-    // leaves the zone pointing at the previous deployment.
-    for (const [template, output] of [
-      [app.cdn, 'CdnDnsTarget'],
-      [app.compute, 'ApiDnsTarget'],
-    ] as const) {
-      expect(Object.keys(template.findOutputs(output))).toHaveLength(1);
-    }
+  it('publishes the DNS target an external provider needs', () => {
+    // The reconciler in infra/cloudflare reads this; a renamed output silently leaves
+    // the zone pointing at the previous deployment.
+    //
+    // One output, not two. The control plane's target used to be a load balancer's DNS
+    // name published by the compute stack; it is now a Lightsail static IP, which
+    // CloudFormation does not know about and which reaches the reconciler through
+    // `API_STATIC_IP` instead.
+    expect(Object.keys(app.cdn.findOutputs('CdnDnsTarget'))).toHaveLength(1);
+    expect(Object.keys(app.compute.findOutputs('ApiDnsTarget'))).toHaveLength(0);
   });
 
   it('subscribes to the metrics its own alarms watch', () => {
@@ -581,10 +547,14 @@ describe('storage posture', () => {
     });
   });
 
-  it('retains the bucket and the database', () => {
+  it('retains the bucket', () => {
     // The one failure in this file that cannot be undone.
+    //
+    // The database used to be asserted alongside it. It is a Lightsail managed
+    // database now, provisioned outside CloudFormation, so its deletion protection is
+    // a console setting rather than a template property — checked in the bootstrap
+    // guide's verification list instead of here.
     app.storage.hasResource('AWS::S3::Bucket', { DeletionPolicy: 'Retain' });
-    app.data.hasResource('AWS::RDS::DBInstance', { DeletionPolicy: 'Retain' });
   });
 
   it('expires staging and tiers originals, but leaves derivatives alone', () => {
@@ -650,49 +620,18 @@ describe('storage posture', () => {
   });
 });
 
-describe('rate limiting sits ahead of the application', () => {
-  it('associates a web ACL with the load balancer', () => {
-    // A per-instance limiter would give an attacker a budget that scales with the
-    // service, and widen exactly when the service is already struggling.
-    app.compute.hasResourceProperties('AWS::WAFv2::WebACLAssociation', {
-      ResourceArn: Match.anyValue(),
-      WebACLArn: Match.anyValue(),
-    });
-  });
-
-  it('rate-limits mutating requests more tightly than reads', () => {
-    const acl = resourcesOf(app.compute, 'AWS::WAFv2::WebACL')[0];
-    const rules = propertyOf<Array<{ Name: string; Statement: Record<string, unknown> }>>(
-      acl,
-      'Rules',
-    );
-
-    const mutating = rules.find((r) => r.Name === 'RateLimitMutating');
-    const overall = rules.find((r) => r.Name === 'RateLimitOverall');
-    const limitOf = (rule: typeof mutating) =>
-      (rule?.Statement as { RateBasedStatement?: { Limit?: number } } | undefined)
-        ?.RateBasedStatement?.Limit;
-
-    expect(limitOf(mutating)).toBeLessThan(limitOf(overall)!);
-  });
-
-  it('counts the broad managed ruleset rather than blocking on it', () => {
-    // The common ruleset flags ordinary multipart image uploads. Blocking on day one
-    // would look like a broken uploader, not a WAF.
-    const acl = resourcesOf(app.compute, 'AWS::WAFv2::WebACL')[0];
-    const rules = propertyOf<Array<{ Name: string; OverrideAction?: Record<string, unknown> }>>(
-      acl,
-      'Rules',
-    );
-
-    expect(rules.find((r) => r.Name === 'AWSManagedCommon')?.OverrideAction).toHaveProperty(
-      'Count',
-    );
-    expect(rules.find((r) => r.Name === 'AWSManagedKnownBadInputs')?.OverrideAction).toHaveProperty(
-      'None',
-    );
-  });
-});
+/*
+ * Rate limiting is no longer here.
+ *
+ * It was a WAF rule on the load balancer, and a WAF cannot attach to a Lightsail
+ * instance — the `REGIONAL` scope covers ALB, API Gateway, and AppSync only. It is now
+ * middleware in the control plane at the same limits, tested where it lives:
+ * `apps/api/src/common/rate-limit.middleware.test.ts`. See design.md L4 for what that
+ * costs, which is not nothing.
+ *
+ * The absence of any web ACL is asserted in the "no Lambda is VPC-attached" suite,
+ * alongside the other resources this change removed.
+ */
 
 describe('malware scanning', () => {
   it('scans only the untrusted prefix', () => {
@@ -706,23 +645,25 @@ describe('malware scanning', () => {
     });
   });
 
-  it('tells the control plane that a scanner exists', () => {
-    // The app fails closed on a missing verdict, so these two must agree or every
-    // upload is held forever.
-    const containers = resourcesOf(app.compute, 'AWS::ECS::TaskDefinition').flatMap(
-      (task) =>
-        propertyOf<Array<{ Environment?: Array<{ Name: string; Value: string }> }>>(
-          task,
-          'ContainerDefinitions',
-        ) ?? [],
-    );
-    const api = containers.find((c) =>
-      (c.Environment ?? []).some((e) => e.Name === 'UPLOAD_MALWARE_SCAN_ENABLED'),
-    );
+  it('tells the workers that a scanner exists', () => {
+    /*
+     * The app fails closed on a missing verdict, so the flag and the provisioning must
+     * agree or every upload is held forever.
+     *
+     * The control plane used to be asserted here through its task definition. It reads
+     * this flag from the instance's `.env` now, which CloudFormation does not own — so
+     * the CDK can only prove what it still sets, and the bootstrap guide carries the
+     * check that the two agree. That is a genuine weakening of a guard against a
+     * failure that presents as a broken uploader, and it is why the guide states the
+     * value to copy rather than describing it.
+     */
+    const fns = resourcesOf(app.compute, 'AWS::Lambda::Function');
+    expect(fns.length).toBeGreaterThan(0);
 
-    expect(
-      (api?.Environment ?? []).find((e) => e.Name === 'UPLOAD_MALWARE_SCAN_ENABLED')?.Value,
-    ).toBe('true');
+    for (const fn of fns) {
+      const env = propertyOf<{ Variables: Record<string, string> }>(fn, 'Environment');
+      expect(env.Variables['UPLOAD_MALWARE_SCAN_ENABLED']).toBe('true');
+    }
   });
 
   it('lets the quarantine handler delete only staged objects', () => {
@@ -819,17 +760,6 @@ describe('least privilege', () => {
 });
 
 describe('compute', () => {
-  it('runs every function on arm64', () => {
-    const ours = resourcesOf(app.compute, 'AWS::Lambda::Function').filter((fn) =>
-      String(propertyOf<string>(fn, 'FunctionName') ?? '').startsWith('imgopt-'),
-    );
-
-    expect(ours.length).toBeGreaterThanOrEqual(3);
-    for (const fn of ours) {
-      expect(propertyOf<string[]>(fn, 'Architectures')).toEqual(['arm64']);
-    }
-  });
-
   it('gives the sharp layer to exactly the functions that decode images', () => {
     // Maintenance moves and deletes objects and never decodes one, so shipping it a
     // native binary would be dead weight and an extra encoder-epoch coupling.
@@ -864,73 +794,6 @@ describe('compute', () => {
    * The listener always knew how to terminate TLS; nothing ever handed it a
    * certificate, so every environment served the control plane in clear.
    */
-  it('terminates TLS and answers port 80 only to redirect', () => {
-    app.compute.hasResourceProperties('AWS::ElasticLoadBalancingV2::Listener', {
-      Port: 443,
-      Protocol: 'HTTPS',
-      Certificates: Match.anyValue(),
-      // CDK's default still negotiates TLS 1.0/1.1.
-      SslPolicy: 'ELBSecurityPolicy-TLS13-1-2-2021-06',
-    });
-
-    app.compute.hasResourceProperties('AWS::ElasticLoadBalancingV2::Listener', {
-      Port: 80,
-      Protocol: 'HTTP',
-      DefaultActions: Match.arrayWith([
-        Match.objectLike({
-          Type: 'redirect',
-          RedirectConfig: Match.objectLike({
-            Protocol: 'HTTPS',
-            Port: '443',
-            StatusCode: 'HTTP_301',
-          }),
-        }),
-      ]),
-    });
-  });
-
-  it('refuses to synthesize a production control plane without a certificate', () => {
-    // The failure mode this guards is silent: an optional prop nobody passes, and a
-    // listener that quietly falls back to plain HTTP.
-    expect(() =>
-      synthesize('production', { API_CERTIFICATE_ARN: undefined, API_HOST: undefined }),
-    ).toThrow(/terminate TLS/);
-  });
-
-  it('still lets staging deploy before DNS exists', () => {
-    // Deliberate asymmetry: a first staging deploy has to be possible before a
-    // hostname is decided, and staging is not where credentials are worth stealing.
-    expect(() =>
-      synthesize('staging', { API_CERTIFICATE_ARN: undefined, API_HOST: undefined }),
-    ).not.toThrow();
-  });
-
-  it('runs migrations through the image script, not the CLI directly', () => {
-    // The CLI needs DATABASE_URL, which this container deliberately does not carry.
-    const containers = resourcesOf(app.compute, 'AWS::ECS::TaskDefinition').flatMap(
-      (task) =>
-        propertyOf<Array<{ Name: string; Command?: string[] }>>(task, 'ContainerDefinitions') ?? [],
-    );
-    const migrate = containers.find((container) => container.Name === 'migrate');
-
-    expect(migrate?.Command).toEqual(['node', 'packages/db/scripts/migrate.mjs']);
-  });
-
-  it('pins every container image to something other than latest', () => {
-    // `latest` makes "redeploy the previous version" ambiguous — it lets the service
-    // and the migration task run different bytes under one name, and it lets an
-    // unchanged task definition pick up a new sidecar on the next deploy.
-    const containers = resourcesOf(app.compute, 'AWS::ECS::TaskDefinition').flatMap(
-      (task) => propertyOf<Array<{ Image?: unknown }>>(task, 'ContainerDefinitions') ?? [],
-    );
-
-    expect(containers.length).toBeGreaterThanOrEqual(2);
-    expect(JSON.stringify(containers)).not.toContain(':latest');
-    // And ours really carries the configured tag, rather than merely not saying
-    // `latest` because the image reference was built some other way.
-    expect(JSON.stringify(containers)).toContain(`:${app.config.api.imageTag}`);
-  });
-
   it('lets maintenance queue work but never consume it', () => {
     // The re-enqueue job recovers optimizations lost to a failed enqueue. It is not a
     // consumer, and must never be able to receive or delete another consumer's message.
@@ -944,55 +807,6 @@ describe('compute', () => {
       expect(document).not.toContain('sqs:ReceiveMessage');
       expect(document).not.toContain('sqs:DeleteMessage');
     }
-  });
-
-  it('takes the database password from the secret store, never from plain env', () => {
-    const containers = resourcesOf(app.compute, 'AWS::ECS::TaskDefinition').flatMap(
-      (task) =>
-        propertyOf<
-          Array<{
-            Environment?: Array<{ Name: string; Value: unknown }>;
-            Secrets?: Array<{ Name: string }>;
-          }>
-        >(task, 'ContainerDefinitions') ?? [],
-    );
-
-    // No container anywhere may carry a credential in plain environment — including
-    // sidecars, which have no business holding one.
-    for (const container of containers) {
-      const names = (container.Environment ?? []).map((e) => e.Name);
-      expect(names).not.toContain('DB_PASSWORD');
-      expect(names).not.toContain('DATABASE_URL');
-    }
-
-    // Containers that actually reach the database take the password from the secret
-    // store. The X-Ray sidecar reaches nothing and correctly declares no secrets.
-    const withDatabase = containers.filter((c) =>
-      (c.Environment ?? []).some((e) => e.Name === 'DB_HOST'),
-    );
-
-    expect(withDatabase.length).toBeGreaterThan(0);
-    for (const container of withDatabase) {
-      expect((container.Secrets ?? []).map((s) => s.Name)).toContain('DB_PASSWORD');
-    }
-  });
-
-  it('gives the migration task its own definition rather than a container entrypoint', () => {
-    // Several tasks starting at once would otherwise race to apply the same
-    // migration, and the result is a half-migrated schema, not a clean error.
-    const tasks = resourcesOf(app.compute, 'AWS::ECS::TaskDefinition');
-    const migration = tasks.filter((task) =>
-      JSON.stringify(propertyOf<unknown>(task, 'ContainerDefinitions')).includes('migrate'),
-    );
-
-    expect(migration).toHaveLength(1);
-    expect(tasks.length).toBeGreaterThan(1);
-  });
-
-  it('checks readiness rather than liveness at the load balancer', () => {
-    app.compute.hasResourceProperties('AWS::ElasticLoadBalancingV2::TargetGroup', {
-      HealthCheckPath: '/readyz',
-    });
   });
 });
 
@@ -1039,7 +853,10 @@ describe('alarms', () => {
     expect(propertyOf<string>(throttled, 'Namespace')).toBe('AWS/Lambda');
     expect(propertyOf<number>(throttled, 'Threshold')).toBe(0);
 
-    for (const fragment of ['generator-errors', 'optimizer-errors', 'maintenance-errors']) {
+    // No `maintenance-errors`: reclamation is a cron job on the control-plane host and
+    // publishes no Lambda metrics. `maintenance-stalled`, below, covers it — and covers
+    // more, since "no run completed" also catches a container that never started.
+    for (const fragment of ['generator-errors', 'optimizer-errors']) {
       const errors = byName(fragment);
       expect(propertyOf<string>(errors, 'MetricName'), fragment).toBe('Errors');
       expect(propertyOf<string>(errors, 'Namespace'), fragment).toBe('AWS/Lambda');
@@ -1120,7 +937,12 @@ describe('alarms', () => {
       'generation-failure-rate',
       'cache-hit-rate',
       'api-5xx',
-      'unhealthy-tasks',
+      // Was `unhealthy-tasks`, from the load balancer's target health. The control
+      // plane is one instance now, so the closest available signal is its status
+      // check — which is weaker, and design.md L4 says so rather than pretending
+      // otherwise.
+      'control-plane-status',
+      'maintenance-stalled',
     ]) {
       expect(
         names.some((n) => n.includes(condition)),
@@ -1163,48 +985,6 @@ describe('tracing is confined to the control path', () => {
 });
 
 describe('lifecycle and cost controls', () => {
-  it('schedules the maintenance worker', () => {
-    app.compute.hasResourceProperties('AWS::Events::Rule', {
-      ScheduleExpression: Match.stringLikeRegexp('rate'),
-      State: 'ENABLED',
-    });
-  });
-
-  it('gives maintenance the only role that can delete an original', () => {
-    // Granted knowingly: reclaiming a superseded version means deleting its source,
-    // and nothing else in the system is permitted to.
-    const deleters = entriesOf(app.compute, 'AWS::IAM::Policy').filter(([, policy]) => {
-      const document = JSON.stringify(propertyOf<unknown>(policy, 'PolicyDocument'));
-      return document.includes('s3:DeleteObject') && document.includes('original/*');
-    });
-
-    const names = deleters.map(([id]) => id);
-    expect(names.some((n) => n.includes('Maintenance'))).toBe(true);
-    expect(names.some((n) => n.includes('Generator'))).toBe(false);
-    expect(names.some((n) => n.includes('Optimizer'))).toBe(false);
-  });
-
-  it('carries the lifecycle windows into the function environment', () => {
-    const maintenance = resourcesOf(app.compute, 'AWS::Lambda::Function').find((fn) =>
-      String(propertyOf<string>(fn, 'FunctionName') ?? '').includes('maintenance'),
-    );
-    const env = propertyOf<{ Variables: Record<string, string> }>(maintenance, 'Environment');
-
-    expect(env.Variables['ORPHAN_SAFETY_WINDOW_HOURS']).toBeDefined();
-    expect(env.Variables['SUPERSEDED_RETENTION_DAYS']).toBeDefined();
-    expect(env.Variables['MAX_DELETIONS_PER_RUN']).toBeDefined();
-  });
-
-  it('ships maintenance without the sharp layer', () => {
-    // It moves and deletes objects and never decodes one, so it needs no native
-    // binary — and stays outside the encoder-epoch coupling entirely.
-    const maintenance = resourcesOf(app.compute, 'AWS::Lambda::Function').find((fn) =>
-      String(propertyOf<string>(fn, 'FunctionName') ?? '').includes('maintenance'),
-    );
-
-    expect(propertyOf<unknown[]>(maintenance, 'Layers')).toBeUndefined();
-  });
-
   it('makes the CloudFront price class a per-environment decision', () => {
     // Delivery is ~75% of the bill, and edge coverage is the lever with the most
     // direct effect on it.
@@ -1237,19 +1017,70 @@ describe('queue', () => {
   });
 });
 
-describe('network', () => {
-  it('keeps object traffic off the NAT with a gateway endpoint', () => {
-    app.network.hasResourceProperties('AWS::EC2::VPCEndpoint', {
-      VpcEndpointType: 'Gateway',
-      ServiceName: Match.anyValue(),
-    });
+/*
+ * The saving, asserted rather than assumed (task 4.9).
+ *
+ * This suite replaces the one that checked the VPC's subnets and endpoints. The whole
+ * cost reduction rests on a single property — that no Lambda is attached to a VPC —
+ * because a VPC-attached function is what a NAT gateway and six interface endpoints
+ * exist to serve. Putting one back reintroduces $76.65/month, and it would do so
+ * silently: the deployment would work perfectly, and the bill would arrive a month
+ * later.
+ */
+describe('no Lambda is VPC-attached', () => {
+  it('gives no function a VPC config', () => {
+    for (const fn of resourcesOf(app.compute, 'AWS::Lambda::Function')) {
+      expect(
+        propertyOf<unknown>(fn, 'VpcConfig'),
+        'a VPC-attached Lambda brings back the NAT gateway and every interface endpoint',
+      ).toBeUndefined();
+    }
   });
 
-  it('puts the database in isolated subnets', () => {
-    const isolated = resourcesOf(app.network, 'AWS::EC2::Subnet').filter((subnet) =>
-      JSON.stringify(propertyOf<unknown>(subnet, 'Tags')).includes('Isolated'),
-    );
+  it('synthesizes no VPC, NAT gateway, or interface endpoint anywhere', () => {
+    for (const template of [app.storage, app.queue, app.compute, app.cdn, app.observability]) {
+      expect(Object.keys(template.findResources('AWS::EC2::VPC'))).toHaveLength(0);
+      expect(Object.keys(template.findResources('AWS::EC2::NatGateway'))).toHaveLength(0);
+      expect(Object.keys(template.findResources('AWS::EC2::VPCEndpoint'))).toHaveLength(0);
+      expect(Object.keys(template.findResources('AWS::EC2::SecurityGroup'))).toHaveLength(0);
+    }
+  });
 
-    expect(isolated.length).toBeGreaterThan(0);
+  it('creates no database, load balancer, or ECS resource', () => {
+    // Each of these was a line in the old cost floor. Asserted as absent so that
+    // "we removed it" stays true rather than becoming folklore.
+    for (const template of [app.storage, app.queue, app.compute, app.cdn, app.observability]) {
+      for (const type of [
+        'AWS::RDS::DBInstance',
+        'AWS::ElasticLoadBalancingV2::LoadBalancer',
+        'AWS::ECS::Cluster',
+        'AWS::ECS::Service',
+        'AWS::ECS::TaskDefinition',
+        'AWS::WAFv2::WebACL',
+        'AWS::ECR::Repository',
+      ]) {
+        expect(Object.keys(template.findResources(type)), `${type} should be gone`).toHaveLength(0);
+      }
+    }
+  });
+
+  it('gives the workers no database credential', () => {
+    // The security property behind design.md L2: the database is reachable only from
+    // the control-plane host, so a worker holding a connection string would be both a
+    // credential to steal and a reason to put the VPC back.
+    for (const fn of resourcesOf(app.compute, 'AWS::Lambda::Function')) {
+      const env = JSON.stringify(propertyOf<unknown>(fn, 'Environment') ?? {});
+      expect(env).not.toContain('DATABASE_URL');
+      expect(env).not.toContain('DB_SECRET_ARN');
+      expect(env).not.toContain('DB_PASSWORD');
+    }
+  });
+
+  it('tells the workers where the control plane is', () => {
+    for (const fn of resourcesOf(app.compute, 'AWS::Lambda::Function')) {
+      const env = JSON.stringify(propertyOf<unknown>(fn, 'Environment') ?? {});
+      expect(env).toContain('WORKER_CALLBACK_URL');
+      expect(env).toContain('WORKER_CALLBACK_SECRET');
+    }
   });
 });

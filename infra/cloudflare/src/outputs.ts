@@ -36,13 +36,19 @@ export async function readStackOutputs(lookup: OutputLookup): Promise<StackOutpu
   const client = new CloudFormationClient({ region: lookup.region });
   const prefix = `Imgopt-${lookup.environment}`;
 
-  const [cdnTarget, apiTarget] = await Promise.all([
-    outputValue(client, `${prefix}-Cdn`, 'CdnDnsTarget'),
-    outputValue(client, `${prefix}-Compute`, 'ApiDnsTarget'),
-  ]);
+  /*
+   * Only the CDN target comes from a stack now.
+   *
+   * The control plane's target used to be a load balancer's DNS name, published by the
+   * compute stack. It is a Lightsail instance's static IP, which CloudFormation does
+   * not know about — Lightsail is not a CloudFormation resource provider — so it
+   * arrives from the environment instead, set by whoever attached the address.
+   */
+  const cdnTarget = await outputValue(client, `${prefix}-Cdn`, 'CdnDnsTarget');
+  const apiTarget = process.env['API_STATIC_IP'];
 
   return {
     ...(cdnTarget !== undefined ? { cdnTarget } : {}),
-    ...(apiTarget !== undefined ? { apiTarget } : {}),
+    ...(apiTarget !== undefined && apiTarget !== '' ? { apiTarget } : {}),
   };
 }

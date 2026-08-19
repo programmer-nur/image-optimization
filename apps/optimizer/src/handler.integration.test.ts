@@ -11,13 +11,11 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import sharp from 'sharp';
 import type { SQSEvent, SQSRecord } from 'aws-lambda';
 import { S3Storage } from '@imgopt/storage';
-import {
-  DEFAULT_TENANT_ID,
-  UnscopedAssetRepository,
-  createPrismaClient,
-  newAssetId,
-} from '@imgopt/db';
+import { createPrismaClient, newAssetId } from '@imgopt/db';
 import type { PrismaClient } from '@imgopt/db';
+import { createServer, type Server } from 'node:http';
+import { PrismaRegistry } from './test-support/prisma-registry.js';
+import { RegistryFixtures } from './test-support/fixtures.js';
 
 process.env['AWS_REGION'] ??= 'us-east-1';
 process.env['S3_BUCKET'] ??= 'imgopt-dev';
@@ -32,8 +30,84 @@ process.env['WARM_WIDTHS'] ??= '640';
 process.env['WARM_FORMATS'] ??= 'webp';
 process.env['LOG_LEVEL'] ??= 'silent';
 
-// Dynamic import: the handler loads config from env at module scope, so env must be
-// set first.
+const prisma: PrismaClient = createPrismaClient({
+  connectionString: process.env['DATABASE_URL'],
+});
+const fixtures = new RegistryFixtures(prisma);
+const createdIds: string[] = [];
+
+const WORKER_SECRET = 'test-worker-secret';
+
+/*
+ * A stand-in control plane, on a real socket.
+ *
+ * The optimizer no longer holds a database connection — it records its results over
+ * HTTP (design.md L2) — so testing it against the repository directly would exercise
+ * neither the transport nor the wire format, which is where this now fails. The
+ * routes below are the same three `apps/api/src/modules/internal` serves, backed by
+ * the same repository, so the request bodies the handler produces are the ones the
+ * real control plane has to accept.
+ */
+const registry = new PrismaRegistry(prisma);
+
+const controlPlane: Server = createServer((req, res) => {
+  void (async () => {
+    if (req.headers['x-imgopt-worker-secret'] !== WORKER_SECRET) {
+      res.writeHead(401).end('{}');
+      return;
+    }
+
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    const body: Record<string, unknown> =
+      chunks.length > 0 ? (JSON.parse(Buffer.concat(chunks).toString()) as never) : {};
+
+    const url = req.url ?? '';
+    const send = (value: unknown): void => {
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(value));
+    };
+
+    try {
+      const optimize = /^\/internal\/v1\/optimize\/([^/]+)(\/complete|\/failed)?$/.exec(url);
+      if (optimize !== null) {
+        const assetId = decodeURIComponent(optimize[1]!);
+
+        if (optimize[2] === '/complete') {
+          await registry.completeOptimize(
+            assetId,
+            body['version'] as number,
+            body['metadata'] as never,
+          );
+          send({ status: 'ready' });
+        } else if (optimize[2] === '/failed') {
+          await registry.markFailed(assetId, body['reason'] as never);
+          send({ status: 'failed' });
+        } else {
+          send(await registry.optimizeContext(assetId));
+        }
+        return;
+      }
+
+      if (url === '/internal/v1/derivatives') {
+        await registry.recordDerivative(body as never);
+        send({ status: 'recorded' });
+        return;
+      }
+
+      res.writeHead(404).end('{}');
+    } catch (error) {
+      res.writeHead(500).end(JSON.stringify({ error: String(error) }));
+    }
+  })();
+});
+
+await new Promise<void>((resolve) => controlPlane.listen(0, '127.0.0.1', resolve));
+process.env['WORKER_CALLBACK_URL'] =
+  `http://127.0.0.1:${(controlPlane.address() as { port: number }).port}`;
+process.env['WORKER_CALLBACK_SECRET'] = WORKER_SECRET;
+
+// Dynamic import: the handler reads config at module scope, so the callback URL above
+// must already be set.
 const { handler } = await import('./handler.js');
 
 const storage = new S3Storage({
@@ -43,11 +117,6 @@ const storage = new S3Storage({
   forcePathStyle: true,
   credentials: { accessKeyId: 'minioadmin', secretAccessKey: 'minioadmin' },
 });
-const prisma: PrismaClient = createPrismaClient({
-  connectionString: process.env['DATABASE_URL'],
-});
-const repo = new UnscopedAssetRepository(prisma);
-const createdIds: string[] = [];
 
 function record(body: unknown, messageId: string): SQSRecord {
   return {
@@ -68,10 +137,10 @@ function record(body: unknown, messageId: string): SQSRecord {
 async function storeAsset(bytes: Buffer): Promise<string> {
   const id = newAssetId();
   createdIds.push(id);
-  await repo.create({ tenantId: DEFAULT_TENANT_ID, id });
+  await fixtures.createAsset(id);
   const sourceKey = `original/${id}/1/source.jpg`;
   await storage.put(sourceKey, bytes);
-  await repo.addVersion({ assetId: id, sourceKey, contentHash: `h-${id}` });
+  await fixtures.addVersion({ assetId: id, sourceKey, contentHash: `h-${id}` });
   return id;
 }
 
@@ -91,6 +160,7 @@ afterAll(async () => {
   }
   storage.destroy();
   await prisma.$disconnect();
+  await new Promise<void>((resolve) => controlPlane.close(() => resolve()));
 });
 
 describe('handler batch response', () => {
@@ -108,7 +178,7 @@ describe('handler batch response', () => {
     const response = await handler(event);
 
     expect(response.batchItemFailures).toEqual([]);
-    expect((await repo.requireById(id)).status).toBe('ready');
+    expect((await fixtures.readAsset(id)).status).toBe('ready');
   });
 
   it('discards a malformed message without reporting a failure', async () => {
@@ -124,8 +194,8 @@ describe('handler batch response', () => {
     // class of failure the handler asks SQS to retry.
     const id = newAssetId();
     createdIds.push(id);
-    await repo.create({ tenantId: DEFAULT_TENANT_ID, id });
-    await repo.addVersion({
+    await fixtures.createAsset(id);
+    await fixtures.addVersion({
       assetId: id,
       sourceKey: `original/${id}/1/missing.jpg`,
       contentHash: `h-${id}`,
@@ -147,8 +217,8 @@ describe('handler batch response', () => {
     );
     const missingSource = newAssetId();
     createdIds.push(missingSource);
-    await repo.create({ tenantId: DEFAULT_TENANT_ID, id: missingSource });
-    await repo.addVersion({
+    await fixtures.createAsset(missingSource);
+    await fixtures.addVersion({
       assetId: missingSource,
       sourceKey: `original/${missingSource}/1/missing.jpg`,
       contentHash: `h-${missingSource}`,
@@ -164,6 +234,6 @@ describe('handler batch response', () => {
     const response = await handler(event);
 
     expect(response.batchItemFailures).toEqual([{ itemIdentifier: 'm-fail' }]);
-    expect((await repo.requireById(good)).status).toBe('ready');
+    expect((await fixtures.readAsset(good)).status).toBe('ready');
   });
 });

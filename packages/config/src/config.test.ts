@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { ConfigError, loadConfig } from './config.js';
+import {
+  ConfigError,
+  loadConfig,
+  requireDatabaseUrl,
+  requireWorkerCallbackUrl,
+  requireWorkerSecret,
+} from './config.js';
 
 const minimal: NodeJS.ProcessEnv = {
   AWS_REGION: 'us-east-1',
@@ -127,47 +133,72 @@ describe('loadConfig', () => {
   });
 });
 
-describe('database credentials from discrete parts', () => {
-  const parts: NodeJS.ProcessEnv = {
-    AWS_REGION: 'us-east-1',
-    S3_BUCKET: 'imgopt-test',
-    SQS_OPTIMIZE_QUEUE_URL: 'http://localhost:9324/q/imgopt-optimize',
-    CDN_HOST: 'cdn.example.com',
-    DB_HOST: 'db.internal',
-    DB_USER: 'imgopt',
-    DB_PASSWORD: 'secret',
-    DB_NAME: 'imgopt',
-  };
+/*
+ * `DB_HOST`/`DB_USER`/`DB_PASSWORD`/`DB_NAME` no longer compose a URL.
+ *
+ * That path existed for one reason: ECS could inject a Secrets Manager value into a
+ * container's environment and Lambda could not, so the functions were handed the
+ * parts and the password separately. There is no ECS task definition and no Lambda
+ * with a database connection any more (design.md L5), so the application reads
+ * `DATABASE_URL` and nothing else — which is also the whole of the Lightsail → RDS
+ * migration on the application side.
+ */
+describe('the database is configured by one variable', () => {
+  it('requires DATABASE_URL where a database is needed', () => {
+    const config = loadConfig({ ...minimal, DATABASE_URL: undefined });
 
-  it('composes a URL when no DATABASE_URL is supplied', () => {
-    // How a deployed container gets its credentials: the parts are plain
-    // environment, and only the password comes from the secret store at runtime.
-    expect(loadConfig(parts).database.url).toBe(
-      'postgresql://imgopt:secret@db.internal:5432/imgopt',
+    expect(config.database.url).toBeUndefined();
+    expect(() => requireDatabaseUrl(config, 'The control plane')).toThrow(/DATABASE_URL/);
+  });
+
+  it('names who was asking', () => {
+    // Three different processes can produce this error, and the one thing worth
+    // knowing is which of them was starting.
+    const config = loadConfig({ ...minimal, DATABASE_URL: undefined });
+
+    expect(() => requireDatabaseUrl(config, 'The maintenance job')).toThrow(/The maintenance job/);
+  });
+
+  it('ignores the discrete parts entirely', () => {
+    // They used to compose a URL. Leaving that behaviour in place would mean a stale
+    // deployment silently connecting somewhere while looking unconfigured.
+    const config = loadConfig({
+      ...minimal,
+      DATABASE_URL: undefined,
+      DB_HOST: 'db.internal',
+      DB_USER: 'imgopt',
+      DB_PASSWORD: 'secret',
+      DB_NAME: 'imgopt',
+    });
+
+    expect(config.database.url).toBeUndefined();
+  });
+
+  it('passes a supplied URL through untouched', () => {
+    const url =
+      'postgresql://imgopt:secret@ls-abc.region.rds.amazonaws.com:5432/imgopt?sslmode=require';
+    expect(loadConfig({ ...minimal, DATABASE_URL: url }).database.url).toBe(url);
+  });
+});
+
+describe('the worker channel', () => {
+  it('refuses to hand out a missing secret', () => {
+    // Serving the internal prefix unauthenticated is worse than not starting.
+    const config = loadConfig(minimal);
+    expect(() => requireWorkerSecret(config, 'The control plane')).toThrow(
+      /WORKER_CALLBACK_SECRET/,
     );
   });
 
-  it('honours an explicit port', () => {
-    expect(loadConfig({ ...parts, DB_PORT: '6543' }).database.url).toBe(
-      'postgresql://imgopt:secret@db.internal:6543/imgopt',
-    );
-  });
+  it('strips a trailing slash from the callback URL', () => {
+    // Every caller appends an absolute path; a doubled slash is a 404 that reads like
+    // an authentication failure.
+    const config = loadConfig({
+      ...minimal,
+      WORKER_CALLBACK_URL: 'https://api.example.com/',
+      WORKER_CALLBACK_SECRET: 'shhh',
+    });
 
-  it('encodes credentials that would otherwise break the URL', () => {
-    // Generated passwords routinely contain these. Unencoded, the URL terminates
-    // early and produces a connection error that points nowhere useful.
-    const cfg = loadConfig({ ...parts, DB_PASSWORD: 'p@ss:w/rd?' });
-    expect(cfg.database.url).toBe('postgresql://imgopt:p%40ss%3Aw%2Frd%3F@db.internal:5432/imgopt');
-  });
-
-  it('prefers an explicit DATABASE_URL', () => {
-    const cfg = loadConfig({ ...parts, DATABASE_URL: 'postgres://u:p@localhost:5432/db' });
-    expect(cfg.database.url).toBe('postgres://u:p@localhost:5432/db');
-  });
-
-  it('fails naming the key when the set is incomplete', () => {
-    const { DB_PASSWORD: _omitted, ...incomplete } = parts;
-    // Better than composing a URL that cannot connect and failing on first query.
-    expect(() => loadConfig(incomplete)).toThrow(ConfigError);
+    expect(requireWorkerCallbackUrl(config, 'The optimizer')).toBe('https://api.example.com');
   });
 });

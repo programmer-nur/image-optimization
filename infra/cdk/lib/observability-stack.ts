@@ -31,10 +31,7 @@ export interface ObservabilityStackProps extends StackProps {
   deadLetterQueueName: string;
   generatorFunctionName: string;
   optimizerFunctionName: string;
-  maintenanceFunctionName: string;
   distributionId: string;
-  loadBalancerFullName: string;
-  targetGroupFullName: string;
 }
 
 export class ObservabilityStack extends Stack {
@@ -263,38 +260,16 @@ export class ObservabilityStack extends Stack {
       );
     }
 
-    alarm(
-      new cloudwatch.Alarm(this, 'MaintenanceErrorsAlarm', {
-        alarmName: `imgopt-${config.name}-maintenance-errors`,
-        alarmDescription: 'The scheduled maintenance run failed.',
-        // A once-a-day job has no tolerance for a failed run: one failure is a day
-        // with no reclamation at all.
-        metric: lambdaMetric(props.maintenanceFunctionName, 'Errors', Duration.days(1)),
-        threshold: 0,
-        evaluationPeriods: 1,
-        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
-        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
-      }),
-    );
-
     /*
-     * The heartbeat, and the one inverted alarm in this stack.
+     * There is no `MaintenanceErrorsAlarm` any more.
      *
-     * `MaintenanceRuns` is emitted only by a run that completed, so *missing data is
-     * the failure* — hence BREACHING, where every other alarm here is NOT_BREACHING.
-     * Getting that backwards would reproduce the cache-hit-rate defect exactly: a
-     * detector that reads healthy forever precisely because nothing is being emitted.
-     *
-     * Not `AWS/Lambda Invocations`, which counts an invocation that died mid-walk
-     * while reclaiming nothing.
-     *
-     * Twelve-hour periods rather than a day, because CloudWatch caps period x
-     * evaluationPeriods at 86,400 seconds and two periods are what tolerate schedule
-     * jitter. A daily run lands in one of the two windows, so 2-of-2 breaching is
-     * impossible while the job runs at all.
-     *
-     * A freshly deployed stack sits in ALARM until the first successful run. That is
-     * intended, and is the cheapest possible proof the whole path works.
+     * It watched the maintenance Lambda's `Errors` metric, and reclamation is not a
+     * Lambda any more — it is a scheduled container beside the database (design.md
+     * L2). A cron job has no platform-level error metric, so the *stalled* alarm below
+     * is now the only signal, and it is the better of the two anyway: it fires on "no
+     * run completed", which covers a failed run, a container that never started, a
+     * crashed host, and a cron entry someone removed. The old alarm could only see the
+     * first of those.
      */
     alarm(
       new cloudwatch.Alarm(this, 'MaintenanceStalledAlarm', {
@@ -374,14 +349,23 @@ export class ObservabilityStack extends Stack {
 
     // ---- control plane ----------------------------------------------------
 
+    /*
+     * The application's own view of its errors, not a load balancer's.
+     *
+     * There is no ALB any more (design.md L3/L4), so `AWS/ApplicationELB` publishes
+     * nothing for this deployment. The control plane already emits every request as
+     * EMF with a `StatusClass` dimension, which is a *better* signal than the one it
+     * replaces: it counts errors the application produced rather than errors a proxy
+     * observed, so a 500 served from cache or swallowed by a retry still appears.
+     */
     alarm(
       new cloudwatch.Alarm(this, 'ApiServerErrorAlarm', {
         alarmName: `imgopt-${config.name}-api-5xx`,
         alarmDescription: 'The control plane is returning server errors.',
         metric: new cloudwatch.Metric({
-          namespace: 'AWS/ApplicationELB',
-          metricName: 'HTTPCode_Target_5XX_Count',
-          dimensionsMap: { LoadBalancer: props.loadBalancerFullName },
+          namespace: NAMESPACE,
+          metricName: METRICS.requestCount,
+          dimensionsMap: { [DIMENSIONS.statusClass]: '5xx' },
           statistic: 'Sum',
           period: Duration.minutes(5),
         }),
@@ -392,61 +376,41 @@ export class ObservabilityStack extends Stack {
       }),
     );
 
-    alarm(
-      new cloudwatch.Alarm(this, 'UnhealthyTasksAlarm', {
-        alarmName: `imgopt-${config.name}-unhealthy-tasks`,
-        alarmDescription:
-          'Control-plane tasks are failing their readiness check, so the load ' +
-          'balancer is withholding traffic from them.',
-        metric: new cloudwatch.Metric({
-          namespace: 'AWS/ApplicationELB',
-          metricName: 'UnHealthyHostCount',
-          dimensionsMap: {
-            LoadBalancer: props.loadBalancerFullName,
-            TargetGroup: props.targetGroupFullName,
-          },
-          statistic: 'Maximum',
-          period: Duration.minutes(1),
-        }),
-        threshold: 0,
-        evaluationPeriods: 3,
-        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
-        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
-      }),
-    );
-
     /*
-     * Zero healthy targets, which the unhealthy-tasks alarm above cannot see.
+     * The instance itself, when one is named.
      *
-     * `UnHealthyHostCount` needs registered targets to report on; with none
-     * registered there are no datapoints at all, and NOT_BREACHING reads that as
-     * healthy. So the total-outage case — every task gone — is precisely the case the
-     * existing alarm is blind to.
+     * This is the alarm that replaces `UnHealthyHostCount` and `HealthyHostCount`, and
+     * it is genuinely weaker than what it replaces. A load balancer polls a readiness
+     * endpoint and knows the difference between "the host is up" and "the application
+     * on it is serving"; Lightsail's status check only knows the former. An
+     * application wedged but not crashed will not appear here — it appears as errors
+     * above, or as the queue backing up, or not at all.
+     *
+     * Stated rather than papered over, because the honest closure is an external
+     * synthetic check against `/readyz`, which costs money this deployment is
+     * deliberately not spending yet. See docs/operations.md.
      */
-    alarm(
-      new cloudwatch.Alarm(this, 'NoHealthyTasksAlarm', {
-        alarmName: `imgopt-${config.name}-no-healthy-tasks`,
-        alarmDescription: 'No control-plane task is passing its readiness check.',
-        metric: new cloudwatch.Metric({
-          namespace: 'AWS/ApplicationELB',
-          metricName: 'HealthyHostCount',
-          dimensionsMap: {
-            LoadBalancer: props.loadBalancerFullName,
-            TargetGroup: props.targetGroupFullName,
-          },
-          // Maximum, not Minimum: with targets spread across availability zones, a
-          // zone with none of them would drag a Minimum to zero and fire this on a
-          // perfectly healthy service.
-          statistic: 'Maximum',
-          period: Duration.minutes(1),
+    if (config.controlPlaneInstanceName !== undefined) {
+      alarm(
+        new cloudwatch.Alarm(this, 'ControlPlaneStatusAlarm', {
+          alarmName: `imgopt-${config.name}-control-plane-status`,
+          alarmDescription:
+            'The control-plane instance is failing its status check. Uploads and the ' +
+            'admin API are down; image delivery is NOT affected.',
+          metric: new cloudwatch.Metric({
+            namespace: 'AWS/Lightsail',
+            metricName: 'StatusCheckFailed',
+            dimensionsMap: { InstanceName: config.controlPlaneInstanceName },
+            statistic: 'Maximum',
+            period: Duration.minutes(1),
+          }),
+          threshold: 0,
+          evaluationPeriods: 3,
+          comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+          treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
         }),
-        threshold: 1,
-        evaluationPeriods: 3,
-        comparisonOperator: cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
-        // No datapoints means nothing is registered, which is the outage.
-        treatMissingData: cloudwatch.TreatMissingData.BREACHING,
-      }),
-    );
+      );
+    }
 
     this.buildDashboard(props, { onDemand, cacheHitRate, dlqDepth });
 

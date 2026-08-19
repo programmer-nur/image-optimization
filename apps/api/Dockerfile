@@ -30,6 +30,9 @@ COPY packages/queue/package.json packages/queue/
 COPY packages/db/package.json packages/db/
 COPY packages/metrics/package.json packages/metrics/
 COPY apps/api/package.json apps/api/
+# Reclamation ships in this image too — it runs on the control-plane host, beside the
+# database, rather than in Lambda.
+COPY apps/maintenance/package.json apps/maintenance/
 RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
     pnpm install --frozen-lockfile
 
@@ -37,6 +40,7 @@ RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
 FROM deps AS build
 COPY packages packages
 COPY apps/api apps/api
+COPY apps/maintenance apps/maintenance
 # `prisma generate` never connects to anything, but Prisma 7 resolves the datasource
 # URL when it *loads* prisma.config.ts, so an absent DATABASE_URL fails the build
 # with an error that reads like a connection problem. A placeholder satisfies the
@@ -44,6 +48,8 @@ COPY apps/api apps/api
 RUN DATABASE_URL=postgresql://build:build@localhost:5432/build \
     pnpm --filter @imgopt/db db:generate
 RUN pnpm --filter @imgopt/api... build
+# Bundled last, so it compiles against the packages just built.
+RUN pnpm --filter @imgopt/maintenance build && pnpm --filter @imgopt/maintenance bundle
 
 # ---- Production dependencies only ----
 FROM deps AS prod-deps
@@ -63,6 +69,14 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends openssl \
   && rm -rf /var/lib/apt/lists/*
 
+# Reclamation's run-lock directory, created here and owned by `node`.
+#
+# A Docker named volume inherits the ownership of the image's directory at its mount
+# point on first use — so without this the volume arrives root-owned, the container
+# (which runs unprivileged) cannot write the lock, and `acquireLock` reports that as
+# "a run is already in progress". Reclamation then never runs, silently, forever.
+RUN install -d -o node -g node /var/lib/imgopt
+
 # Drop privileges. node:22-slim ships a `node` user.
 USER node
 
@@ -77,25 +91,35 @@ COPY --from=build --chown=node:node /repo/packages/metrics/dist ./packages/metri
 COPY --from=build --chown=node:node /repo/packages/db/src/generated ./packages/db/src/generated
 COPY --from=build --chown=node:node /repo/apps/api/dist ./apps/api/dist
 
-# The migration task's payload, not the API's.
+# The migration step's payload, not the API's.
 #
-# This same image runs `packages/db/scripts/migrate.mjs` as a one-off ECS task before
-# a new task definition takes traffic, and `migrate deploy` needs the schema, the
-# migration SQL, and the CLI config — none of which a compiled `dist` contains. An
-# image without them deploys perfectly and then fails at the one step standing
-# between a green deployment and a working database, which is also the step with no
-# other way in: the instance sits in isolated subnets.
+# This same image runs `packages/db/scripts/migrate.mjs` as a one-off container before
+# the new version takes traffic, and `migrate deploy` needs the schema, the migration
+# SQL, and the CLI config — none of which a compiled `dist` contains. An image without
+# them builds perfectly and then fails at the one step standing between a green deploy
+# and a working database.
 COPY --from=build --chown=node:node /repo/packages/db/prisma ./packages/db/prisma
 COPY --from=build --chown=node:node /repo/packages/db/prisma.config.ts ./packages/db/prisma.config.ts
 COPY --from=build --chown=node:node /repo/packages/db/scripts ./packages/db/scripts
+# Reclamation, as a single bundled file.
+#
+# It runs here rather than in Lambda because it holds the only remaining direct
+# database connection and the database is reachable only from this host (design.md
+# L2). Bundled rather than assembled from workspace packages precisely so it adds
+# nothing to the hand-maintained COPY list above — the failure mode that list has is a
+# missing package that surfaces as an unresolved import at runtime, and a bundle
+# cannot have one.
+COPY --from=build --chown=node:node /repo/apps/maintenance/dist-bundle/maintenance.mjs ./maintenance.mjs
+
 # Production node_modules, so dev-only deps (sharp-for-tests, swc) are excluded.
 COPY --from=prod-deps --chown=node:node /repo/apps/api/node_modules ./apps/api/node_modules
 
 ENV PORT=3000
 EXPOSE 3000
 
-# The ALB/ECS health check also probes /readyz; this in-container check is a coarse
-# liveness signal against the process itself.
+# Compose probes this too. `/healthz` and not `/readyz`: liveness must not depend on
+# Postgres, or a database blip restarts a healthy process — which is the one action
+# that cannot help.
 HEALTHCHECK --interval=15s --timeout=3s --start-period=20s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 

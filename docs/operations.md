@@ -346,3 +346,104 @@ orphans once they age past the safety window, which is the correct outcome.
 
 **Practise it on staging.** None of the above has been executed against a real AWS
 account — see the deployment-verification items in the release checklist.
+
+## Migrating off Lightsail
+
+Both migrations are reversals of _hosting_, not of architecture. Neither touches domain
+logic, and that is a property the code pays for deliberately: the application reads one
+database variable and holds no state on local disk (design.md L5, L7).
+
+Do them separately. Moving the database and the compute in one change means a failure
+you cannot attribute.
+
+### Lightsail PostgreSQL → Amazon RDS
+
+**Triggers.** Any one of: needing Multi-AZ, needing a read replica, outgrowing the
+largest Lightsail database plan, or wanting the database back inside a VPC you control.
+
+```text
+Lightsail PostgreSQL → pg_dump → RDS → restore → DATABASE_URL → migrate → verify → cut over
+```
+
+1. **Provision RDS** in the deployment's region, PostgreSQL 16, in private subnets, with
+   a security group admitting only the control plane. Note the endpoint.
+
+2. **Dump.** From the control-plane instance, which is the only host that can reach the
+   Lightsail database:
+
+   ```bash
+   docker compose exec -T api pg_dump "$DATABASE_URL" --no-owner --no-acl -Fc > /tmp/imgopt.dump
+   ```
+
+   `-Fc` (custom format) rather than plain SQL: it restores in parallel and it lets you
+   restore selectively if something goes wrong halfway.
+
+3. **Stop writes.** `docker compose stop api` — reclamation is cron-driven, so also
+   comment out its crontab entry for the duration. The delivery plane keeps serving
+   throughout; this is an outage for uploads and the admin API only.
+
+   Take the dump _again_ after stopping. The first one told you how long it takes and
+   whether it works; this one is the one you restore.
+
+4. **Restore.**
+
+   ```bash
+   pg_restore --no-owner --no-acl -d "postgresql://imgopt:PASSWORD@NEW-ENDPOINT:5432/imgopt?sslmode=require" /tmp/imgopt.dump
+   ```
+
+5. **Point at it.** Edit `DATABASE_URL` in `/opt/imgopt/.env`. That is the whole of the
+   application-side change — there is no other place the database is named.
+
+6. **Migrate.** `docker compose run --rm migrate`. Expect "No pending migrations": the
+   dump carried the schema. A pending migration here means the dump predates a deploy,
+   and it is applied now rather than discovered later.
+
+7. **Verify before cutting over.**
+
+   ```bash
+   docker compose up -d api
+   curl -s localhost:3000/readyz          # database: ok
+   curl -s localhost:3000/v1/images?limit=1 -H "x-api-key: $KEY"
+   ```
+
+   Compare row counts against the old database — `assets`, `asset_versions`,
+   `derivatives`, `api_keys`, `tenants` — before deleting anything.
+
+8. **Restore the cron entry.** Reclamation deletes objects; leaving it disabled is safe,
+   and leaving it disabled _by accident_ is how storage quietly doubles.
+
+**Keep the Lightsail database for a week.** It costs $15 and it is the only rollback:
+put the old `DATABASE_URL` back and restart. Writes made against RDS in the interim are
+lost by that rollback, which is the reason to decide quickly rather than to keep the
+option open indefinitely.
+
+### Lightsail instance → ECS / EC2 / App Runner
+
+**Triggers.** Any one of: needing more than one replica, needing zero-downtime deploys,
+the instance becoming the thing you are paged about, or wanting the static AWS
+credential gone.
+
+**The credential is the strongest of those.** A Lightsail instance cannot assume an IAM
+role, so the control plane authenticates with a long-lived access key on disk. Every
+compute service in this list supports task or instance roles, and moving deletes the
+key rather than rotating it.
+
+**What moves:** the same image, the same environment file, a different scheduler. The
+API is stateless — no local disk, no sticky sessions, no in-process cache — so nothing
+contends when a second replica starts.
+
+**What must change with it**, and would be a silent regression if it did not:
+
+| Concern           | On one instance                    | With more than one                                                                                                                                                |
+| ----------------- | ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Rate limiting     | in-process, correct at one replica | **becomes per-replica** — an attacker's budget multiplies by replica count. Move it back to a WAF on the load balancer, or to a shared counter. See design.md L4. |
+| `x-forwarded-for` | trusted, Caddy is the only way in  | trust only the load balancer, and only its right-most hop                                                                                                         |
+| TLS               | Caddy, self-renewing               | ACM on the load balancer; `pnpm --filter @imgopt/cloudflare certs` issues the regional certificate again                                                          |
+| DNS               | `A` record → static IP             | `CNAME` → the load balancer's hostname; set `API_STATIC_IP` aside                                                                                                 |
+| Reclamation       | cron on the host                   | a scheduled task, and **exactly one** — the run lock is per-host, so two hosts running it concurrently is not something the lock prevents                         |
+| Migrations        | `docker compose run --rm migrate`  | a one-off task before the new version takes traffic, never an entrypoint                                                                                          |
+| Credentials       | access key in `.env`               | a task role; delete the IAM user the compute stack creates                                                                                                        |
+
+Reclamation is the one that bites quietly: two hosts each running it on a schedule would
+each delete up to `MAX_DELETIONS_PER_RUN`, and the per-run cap exists precisely to bound
+how much one mistake destroys.

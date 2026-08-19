@@ -1,15 +1,21 @@
 import { build } from 'esbuild';
 
-// Bundles the handler for the arm64 Lambda runtime. No `sharp` here: maintenance
-// moves and deletes objects, and never decodes one — so it needs no native binary
-// and no layer.
+// Bundles the reclamation CLI into one self-contained file.
 //
-// `.mjs`, not `.js`: the output is ESM and a deployed function has no package.json
-// above it, so a bare `.js` is read as CommonJS and fails at init on its own first
-// `import`. See apps/generator/esbuild.mjs for the full note.
+// Not a Lambda any more: reclamation holds the only remaining direct database
+// connection and runs beside the database on the control-plane host (design.md L2).
+// It is bundled rather than run from source so the API image can carry it as a single
+// COPY — the Dockerfile's workspace dependency list is hand-maintained, and a bundle
+// has nothing to add to it.
+//
+// No `sharp`: maintenance moves and deletes objects and never decodes one, so it needs
+// no native binary and no layer.
+//
+// `.mjs`, not `.js`: the output is ESM and there is no package.json beside it in the
+// image, so a bare `.js` would be read as CommonJS and fail on its own first `import`.
 await build({
-  entryPoints: ['src/handler.ts'],
-  outfile: 'dist-bundle/index.mjs',
+  entryPoints: ['src/cli.ts'],
+  outfile: 'dist-bundle/maintenance.mjs',
   bundle: true,
   platform: 'node',
   format: 'esm',
@@ -22,4 +28,4 @@ await build({
   },
 });
 
-console.log('maintenance bundled -> dist-bundle/index.mjs');
+console.log('maintenance bundled -> dist-bundle/maintenance.mjs');

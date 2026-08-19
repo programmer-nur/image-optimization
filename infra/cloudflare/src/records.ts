@@ -28,7 +28,16 @@ export const PROXIED = false as const;
 export interface DesiredRecord {
   /** Fully qualified name, e.g. `images.example.com`. */
   name: string;
-  type: 'CNAME';
+  /**
+   * `CNAME` for the distribution, `A` for the control plane.
+   *
+   * They differ because the targets differ in kind: CloudFront hands out a hostname,
+   * and a Lightsail instance has a static IPv4 address. An `A` record is not a
+   * downgrade here — there is exactly one instance, so there is nothing for a
+   * hostname's indirection to buy — but it *is* the thing that has to be edited when
+   * the control plane moves, which is why the migration runbook names it.
+   */
+  type: 'CNAME' | 'A';
   content: string;
   proxied: boolean;
   /** Why this record exists, written into the Cloudflare record comment. */
@@ -38,7 +47,7 @@ export interface DesiredRecord {
 export interface StackOutputs {
   /** `CdnDnsTarget` from the CDN stack — the distribution's own hostname. */
   cdnTarget?: string;
-  /** `ApiDnsTarget` from the compute stack — the load balancer's DNS name. */
+  /** The control-plane instance's static IP, from `API_STATIC_IP`. */
   apiTarget?: string;
 }
 
@@ -70,10 +79,22 @@ export function desiredRecords(hosts: HostConfig, outputs: StackOutputs): Desire
   if (hosts.apiHost !== undefined && outputs.apiTarget !== undefined && outputs.apiTarget !== '') {
     records.push({
       name: hosts.apiHost,
-      type: 'CNAME',
+      // A, not CNAME: the target is the instance's static IP.
+      type: 'A',
       content: outputs.apiTarget,
+      /*
+       * Grey-clouded, like everything else.
+       *
+       * The `Vary: Accept` hazard that makes proxying fatal for the CDN host does not
+       * apply to a JSON API, so orange cloud would be *safe* here — and it would add
+       * free TLS termination, DDoS absorption, and a hidden origin IP. It is off
+       * anyway so that the zone has one posture rather than two, and so the rule "every
+       * imgopt record is grey" stays checkable at a glance. Turning it on for this one
+       * record is a documented hardening step, not a default.
+       */
       proxied: PROXIED,
-      comment: 'imgopt control plane -> ALB. Proxy must stay off; see infra/cloudflare.',
+      comment:
+        'imgopt control plane -> Lightsail static IP. Proxy off by default; see infra/cloudflare.',
     });
   }
 
